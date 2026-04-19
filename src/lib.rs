@@ -40,9 +40,10 @@
 
 use std::collections::VecDeque;
 
-use oxideav_codec::{CodecRegistry, Decoder};
+use oxideav_codec::{CodecInfo, CodecRegistry, Decoder};
 use oxideav_core::{
-    CodecCapabilities, CodecId, CodecParameters, CodecTag, Error, Frame, Packet, Result,
+    CodecCapabilities, CodecId, CodecParameters, CodecTag, Error, Frame, Packet, ProbeContext,
+    Result,
 };
 
 pub const CODEC_ID_V1: &str = "msmpeg4v1";
@@ -173,13 +174,23 @@ const ALIASES_V1: &[&str] = &[CODEC_ID_V1, "msmpeg4v1"];
 const ALIASES_V2: &[&str] = &[CODEC_ID_V2, "msmpeg4v2"];
 const ALIASES_V3: &[&str] = &[CODEC_ID_V3, "msmpeg4v3", "div3"];
 
-/// Probe used in tag claims: accepts any bitstream that doesn't look
-/// like ISO/IEC 14496-2 MPEG-4 Part 2. Delegates to [`classify`] — if
-/// it returns anything other than `Classification::Mpeg4Part2`, the
-/// data is our family (or unknown, which we optimistically accept
-/// because the FourCC hint routed the packet here).
-pub fn probe_is_msmpeg4(data: &[u8]) -> bool {
-    !classify(data, None).is_mpeg4_part2()
+/// Probe used in tag claims: returns a confidence in `0.0..=1.0` that
+/// the context describes an MS-MPEG4 stream (not an ISO/IEC 14496-2
+/// MPEG-4 Part 2 stream). Inspects `ctx.packet` (or `ctx.header` as a
+/// fallback) via [`classify`]. When no bytes are available, returns a
+/// moderate-confidence value because the FourCC has already routed the
+/// probe here.
+pub fn probe_is_msmpeg4(ctx: &ProbeContext) -> f32 {
+    match ctx.packet.or(ctx.header) {
+        Some(d) => {
+            if classify(d, None).is_mpeg4_part2() {
+                0.0
+            } else {
+                1.0
+            }
+        }
+        None => 0.6,
+    }
 }
 
 /// Register the msmpeg4v1 / v2 / v3 decoders with a [`CodecRegistry`]
@@ -193,10 +204,9 @@ pub fn probe_is_msmpeg4(data: &[u8]) -> bool {
 ///
 /// Each claim carries the [`probe_is_msmpeg4`] probe so the registry
 /// can re-route a packet that's actually MPEG-4 Part 2 (mislabelled
-/// FourCC) to the mpeg4video decoder — when oxideav-mpeg4video is
-/// also registered and claims the same FourCCs with priority 5 + its
-/// own "looks like Part 2" probe, the registry's priority-first walk
-/// naturally picks whichever one accepts the bytes.
+/// FourCC) to the mpeg4video decoder — `oxideav-mpeg4video` claims
+/// the same FourCCs with its own mirror probe, and whichever probe
+/// returns the higher confidence wins.
 ///
 /// The decoders themselves currently return
 /// `Error::Unsupported` on `send_packet`, with distinct diagnostic
@@ -205,54 +215,49 @@ pub fn register(reg: &mut CodecRegistry) {
     fn make_caps(name: &'static str) -> CodecCapabilities {
         CodecCapabilities::video(name).with_intra_only(false)
     }
-    for alias in ALIASES_V1 {
-        reg.register_decoder_impl(CodecId::new(*alias), make_caps("msmpeg4v1_sw"), |params| {
-            MsMpeg4Decoder::boxed(params, MsVersion::V1)
-        });
-    }
-    for alias in ALIASES_V2 {
-        reg.register_decoder_impl(CodecId::new(*alias), make_caps("msmpeg4v2_sw"), |params| {
-            MsMpeg4Decoder::boxed(params, MsVersion::V2)
-        });
-    }
-    for alias in ALIASES_V3 {
-        reg.register_decoder_impl(CodecId::new(*alias), make_caps("msmpeg4v3_sw"), |params| {
-            MsMpeg4Decoder::boxed(params, MsVersion::V3)
-        });
+
+    // --- v1: factories for every alias, tags attached to the canonical one.
+    for (idx, alias) in ALIASES_V1.iter().enumerate() {
+        let mut info = CodecInfo::new(CodecId::new(*alias))
+            .capabilities(make_caps("msmpeg4v1_sw"))
+            .decoder(|params| MsMpeg4Decoder::boxed(params, MsVersion::V1));
+        if idx == 0 {
+            info = info
+                .probe(probe_is_msmpeg4)
+                .tags([CodecTag::fourcc(b"MP41"), CodecTag::fourcc(b"MPG4")]);
+        }
+        reg.register(info);
     }
 
-    // Claim the MS-MPEG4v1 FourCCs.
-    for fcc in &[b"MP41", b"MPG4"] {
-        reg.claim_tag(
-            CodecId::new(CODEC_ID_V1),
-            CodecTag::fourcc(fcc),
-            10,
-            Some(probe_is_msmpeg4),
-        );
+    // --- v2.
+    for (idx, alias) in ALIASES_V2.iter().enumerate() {
+        let mut info = CodecInfo::new(CodecId::new(*alias))
+            .capabilities(make_caps("msmpeg4v2_sw"))
+            .decoder(|params| MsMpeg4Decoder::boxed(params, MsVersion::V2));
+        if idx == 0 {
+            info = info.probe(probe_is_msmpeg4).tag(CodecTag::fourcc(b"MP42"));
+        }
+        reg.register(info);
     }
 
-    // MS-MPEG4v2.
-    reg.claim_tag(
-        CodecId::new(CODEC_ID_V2),
-        CodecTag::fourcc(b"MP42"),
-        10,
-        Some(probe_is_msmpeg4),
-    );
-
-    // MS-MPEG4v3 (DivX 3) — the biggest pile of FourCCs. DIV3/DIV4/DIV5/
-    // DIV6 and MP43/MPG3/AP41 all route here by default; oxideav-mpeg4video
-    // claims the same FourCCs at lower priority so a mislabelled stream
-    // can still find its way to the correct decoder via probe-driven
-    // fallback.
-    for fcc in &[
-        b"DIV3", b"DIV4", b"DIV5", b"DIV6", b"MP43", b"MPG3", b"AP41",
-    ] {
-        reg.claim_tag(
-            CodecId::new(CODEC_ID_V3),
-            CodecTag::fourcc(fcc),
-            10,
-            Some(probe_is_msmpeg4),
-        );
+    // --- v3 (DivX 3). Biggest FourCC pool; oxideav-mpeg4video claims the
+    // same set with its mirror probe for the mislabel case.
+    for (idx, alias) in ALIASES_V3.iter().enumerate() {
+        let mut info = CodecInfo::new(CodecId::new(*alias))
+            .capabilities(make_caps("msmpeg4v3_sw"))
+            .decoder(|params| MsMpeg4Decoder::boxed(params, MsVersion::V3));
+        if idx == 0 {
+            info = info.probe(probe_is_msmpeg4).tags([
+                CodecTag::fourcc(b"DIV3"),
+                CodecTag::fourcc(b"DIV4"),
+                CodecTag::fourcc(b"DIV5"),
+                CodecTag::fourcc(b"DIV6"),
+                CodecTag::fourcc(b"MP43"),
+                CodecTag::fourcc(b"MPG3"),
+                CodecTag::fourcc(b"AP41"),
+            ]);
+        }
+        reg.register(info);
     }
 }
 
@@ -452,6 +457,7 @@ mod tests {
 
     #[test]
     fn registered_tag_claims_route_correctly() {
+        use oxideav_core::CodecResolver;
         let mut reg = CodecRegistry::new();
         register(&mut reg);
 
@@ -459,28 +465,30 @@ mod tests {
         let iso_bytes = vos_header();
 
         // DIV3 with MS bytes → msmpeg4v3.
+        let div3 = CodecTag::fourcc(b"DIV3");
+        let ctx = ProbeContext::new(&div3).packet(&ms_bytes);
         assert_eq!(
-            reg.resolve_tag(&CodecTag::fourcc(b"DIV3"), Some(&ms_bytes))
-                .map(|c| c.as_str()),
-            Some(CODEC_ID_V3),
+            CodecResolver::resolve_tag(&reg, &ctx).map(|c| c.as_str().to_string()),
+            Some(CODEC_ID_V3.to_string()),
         );
         // DIV3 with MPEG-4 Part 2 bytes → probe rejects, no fallback in
         // this crate, so resolution returns None (the mpeg4video claim
         // would come from the other crate, not tested here).
-        assert!(reg
-            .resolve_tag(&CodecTag::fourcc(b"DIV3"), Some(&iso_bytes))
-            .is_none());
+        let ctx = ProbeContext::new(&div3).packet(&iso_bytes);
+        assert!(CodecResolver::resolve_tag(&reg, &ctx).is_none());
         // MP42 with MS bytes → msmpeg4v2.
+        let mp42 = CodecTag::fourcc(b"MP42");
+        let ctx = ProbeContext::new(&mp42).packet(&ms_bytes);
         assert_eq!(
-            reg.resolve_tag(&CodecTag::fourcc(b"MP42"), Some(&ms_bytes))
-                .map(|c| c.as_str()),
-            Some(CODEC_ID_V2),
+            CodecResolver::resolve_tag(&reg, &ctx).map(|c| c.as_str().to_string()),
+            Some(CODEC_ID_V2.to_string()),
         );
         // MP41 with MS bytes → msmpeg4v1.
+        let mp41 = CodecTag::fourcc(b"MP41");
+        let ctx = ProbeContext::new(&mp41).packet(&ms_bytes);
         assert_eq!(
-            reg.resolve_tag(&CodecTag::fourcc(b"MP41"), Some(&ms_bytes))
-                .map(|c| c.as_str()),
-            Some(CODEC_ID_V1),
+            CodecResolver::resolve_tag(&reg, &ctx).map(|c| c.as_str().to_string()),
+            Some(CODEC_ID_V1.to_string()),
         );
     }
 
