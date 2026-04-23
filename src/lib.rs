@@ -47,6 +47,7 @@ use oxideav_core::{
 };
 
 pub mod header;
+pub mod vlc;
 
 pub const CODEC_ID_V1: &str = "msmpeg4v1";
 pub const CODEC_ID_V2: &str = "msmpeg4v2";
