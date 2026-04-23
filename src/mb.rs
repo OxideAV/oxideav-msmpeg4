@@ -17,7 +17,7 @@
 //! tables.
 
 use oxideav_core::bits::BitReader;
-use oxideav_core::{Error, Result};
+use oxideav_core::Result;
 
 use crate::iq::dc_scaler;
 use crate::tables::{CBPY_INTRA_TABLE, DC_SIZE_CHROMA_TABLE, DC_SIZE_LUMA_TABLE};

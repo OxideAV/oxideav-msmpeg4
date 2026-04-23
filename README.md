@@ -22,11 +22,25 @@ right decoder when a packet arrives.
 
 ## Status
 
-**Probe + stubs only.** [`classify`] is functional and unit-tested.
-The decoder registers itself under the `msmpeg4v1` / `msmpeg4v2` /
-`msmpeg4v3` codec ids but returns `Error::Unsupported` on
-`send_packet`. The full bitstream parser, VLC tables, and macroblock
-pipeline are a future addition.
+**In progress.** [`classify`] is production-ready.
+
+| Piece                                          | Status   |
+| ---------------------------------------------- | -------- |
+| Bitstream classifier (`classify`)              | complete |
+| V3 picture-header parser (I / P)               | complete |
+| Scan tables (zigzag + alternate H/V)           | complete |
+| IDCT (float reference)                         | complete |
+| H.263-style dequantisation + DC scalers        | complete |
+| CBPY + DC-size VLCs                            | complete |
+| Intra MB header + DC differential decode       | complete |
+| Intra AC run/level VLCs                        | pending  |
+| Intra MB pipeline (DC/AC pred + IDCT + store)  | pending  |
+| P-frame MV VLCs + motion compensation          | pending  |
+| V1 / V2 bitstream                              | pending  |
+
+Calling `send_packet` on a v3 stream currently parses the picture
+header and the first MB's header + DC differential, then returns an
+[`Error::Unsupported`] diagnostic pointing at the AC decode boundary.
 
 ## License
 

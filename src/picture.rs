@@ -15,6 +15,7 @@ use oxideav_core::bits::BitReader;
 use oxideav_core::{Error, Result};
 
 use crate::header::{MsV3PictureHeader, PictureType};
+use crate::mb::{decode_intra_dc_diff, reconstruct_intra_dc, BlockPred, IntraMbHeader};
 
 /// Dimensions of a picture, derived from the container's
 /// [`oxideav_core::CodecParameters`]. MS-MPEG4v3 does not carry
@@ -96,23 +97,56 @@ impl Picture {
 pub fn decode_picture(br: &mut BitReader<'_>, dims: PictureDims) -> Result<Picture> {
     let hdr = MsV3PictureHeader::parse(br)?;
     match hdr.picture_type {
-        PictureType::I => {
-            // I-frame MB decode pending VLC-table commits. The header is
-            // already consumed; we keep `dims` validated so callers can
-            // still detect obvious mismatches early.
-            let _ = dims;
-            Err(Error::unsupported(format!(
-                "msmpeg4v3: I-frame MB decode not yet implemented (quant={}, \
-                 slice_height={}, flag={})",
-                hdr.quant, hdr.slice_height, hdr.flag as u8,
-            )))
-        }
+        PictureType::I => decode_iframe(br, dims, &hdr),
         PictureType::P => Err(Error::unsupported(format!(
             "msmpeg4v3: P-frame MB decode not yet implemented (quant={}, \
              mv_table={}, rl_table={})",
             hdr.quant, hdr.mv_table_select, hdr.rl_table_select,
         ))),
     }
+}
+
+fn decode_iframe(
+    br: &mut BitReader<'_>,
+    dims: PictureDims,
+    hdr: &MsV3PictureHeader,
+) -> Result<Picture> {
+    let (mb_w, mb_h) = dims.mb_dims();
+    // One prediction slot per 8×8 block — 4 luma + 2 chroma columns for
+    // each MB row. The MB at (mx, my) references blocks at:
+    //   luma   :  (mx*2, my*2)   (mx*2+1, my*2)
+    //             (mx*2, my*2+1) (mx*2+1, my*2+1)
+    //   chroma : (mx + cb_offset, my)
+    //             (mx + cr_offset, my)
+    // Non-intra neighbours predict 1024 (DC) / 0 (AC), which is the
+    // default-initialised value for `BlockPred`.
+    let _luma_pred: Vec<BlockPred> = vec![BlockPred::default(); mb_w * 2 * mb_h * 2];
+    let _chroma_cb_pred: Vec<BlockPred> = vec![BlockPred::default(); mb_w * mb_h];
+    let _chroma_cr_pred: Vec<BlockPred> = vec![BlockPred::default(); mb_w * mb_h];
+
+    // Attempt to parse the first MB to exercise the header + CBPY + DC
+    // machinery — as far as we can go without the AC run/level tables.
+    let first_mb = IntraMbHeader::parse(br).map_err(|e| {
+        Error::invalid(format!(
+            "msmpeg4v3: failed to parse first intra MB header: {e}"
+        ))
+    })?;
+
+    // Decode the DC differential for block 0 (top-left luma) so at
+    // least the DC VLC path is exercised end-to-end on real data.
+    let dc_diff = decode_intra_dc_diff(br, 0)?;
+    let _dc_pel = reconstruct_intra_dc(dc_diff, 1024, 0, hdr.quant as u32);
+
+    Err(Error::unsupported(format!(
+        "msmpeg4v3: I-frame AC decode not yet implemented — got MB 0/0 \
+         with ac_pred={}, cbpy=0x{:x}, dc_diff={}, quant={}, grid={}x{} MBs",
+        first_mb.ac_pred as u8,
+        first_mb.cbpy,
+        dc_diff,
+        hdr.quant,
+        mb_w,
+        mb_h,
+    )))
 }
 
 #[cfg(test)]
@@ -170,14 +204,30 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_carries_header_fields() {
-        let bytes = pack(&[(0, 2), (7, 5), (0, 1), (0, 5), (0, 8)]);
+    fn unsupported_after_first_mb_header() {
+        // I-frame, quant=7, slice_height=0. After the picture header:
+        //   ac_pred = 1
+        //   CBPY = 15 (code `11`, 2 bits)
+        //   DC size luma 0 (code `011`, 3 bits)  -- block 0 DC diff is 0
+        //   then we would expect AC -> Unsupported fires
+        let bytes = pack(&[
+            (0, 2),     // picture_type = I
+            (7, 5),     // quant = 7
+            (0, 1),     // flag = 0
+            (0, 5),     // slice_height = 0
+            (1, 1),     // ac_pred = 1
+            (0b11, 2),  // CBPY = 15
+            (0b011, 3), // DC size 0 for block 0
+            (0, 16),    // filler so the reader doesn't starve mid-VLC
+        ]);
         let mut br = BitReader::new(&bytes);
         let d = PictureDims::new(352, 288).unwrap();
         let err = decode_picture(&mut br, d).unwrap_err();
         let msg = format!("{err}");
-        assert!(msg.contains("I-frame"));
-        assert!(msg.contains("quant=7"));
+        assert!(msg.contains("I-frame"), "msg = {msg}");
+        assert!(msg.contains("quant=7"), "msg = {msg}");
+        assert!(msg.contains("ac_pred=1"), "msg = {msg}");
+        assert!(msg.contains("cbpy=0xf"), "msg = {msg}");
     }
 
     #[test]
