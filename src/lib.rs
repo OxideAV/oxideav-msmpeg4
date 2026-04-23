@@ -46,6 +46,8 @@ use oxideav_core::{
     Result,
 };
 
+pub mod header;
+
 pub const CODEC_ID_V1: &str = "msmpeg4v1";
 pub const CODEC_ID_V2: &str = "msmpeg4v2";
 pub const CODEC_ID_V3: &str = "msmpeg4v3";
