@@ -51,6 +51,7 @@ pub mod idct;
 pub mod iq;
 pub mod picture;
 pub mod scan;
+pub mod tables;
 pub mod vlc;
 
 pub const CODEC_ID_V1: &str = "msmpeg4v1";
