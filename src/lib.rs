@@ -47,6 +47,7 @@ use oxideav_core::{
 };
 
 pub mod header;
+pub mod picture;
 pub mod vlc;
 
 pub const CODEC_ID_V1: &str = "msmpeg4v1";
@@ -290,15 +291,25 @@ struct MsMpeg4Decoder {
     // Cache the classification of the first packet so repeated
     // send_packet calls don't re-scan the same start-code window.
     classified: Option<Classification>,
+    // Picture dimensions carried from the container's CodecParameters
+    // (MS-MPEG4 does not encode dimensions in the bitstream). None if
+    // the container supplied 0 or no dimensions — in that case the
+    // decoder can still parse headers but not allocate pictures.
+    dims: Option<picture::PictureDims>,
 }
 
 impl MsMpeg4Decoder {
-    fn boxed(_params: &CodecParameters, version: MsVersion) -> Result<Box<dyn Decoder>> {
+    fn boxed(params: &CodecParameters, version: MsVersion) -> Result<Box<dyn Decoder>> {
+        let dims = match (params.width, params.height) {
+            (Some(w), Some(h)) if w > 0 && h > 0 => picture::PictureDims::new(w, h).ok(),
+            _ => None,
+        };
         Ok(Box::new(Self {
             codec_id: CodecId::new(version.codec_id()),
             version,
             output_queue: VecDeque::new(),
             classified: None,
+            dims,
         }))
     }
 }
@@ -322,11 +333,32 @@ impl Decoder for MsMpeg4Decoder {
                  probably mislabelled; dispatch to oxideav-mpeg4video instead.",
                 self.version.codec_id(),
             ))),
-            _ => Err(Error::unsupported(format!(
-                "{}: decode not implemented yet. This crate currently exposes a \
-                 classification probe only.",
-                self.version.codec_id(),
-            ))),
+            _ => {
+                if self.version != MsVersion::V3 {
+                    return Err(Error::unsupported(format!(
+                        "{}: decode not implemented yet (only v3 parser is in progress).",
+                        self.version.codec_id(),
+                    )));
+                }
+                let dims = self.dims.ok_or_else(|| {
+                    Error::invalid(format!(
+                        "{}: CodecParameters missing width/height — MS-MPEG4 needs \
+                         them from the container (AVI BITMAPINFOHEADER or equivalent).",
+                        self.version.codec_id(),
+                    ))
+                })?;
+                let mut br = oxideav_core::bits::BitReader::new(&packet.data);
+                match picture::decode_picture(&mut br, dims) {
+                    Ok(_pic) => {
+                        // TODO: wrap into Frame::Video once reconstruction lands.
+                        Err(Error::unsupported(format!(
+                            "{}: picture decoded but frame wrapping not implemented",
+                            self.version.codec_id(),
+                        )))
+                    }
+                    Err(e) => Err(e),
+                }
+            }
         }
     }
 
