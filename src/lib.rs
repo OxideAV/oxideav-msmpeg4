@@ -49,6 +49,7 @@ use oxideav_core::{
 pub mod header;
 pub mod idct;
 pub mod iq;
+pub mod mb;
 pub mod picture;
 pub mod scan;
 pub mod tables;
