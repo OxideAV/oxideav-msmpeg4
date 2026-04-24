@@ -46,6 +46,7 @@ use oxideav_core::{
     Result,
 };
 
+pub mod ac;
 pub mod header;
 pub mod idct;
 pub mod iq;
