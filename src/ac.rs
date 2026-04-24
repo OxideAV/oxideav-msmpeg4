@@ -105,6 +105,48 @@ impl AcVlcTable {
     pub const MPEG4_ESC_LAST_BITS: u8 = 1;
     pub const MPEG4_ESC_RUN_BITS: u8 = 6;
     pub const MPEG4_ESC_LEVEL_BITS: u8 = 8;
+
+    /// Placeholder for the MS-MPEG4v3 intra-AC primary VLC.
+    ///
+    /// **This table is empty by design.** The bundled internal notes do
+    /// not yet contain concrete `(symbol, bit_length)` pairs for the
+    /// intra-AC run/level/last VLC.
+    ///
+    /// Specifically:
+    ///
+    /// * `docs/video/msmpeg4/spec/03-corrections.md` §5.3 identifies
+    ///   the two candidate VMAs but flags them as `**OPEN**`:
+    ///     - `0x1c25fad0` — intra-AC-coefficient run/level/last VLC
+    ///       (candidate pair variant 0) — file offset `0x5eed0`.
+    ///     - `0x1c25f6c8` — intra-AC-coefficient run/level/last VLC
+    ///       (candidate pair variant 1) — file offset `0x5eac8`.
+    ///
+    /// * `docs/video/msmpeg4/spec/03-corrections.md` §6 residual OPEN
+    ///   entry "intra AC VLC pair" — role attribution is a candidate,
+    ///   not confirmed.
+    ///
+    /// * `docs/video/msmpeg4/provenance/03-corrections.md` lines
+    ///   101, 130 — list the two candidate VMAs in the extractor's
+    ///   TODO pile.
+    ///
+    /// * `docs/video/msmpeg4/tables/` — Extractor sessions 00, 01 and
+    ///   02 produced region dumps, but **no region at file offset
+    ///   `0x5eed0` or `0x5eac8` exists** (see `tables/README.md` and
+    ///   `tables/README-02.md` — the closest dumped regions are
+    ///   `0x060438` for the zigzag scan table, not AC VLC data).
+    ///
+    /// Consumer code that wants to exercise the intra-AC pipeline
+    /// on real DIV3/MP43 bitstreams will fail at the first
+    /// [`crate::vlc::decode`] call with
+    /// `"msmpeg4 vlc: empty table"` — this is intentional; it is the
+    /// hand-off signal for the Extractor to produce a real
+    /// `VlcEntry<Symbol>` slice from those two VMAs.
+    pub const V3_INTRA_PLACEHOLDER: AcVlcTable = AcVlcTable {
+        entries: &[],
+        esc_last_bits: Self::MPEG4_ESC_LAST_BITS,
+        esc_run_bits: Self::MPEG4_ESC_RUN_BITS,
+        esc_level_bits: Self::MPEG4_ESC_LEVEL_BITS,
+    };
 }
 
 /// Scan-order selection for the AC walk. MS-MPEG4v3 picks this per-block
@@ -408,6 +450,20 @@ mod tests {
         let mut br = BitReader::new(&bytes);
         let mut block = [0i32; 64];
         assert!(decode_intra_ac(&mut br, &mut block, Scan::Zigzag, &t, 1).is_err());
+    }
+
+    #[test]
+    fn placeholder_v3_intra_is_empty() {
+        // The placeholder exists specifically as a sentinel: its
+        // `entries` slice is empty by design so callers can detect
+        // "no real table yet" without reaching for a separate flag.
+        // See `AcVlcTable::V3_INTRA_PLACEHOLDER` for the detailed
+        // doc-line citations of what's OPEN.
+        assert!(AcVlcTable::V3_INTRA_PLACEHOLDER.entries.is_empty());
+        assert_eq!(
+            AcVlcTable::V3_INTRA_PLACEHOLDER.esc_run_bits,
+            AcVlcTable::MPEG4_ESC_RUN_BITS,
+        );
     }
 
     #[test]

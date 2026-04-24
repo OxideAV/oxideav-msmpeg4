@@ -19,7 +19,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use oxideav_core::bits::BitReader;
+use oxideav_msmpeg4::ac::{AcVlcTable, Scan};
 use oxideav_msmpeg4::header::{MsV3PictureHeader, PictureType};
+use oxideav_msmpeg4::mb::decode_intra_mb;
 
 fn ffmpeg_available() -> bool {
     Command::new("ffmpeg")
@@ -137,6 +139,44 @@ fn ffmpeg_generated_div3_header_and_first_mb_parse() {
         (1..=31).contains(&hdr.quant),
         "pquant {} out of range",
         hdr.quant
+    );
+
+    // Attempt to decode the first intra MB through `decode_intra_mb` using
+    // the placeholder AC VLC table. Expected outcome: an `Unsupported`
+    // error whose message names the two candidate source VMAs
+    // (`0x1c25fad0` and `0x1c25f6c8` per
+    // `docs/video/msmpeg4/spec/03-corrections.md` §5.3) — this is the
+    // hand-off signal for the Extractor.
+    //
+    // This asserts the pipeline is wired end-to-end: classification →
+    // picture header → MB header parse → the AC table is requested at
+    // the right point. Once the Extractor lands real
+    // `VlcEntry<Symbol>` data, flip the assertion to expect Ok(_).
+    let pred = [1024i32; 6];
+    let mb_result = decode_intra_mb(
+        &mut br,
+        hdr.quant as u32,
+        true, // cbp_cb — worst-case (triggers AC path if table were real)
+        true, // cbp_cr
+        pred,
+        Scan::Zigzag,
+        &AcVlcTable::V3_INTRA_PLACEHOLDER,
+    );
+    let err = mb_result.expect_err(
+        "first MB decode must fail (placeholder AC VLC) until Extractor lands real data",
+    );
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("0x1c25fad0"),
+        "error must cite candidate VMA 0x1c25fad0; got: {msg}",
+    );
+    assert!(
+        msg.contains("0x1c25f6c8"),
+        "error must cite candidate VMA 0x1c25f6c8; got: {msg}",
+    );
+    assert!(
+        msg.contains("§5.3"),
+        "error must cite spec section; got: {msg}",
     );
 }
 
