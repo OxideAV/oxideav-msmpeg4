@@ -11,6 +11,16 @@ homepage = "https://github.com/OxideAV/oxideav-msmpeg4"
 readme = "README.md"
 keywords = ["multimedia", "video", "msmpeg4", "divx3", "codec"]
 categories = ["multimedia::encoding", "multimedia::video"]
+build = "build.rs"
+include = [
+    "src/**/*.rs",
+    "build.rs",
+    "Cargo.toml",
+    "LICENSE",
+    "README.md",
+    "CHANGELOG.md",
+    "tables/*.csv",
+]
 
 [dependencies]
 oxideav-core = "0.1"

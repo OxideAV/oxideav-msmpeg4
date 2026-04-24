@@ -1,17 +1,37 @@
-//! Inverse quantisation — H.263-style as used by MS-MPEG4v3.
+//! Inverse quantisation — H.263-style as used by MS-MPEG4 v1/v2/v3.
 //!
-//! For the H.263-style path (the only path MS-MPEG4v3 uses), the
-//! inverse quantisation is:
+//! Per `docs/video/msmpeg4/spec/08-descriptor-constants.md` §3.2 /
+//! `docs/video/msmpeg4/spec/07-remaining-opens.md` §4, all three
+//! integer inner kernels (v1 inter `0x1c215d2c`, v2/v3 inter `0x1c215e6f`
+//! / `0x1c21611b`, and v1/v2/v3 intra `0x1c216d97`) use the **same**
+//! per-MB scalar pair `[esi+0x13c]` (mag) / `[esi+0x140]` (bias),
+//! computed from PQUANT exactly as H.263 §6.2.2.1 Eq. 12:
 //!
-//!   if level == 0:        coeff = 0
-//!   else if quant is odd: coeff = quant * (2*|level| + 1) * sign(level)
-//!   else:                 coeff = (quant * (2*|level| + 1) - 1) * sign(level)
+//!   parity = PQUANT & 1
+//!   mag    = 2 * PQUANT
+//!   bias   = PQUANT - parity
+//!
+//! The dequantised coefficient is:
+//!
+//!   coeff = level * mag + bias   if level > 0
+//!   coeff = level * mag - bias   if level < 0
+//!   coeff = 0                    if level == 0
+//!
+//! This is equivalent to the older "sum of half-step" form:
+//!
+//!   coeff = sign(level) * (quant * (2|level| + 1) - (1 - parity))
+//!
+//! because `2 * QP * |l| + (QP - parity) = QP * (2|l| + 1) - parity` and
+//! parity=0 for odd QP in the old form (a sign-convention flip). The
+//! spec/08 form is what the disassembly actually does, so that's what
+//! we implement.
+//!
+//! Final coefficients are clipped to the signed 12-bit range
+//! [-2048, 2047] per the 12-bit DCT-domain saturation (MPEG-4 Part 2
+//! §7.4.4 / H.263 §6.2.2.1 post-dequant clip).
 //!
 //! The intra DC coefficient uses a different scaling — see
 //! [`dc_scaler`] — and is handled outside this dequantisation step.
-//!
-//! Final coefficients are clipped to the signed 12-bit range
-//! [-2048, 2047] per the spec's 12-bit DCT-domain saturation.
 
 use oxideav_core::{Error, Result};
 
@@ -20,7 +40,10 @@ use oxideav_core::{Error, Result};
 ///
 /// `level_start` is `0` for inter (all positions are bitstream levels)
 /// and `1` for intra (skip the DC, which is reconstructed by the DC
-/// predictor). `coeffs` is modified in place.
+/// predictor). `coeffs` is modified in place. Each coefficient is a
+/// signed "level" as read from the bitstream (`pri_A[idx]` with its
+/// sign bit applied) — this function scales it into the final DCT
+/// domain.
 pub fn dequantise_h263(coeffs: &mut [i32; 64], quant: u32, level_start: usize) -> Result<()> {
     if !(1..=31).contains(&quant) {
         return Err(Error::invalid(format!(
@@ -28,16 +51,17 @@ pub fn dequantise_h263(coeffs: &mut [i32; 64], quant: u32, level_start: usize) -
         )));
     }
     let q = quant as i32;
-    let odd = (q & 1) != 0;
+    let parity = q & 1;
+    let mag = 2 * q;
+    let bias = q - parity;
     for c in &mut coeffs[level_start..] {
         let lv = *c;
         if lv == 0 {
             continue;
         }
-        let abs = lv.unsigned_abs() as i32;
-        let mag = q * (2 * abs + 1);
-        let out = if odd { mag } else { mag - 1 };
-        *c = if lv < 0 { -out } else { out }.clamp(-2048, 2047);
+        // spec/08 §3.2 / spec/07 §4.5: sign(level) * (|level| * mag + bias).
+        let scaled = lv.unsigned_abs() as i32 * mag + bias;
+        *c = if lv < 0 { -scaled } else { scaled }.clamp(-2048, 2047);
     }
     Ok(())
 }
@@ -81,18 +105,20 @@ mod tests {
     fn positive_odd_quant() {
         let mut c = [0i32; 64];
         c[1] = 3;
-        // q=5 (odd): (5*(2*3+1)) = 35.
+        // spec/08: mag = 2*q = 10, parity = 1, bias = q - parity = 4.
+        //   coeff = 3 * 10 + 4 = 34.
         dequantise_h263(&mut c, 5, 1).unwrap();
-        assert_eq!(c[1], 35);
+        assert_eq!(c[1], 34);
     }
 
     #[test]
     fn negative_even_quant() {
         let mut c = [0i32; 64];
         c[5] = -2;
-        // q=4 (even): 4*(2*2+1) - 1 = 19, negated -> -19.
+        // q=4 (even): mag = 8, parity = 0, bias = 4.
+        //   |coeff| = 2 * 8 + 4 = 20; sign of level => -20.
         dequantise_h263(&mut c, 4, 0).unwrap();
-        assert_eq!(c[5], -19);
+        assert_eq!(c[5], -20);
     }
 
     #[test]

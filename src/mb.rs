@@ -1,19 +1,19 @@
 //! Macroblock-level decode for MS-MPEG4v3.
 //!
 //! An MS-MPEG4v3 intra MB consists of:
-//! * 1 bit  `ac_pred_flag`   — is AC prediction active for this MB?
-//! * VLC    `CBPY`           — coded-block-pattern for the 4 luma blocks (the
-//!                              two chroma blocks use a separate CBP field
-//!                              that lives in the MB-type escape chain and is
-//!                              decoded elsewhere; stubbed here)
-//! * per-block:               — one sub-block per the 6 (4 luma + 2 chroma)
-//!   * DC differential (DC-size VLC + that many bits of magnitude, if any)
-//!   * if this block's CBP bit is set: AC coefficients (run/level VLC — not
-//!     yet implemented, see [`crate::tables`])
 //!
-//! This module implements everything **up to** the AC walk, including DC
-//! prediction and bookkeeping of prediction-cache state. The AC walk
-//! currently returns [`Error::Unsupported`] pending the run/level
+//! * 1 bit `ac_pred_flag` — is AC prediction active for this MB?
+//! * VLC `CBPY` — coded-block-pattern for the 4 luma blocks. The two
+//!   chroma blocks use a separate CBP field that lives in the MB-type
+//!   escape chain (spec §3.1 MCBPCY) and is decoded elsewhere.
+//! * Per-block (6 total — 4 luma + 2 chroma):
+//!   - DC differential (DC-size VLC + that many bits of magnitude).
+//!   - If this block's CBP bit is set: AC coefficients (run/level VLC
+//!     — not yet implemented, see [`crate::tables`]).
+//!
+//! This module implements everything **up to** the AC walk, including
+//! DC prediction and bookkeeping of prediction-cache state. The AC
+//! walk currently returns [`Error::Unsupported`] pending the run/level
 //! tables.
 
 use oxideav_core::bits::BitReader;
@@ -312,15 +312,15 @@ mod tests {
         // Minimal header: ac_pred=0, CBPY=0 (no coded AC), then 6
         // DC-size-0 codewords (luma `011` x4, chroma `10` x2).
         let bytes = pack(&[
-            (0, 1),       // ac_pred = 0
-            (0b0011, 4),  // CBPY = 0
-            (0b011, 3),   // block 0 DC size 0
-            (0b011, 3),   // block 1 DC size 0
-            (0b011, 3),   // block 2 DC size 0
-            (0b011, 3),   // block 3 DC size 0
-            (0b11, 2),    // block 4 Cb DC size 0 (chroma code `11`)
-            (0b11, 2),    // block 5 Cr DC size 0 (chroma code `11`)
-            (0, 16),      // tail padding
+            (0, 1),      // ac_pred = 0
+            (0b0011, 4), // CBPY = 0
+            (0b011, 3),  // block 0 DC size 0
+            (0b011, 3),  // block 1 DC size 0
+            (0b011, 3),  // block 2 DC size 0
+            (0b011, 3),  // block 3 DC size 0
+            (0b11, 2),   // block 4 Cb DC size 0 (chroma code `11`)
+            (0b11, 2),   // block 5 Cr DC size 0 (chroma code `11`)
+            (0, 16),     // tail padding
         ]);
         let mut br = BitReader::new(&bytes);
         let pred = [1024i32; 6];
@@ -357,13 +357,13 @@ mod tests {
         // Once a real AcVlcTable ships, flip this test to assert
         // a successful decode of 6 DC-only blocks.
         let bytes = pack(&[
-            (0, 1),       // ac_pred = 0
-            (0b0011, 4),  // CBPY = 0
-            (0b011, 3),   // luma DC size 0
+            (0, 1),      // ac_pred = 0
+            (0b0011, 4), // CBPY = 0
+            (0b011, 3),  // luma DC size 0
             (0b011, 3),
             (0b011, 3),
             (0b011, 3),
-            (0b11, 2),    // chroma DC size 0 (code `11`)
+            (0b11, 2), // chroma DC size 0 (code `11`)
             (0b11, 2),
             (0, 16),
         ]);

@@ -42,8 +42,8 @@ use std::collections::VecDeque;
 
 use oxideav_codec::{CodecInfo, CodecRegistry, Decoder};
 use oxideav_core::{
-    CodecCapabilities, CodecId, CodecParameters, CodecTag, Error, Frame, Packet, ProbeContext,
-    Result,
+    format::PixelFormat, time::TimeBase, CodecCapabilities, CodecId, CodecParameters, CodecTag,
+    Error, Frame, Packet, ProbeContext, Result, VideoFrame, VideoPlane,
 };
 
 pub mod ac;
@@ -54,6 +54,7 @@ pub mod mb;
 pub mod picture;
 pub mod scan;
 pub mod tables;
+pub mod tables_data;
 pub mod vlc;
 
 pub const CODEC_ID_V1: &str = "msmpeg4v1";
@@ -271,6 +272,39 @@ pub fn register(reg: &mut CodecRegistry) {
     }
 }
 
+// ==================== Picture → VideoFrame ====================
+
+/// Wrap a decoded [`picture::Picture`] in an [`oxideav_core::VideoFrame`].
+///
+/// The picture's internal strides are MB-aligned multiples of 16 (luma)
+/// and 8 (chroma); `VideoFrame` carries `(stride, data)` per plane
+/// verbatim. `pts` is propagated from the source packet.
+fn picture_to_video_frame(pic: &picture::Picture, pts: Option<i64>) -> VideoFrame {
+    VideoFrame {
+        format: PixelFormat::Yuv420P,
+        width: pic.width,
+        height: pic.height,
+        pts,
+        // MSMPEG4 has no intrinsic time base — the container (AVI) owns
+        // the frame rate. Caller can override after receive_frame().
+        time_base: TimeBase::new(1, 1),
+        planes: vec![
+            VideoPlane {
+                stride: pic.y_stride,
+                data: pic.y.clone(),
+            },
+            VideoPlane {
+                stride: pic.c_stride,
+                data: pic.cb.clone(),
+            },
+            VideoPlane {
+                stride: pic.c_stride,
+                data: pic.cr.clone(),
+            },
+        ],
+    }
+}
+
 // ==================== Decoder stub ====================
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -354,16 +388,10 @@ impl Decoder for MsMpeg4Decoder {
                     ))
                 })?;
                 let mut br = oxideav_core::bits::BitReader::new(&packet.data);
-                match picture::decode_picture(&mut br, dims) {
-                    Ok(_pic) => {
-                        // TODO: wrap into Frame::Video once reconstruction lands.
-                        Err(Error::unsupported(format!(
-                            "{}: picture decoded but frame wrapping not implemented",
-                            self.version.codec_id(),
-                        )))
-                    }
-                    Err(e) => Err(e),
-                }
+                let pic = picture::decode_picture(&mut br, dims)?;
+                let frame = picture_to_video_frame(&pic, packet.pts);
+                self.output_queue.push_back(Frame::Video(frame));
+                Ok(())
             }
         }
     }

@@ -16,14 +16,14 @@ fn cos_table() -> &'static [[f32; 8]; 8] {
     static T: OnceLock<[[f32; 8]; 8]> = OnceLock::new();
     T.get_or_init(|| {
         let mut t = [[0.0f32; 8]; 8];
-        for k in 0..8 {
+        for (k, row) in t.iter_mut().enumerate() {
             let c_k = if k == 0 {
                 (1.0_f32 / 2.0_f32).sqrt()
             } else {
                 1.0
             };
-            for n in 0..8 {
-                t[k][n] = 0.5 * c_k * ((2 * n + 1) as f32 * k as f32 * PI / 16.0).cos();
+            for (n, cell) in row.iter_mut().enumerate() {
+                *cell = 0.5 * c_k * ((2 * n + 1) as f32 * k as f32 * PI / 16.0).cos();
             }
         }
         t

@@ -177,11 +177,7 @@ pub fn decode_token(br: &mut BitReader<'_>, table: &AcVlcTable) -> Result<Token>
         Symbol::RunLevel { last, run, level } => {
             // 1 sign bit follows the VLC match.
             let sign = br.read_bit()?;
-            let signed = if sign {
-                -(level as i32)
-            } else {
-                level as i32
-            };
+            let signed = if sign { -(level as i32) } else { level as i32 };
             let signed = signed.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
             Ok(Token {
                 last,
@@ -396,14 +392,7 @@ mod tests {
         //   Tok B: code `001` sign `0` -> (last=0, run=2, level=+1) @ pos 1+1+2 = 4 (zz=9)
         //   Tok C: code `01` sign `1` -> (last=1, run=0, level=-1)  @ pos 4+1 = 5 (zz=2)
         let t = toy_table();
-        let bytes = pack(&[
-            (0b1, 1),
-            (0, 1),
-            (0b001, 3),
-            (0, 1),
-            (0b01, 2),
-            (1, 1),
-        ]);
+        let bytes = pack(&[(0b1, 1), (0, 1), (0b001, 3), (0, 1), (0b01, 2), (1, 1)]);
         let mut br = BitReader::new(&bytes);
         let mut block = [0i32; 64];
         let n = decode_intra_ac(&mut br, &mut block, Scan::Zigzag, &t, 1).unwrap();
@@ -436,7 +425,10 @@ mod tests {
             let n = decode_intra_ac(&mut br, &mut block, scan, &t, 1).unwrap();
             assert_eq!(n, 1);
             let expected_pos = scan.table()[1];
-            assert_eq!(block[expected_pos], 1, "scan {scan:?} target={expected_pos}");
+            assert_eq!(
+                block[expected_pos], 1,
+                "scan {scan:?} target={expected_pos}"
+            );
         }
     }
 
@@ -470,7 +462,8 @@ mod tests {
     fn decode_intra_block_runs_dequantise() {
         // DC = 512 goes straight to block[0]. AC has one token
         // terminating immediately with (last=1, run=0, level=+1).
-        // After dequant with q=5 (odd): lvl 1 -> 5 * (2*1+1) = 15.
+        // After dequant with q=5 (odd, parity=1, mag=10, bias=4):
+        //   coeff = 1 * 10 + 4 = 14.
         let t = toy_table();
         let bytes = pack(&[(0b01, 2), (0, 1)]);
         let mut br = BitReader::new(&bytes);
@@ -478,6 +471,6 @@ mod tests {
         let n = decode_intra_block(&mut br, &mut block, 512, Scan::Zigzag, &t, 5).unwrap();
         assert_eq!(n, 1);
         assert_eq!(block[0], 512, "DC untouched");
-        assert_eq!(block[ZIGZAG[1]], 15, "AC dequantised");
+        assert_eq!(block[ZIGZAG[1]], 14, "AC dequantised");
     }
 }
