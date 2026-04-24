@@ -37,6 +37,17 @@ pub struct BlockPred {
 }
 
 /// Intra MB header — the state decoded before per-block decode begins.
+///
+/// Two shapes are supported:
+///
+/// * [`IntraMbHeader::parse`] — legacy H.263-style parse (`ac_pred` bit
+///   followed by a CBPY VLC for the 4 luma blocks). The MSMPEG4v3 bit
+///   layout does **not** match this; it is retained for v1/v2 paths and
+///   for tests that exercise the old shape.
+/// * [`IntraMbHeader::parse_v3_mcbpcy`] — MSMPEG4 v3 joint-MCBPCY parse
+///   (spec §3.1 / spec/05 §3.2): decode the 128-entry joint-MCBPCY VLC
+///   first, then read the post-VLC `ac_pred_flag` bit. Produces
+///   `ac_pred`, 4-bit `cbpy`, and the two chroma CBP bits.
 #[derive(Clone, Copy, Debug)]
 pub struct IntraMbHeader {
     pub ac_pred: bool,
@@ -44,13 +55,40 @@ pub struct IntraMbHeader {
     /// coefficients. Luma blocks are ordered raster (top-left,
     /// top-right, bottom-left, bottom-right).
     pub cbpy: u8,
+    /// Cb chroma CBP bit (set only by the joint-MCBPCY parse).
+    pub cbp_cb: bool,
+    /// Cr chroma CBP bit (set only by the joint-MCBPCY parse).
+    pub cbp_cr: bool,
 }
 
 impl IntraMbHeader {
     pub fn parse(br: &mut BitReader<'_>) -> Result<Self> {
         let ac_pred = br.read_bit()?;
         let cbpy = vlc::decode(br, CBPY_INTRA_TABLE)?;
-        Ok(Self { ac_pred, cbpy })
+        Ok(Self {
+            ac_pred,
+            cbpy,
+            cbp_cb: false,
+            cbp_cr: false,
+        })
+    }
+
+    /// MSMPEG4 v3 intra MB header: decode the 128-entry joint-MCBPCY
+    /// canonical-Huffman VLC, then read 1 bit for `ac_pred_flag`.
+    ///
+    /// The decoded joint index's low 6 bits give the 6-block CBP
+    /// pattern (4 luma + 2 chroma), and the post-VLC bit is
+    /// `ac_pred_flag` (spec/05 §3.2 step 5, "sign bit `0x1c215c9b` at
+    /// `1c2178ca`").
+    pub fn parse_v3_mcbpcy(br: &mut BitReader<'_>) -> Result<Self> {
+        let dec = crate::mcbpcy::decode_mcbpcy(br)?;
+        let ac_pred = br.read_bit()?;
+        Ok(Self {
+            ac_pred,
+            cbpy: dec.cbpy,
+            cbp_cb: dec.cbp_cb,
+            cbp_cr: dec.cbp_cr,
+        })
     }
 }
 
@@ -255,6 +293,8 @@ mod tests {
         let h = IntraMbHeader::parse(&mut br).unwrap();
         assert!(h.ac_pred);
         assert_eq!(h.cbpy, 15);
+        assert!(!h.cbp_cb);
+        assert!(!h.cbp_cr);
     }
 
     #[test]
@@ -265,6 +305,8 @@ mod tests {
         let h = IntraMbHeader::parse(&mut br).unwrap();
         assert!(!h.ac_pred);
         assert_eq!(h.cbpy, 0);
+        assert!(!h.cbp_cb);
+        assert!(!h.cbp_cr);
     }
 
     #[test]
