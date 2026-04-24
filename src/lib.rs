@@ -30,11 +30,22 @@
 //!
 //! # Status
 //!
-//! **Probe + stubs only.** [`classify`] is fully implemented and
-//! tested. [`Decoder`]s register themselves under the codec ids above
-//! but their `send_packet` returns [`Error::Unsupported`] with a
-//! diagnostic message. The bitstream parser, VLC tables, and
-//! macroblock pipeline are future work.
+//! **v3 partial decoder.** [`classify`] is fully implemented and
+//! tested. The v3 decoder now runs end-to-end for I-frames (with a
+//! DC-only placeholder path where the intra-AC VLC is still the spec
+//! §9 OPEN clean-room extraction item) and for P-frames (skip + inter
+//! MC-only; inter-AC VLC also OPEN). P-frame MC uses the `0x1c25cbc0`
+//! default joint MV VLC (1100 entries + ESC) with the `0x1c25ee28` /
+//! `0x1c25f278` byte LUTs for MVDx / MVDy, all extracted into
+//! `tables/` and wired through `build.rs`. The alternate MV VLC
+//! (`0x1c25a0b8`) has only a 256-byte extraction dump and is rejected
+//! with a documented `Unsupported` error.
+//!
+//! v1 and v2 are still stubs — the v1/v2 MCBPC + CBPY separated
+//! tables (`0x1c253d40` / `0x1c254240` / `0x1c254140`) and the 33-entry
+//! per-component MV VLC (`0x1c24f930`) are not yet extracted into
+//! `tables/`. See `docs/video/msmpeg4/spec/07-remaining-opens.md` for
+//! the traced decoder bodies.
 
 #![deny(unsafe_code)]
 
@@ -52,7 +63,9 @@ pub mod header;
 pub mod idct;
 pub mod iq;
 pub mod mb;
+pub mod mc;
 pub mod mcbpcy;
+pub mod mv;
 pub mod picture;
 pub mod scan;
 pub mod tables;
@@ -338,6 +351,9 @@ struct MsMpeg4Decoder {
     // the container supplied 0 or no dimensions — in that case the
     // decoder can still parse headers but not allocate pictures.
     dims: Option<picture::PictureDims>,
+    // Last decoded picture, retained so P-frames can use it as an MC
+    // reference. Cleared on `flush()`.
+    last_picture: Option<picture::Picture>,
 }
 
 impl MsMpeg4Decoder {
@@ -352,6 +368,7 @@ impl MsMpeg4Decoder {
             output_queue: VecDeque::new(),
             classified: None,
             dims,
+            last_picture: None,
         }))
     }
 }
@@ -390,8 +407,9 @@ impl Decoder for MsMpeg4Decoder {
                     ))
                 })?;
                 let mut br = oxideav_core::bits::BitReader::new(&packet.data);
-                let pic = picture::decode_picture(&mut br, dims)?;
+                let pic = picture::decode_picture(&mut br, dims, self.last_picture.as_ref())?;
                 let frame = picture_to_video_frame(&pic, packet.pts);
+                self.last_picture = Some(pic);
                 self.output_queue.push_back(Frame::Video(frame));
                 Ok(())
             }
@@ -408,6 +426,7 @@ impl Decoder for MsMpeg4Decoder {
     fn flush(&mut self) -> Result<()> {
         self.output_queue.clear();
         self.classified = None;
+        self.last_picture = None;
         Ok(())
     }
 }

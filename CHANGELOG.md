@@ -9,6 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **v3 P-frame decoder skeleton** (round 9): `decode_pframe` wires
+  the full P-frame pipeline around the intra path. Per-MB skip-bit
+  read + joint MCBPCY (shared with I-frames) + post-VLC `ac_pred`
+  flag + (if intra) reuse the intra pipeline or (if inter) decode
+  the joint (MVDx, MVDy) MV VLC and copy a 16×16 luma + two 8×8
+  chroma blocks from the previous reference picture. The decoder
+  now retains the last decoded picture (cleared on `flush()`) and
+  threads it as the MC reference automatically.
+- **MV VLC + MVDx/MVDy byte LUTs** (`mv.rs`): the default v3 joint
+  (X, Y) MV VLC source at VMA `0x1c25cbc0` (1100 entries + ESC
+  index 1099) and the `0x1c25ee28` / `0x1c25f278` byte LUTs are
+  extracted into `tables/region_05bfc0.csv` +
+  `region_05e228.hex` / `region_05e678.hex` and compiled via
+  `build.rs` into `MV_V3_RAW` / `MVDX_V3_BYTES` / `MVDY_V3_BYTES`.
+  Canonical Huffman builder (shared with MCBPCY), median-of-3
+  neighbour predictor, ESC tail (6 bits MVDx + 6 bits MVDy), and
+  toroidal `[-63, +63]` wrap all wired per spec/06 §§3.1–3.5.
+- **Motion compensation** (`mc.rs`): integer + half-pel bilinear
+  luma/chroma MC with edge-clamp OOB handling. `mc_macroblock`
+  handles the 16×16 luma + 2× 8×8 chroma copy in one call, using
+  the MPEG-4 §7.6.3.4 chroma-MV derivation `chroma = luma >> 1` for
+  the 1-MV-per-MB case.
+- **P-frame MCBPCY variant** (`decode_mcbpcy_pframe`): reads the
+  1-bit skip prefix (spec/05 §3.2), then on non-skip decodes the
+  joint VLC + post-VLC `ac_pred` bit. Returns `PFrameMcbpcy::Skip`
+  on the skip branch so the caller can MC-copy from the reference
+  directly.
+- Alternate MV table (`mv_table_sel == 1`, VMA `0x1c25a0b8`) is
+  rejected with a documented `Unsupported` error — the available
+  extraction dump is truncated to 256 of the 8800 bytes needed for
+  the 1100-entry alphabet. The default table covers the most
+  common content.
 - v3 I-frame decoder produces a `Frame::Video` end-to-end: picture
   header → MB loop → 6 blocks per MB → DC-path reconstruction +
   IDCT → YUV420P pel planes. Clean-room first-light milestone.

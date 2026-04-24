@@ -65,6 +65,37 @@ fn mint_div3_avi(dir: &Path) -> Option<PathBuf> {
     }
 }
 
+/// Enumerate all `00dc` (video) payloads in an AVI in file order.
+fn all_video_chunks(avi: &[u8]) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut i = 12;
+    while i + 8 <= avi.len() {
+        let fourcc = &avi[i..i + 4];
+        let size = u32::from_le_bytes([avi[i + 4], avi[i + 5], avi[i + 6], avi[i + 7]]) as usize;
+        if fourcc == b"00dc" && size > 0 {
+            let payload_start = i + 8;
+            let payload_end = payload_start + size;
+            if payload_end <= avi.len() {
+                out.push(avi[payload_start..payload_end].to_vec());
+            }
+            let mut next = payload_end;
+            if next % 2 != 0 {
+                next += 1;
+            }
+            i = next;
+        } else if fourcc == b"RIFF" || fourcc == b"LIST" {
+            i += 12;
+        } else {
+            let mut next = i + 8 + size;
+            if next % 2 != 0 {
+                next += 1;
+            }
+            i = next;
+        }
+    }
+    out
+}
+
 /// Minimalistic AVI/RIFF scan: look for `00dc` chunks (video payload)
 /// inside `movi` list and return the first chunk's bytes.
 fn first_video_chunk(avi: &[u8]) -> Option<Vec<u8>> {
@@ -395,6 +426,130 @@ fn testsrc2_32x32_ffmpeg_parity() {
             "Y PSNR {y_psnr} dB suggests catastrophic decode — DC \
              prediction or pel-placement is wrong"
         );
+    }
+}
+
+/// P-frame smoke test: mint a 2-frame 32×32 DIV3 AVI (one I then one P),
+/// decode both through our pipeline, and assert the P-frame decode
+/// completes and produces a YUV picture. The current build lacks the
+/// inter AC VLC (spec/99 §9 OPEN), so the P-frame output is pure MC
+/// from the reference — but that is exactly what "P-frame decode
+/// completes + produces image" means in round-9 terms.
+///
+/// The test is tolerant: if ffmpeg emits an MV that selects the
+/// alternate table (`mv_table_sel == 1`) we accept the documented
+/// `Unsupported` error; and if some MB hits the AC-placeholder path
+/// (e.g. for intra-in-P blocks with coded CBP) we likewise accept a
+/// `placeholder / AC` error string. The point is to prove the P-frame
+/// pipeline runs end-to-end for at least the all-skip or all-inter
+/// path, not to hit bit-exact parity against ffmpeg.
+#[test]
+fn pframe_smoke_32x32_decodes() {
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg not available — skipping integration test");
+        return;
+    }
+    let tmp = tempdir();
+    let avi = tmp.join("pframe.avi");
+    let ok = Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=gray:s=32x32:d=0.12:r=25",
+            "-c:v",
+            "msmpeg4v3",
+            "-g",
+            "2",
+            "-qscale:v",
+            "8",
+            "-f",
+            "avi",
+            "-y",
+        ])
+        .arg(&avi)
+        .status()
+        .ok()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !ok {
+        eprintln!("ffmpeg failed to mint P-frame DIV3 — skipping");
+        return;
+    }
+    let bytes = std::fs::read(&avi).expect("read AVI");
+    let chunks = all_video_chunks(&bytes);
+    if chunks.len() < 2 {
+        eprintln!("AVI has < 2 video chunks — skipping P-frame test");
+        return;
+    }
+
+    let mut reg = CodecRegistry::new();
+    oxideav_msmpeg4::register(&mut reg);
+    let mut params = CodecParameters::video(CodecId::new("msmpeg4v3"));
+    params.width = Some(32);
+    params.height = Some(32);
+    let mut dec = reg.make_decoder(&params).expect("decoder creation");
+
+    // I-frame first.
+    let pkt0 = Packet::new(0, TimeBase::new(1, 25), chunks[0].clone())
+        .with_pts(0)
+        .with_keyframe(true);
+    match dec.send_packet(&pkt0) {
+        Ok(()) => {
+            let _ = dec.receive_frame();
+        }
+        Err(e) => {
+            // I-frame itself might hit the AC placeholder; document and
+            // bail out of the P-frame half.
+            let msg = format!("{e}");
+            eprintln!("I-frame decode errored: {msg} — skipping P-frame half");
+            return;
+        }
+    }
+
+    // P-frame second.
+    let pkt1 = Packet::new(0, TimeBase::new(1, 25), chunks[1].clone()).with_pts(1);
+    match dec.send_packet(&pkt1) {
+        Ok(()) => {
+            let frame = dec.receive_frame().expect("P-frame output");
+            match frame {
+                oxideav_core::Frame::Video(v) => {
+                    assert_eq!(v.format, oxideav_core::format::PixelFormat::Yuv420P);
+                    assert_eq!(v.width, 32);
+                    assert_eq!(v.height, 32);
+                    assert_eq!(v.planes.len(), 3);
+                    let y_max = v.planes[0].data.iter().copied().max().unwrap_or(0);
+                    assert!(y_max > 0, "P-frame luma plane was all zeros");
+                    eprintln!(
+                        "pframe_smoke_32x32_decodes: P-frame OK, Y max = {y_max}, \
+                         len = {}",
+                        v.planes[0].data.len()
+                    );
+                }
+                other => panic!("expected Frame::Video, got {other:?}"),
+            }
+        }
+        Err(e) => {
+            // Documented boundaries for P-frame decode:
+            //   * mv_table_sel=1 (alternate MV VLC) — not extracted
+            //   * intra-in-P with coded CBP → AC placeholder
+            //   * inter MB with coded CBP — would need inter AC VLC
+            //     (also OPEN)
+            let msg = format!("{e}");
+            assert!(
+                msg.contains("placeholder")
+                    || msg.contains("AC")
+                    || msg.contains("mv_table_sel")
+                    || msg.contains("alternate MV VLC")
+                    || msg.contains("vlc")
+                    || msg.contains("0x1c"),
+                "P-frame decode error should cite a documented gap; got: {msg}",
+            );
+            eprintln!("P-frame decode at documented gap: {msg}");
+        }
     }
 }
 

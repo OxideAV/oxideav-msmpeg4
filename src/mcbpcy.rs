@@ -133,6 +133,41 @@ pub fn decode_mcbpcy(br: &mut BitReader<'_>) -> Result<McbpcyDecode> {
     })
 }
 
+/// P-frame MCBPCY parse: first read a 1-bit `skip` flag; if skipped,
+/// the MB is copy-from-reference (no residual, zero MV). Otherwise
+/// decode the same 128-entry joint VLC as the I-frame path.
+///
+/// Per spec/05 §3.2: on P-frames, `[edi+0x88] != 0` gates the 1-bit
+/// skip read at `1c21786c..1c217877`. For I-frames (`[edi+0x88] == 0`)
+/// the path skips directly to the joint-VLC decode, which is what
+/// [`decode_mcbpcy`] implements. We split the P-frame variant here so
+/// the caller can branch on the skip-flag before doing any per-MB
+/// work.
+pub enum PFrameMcbpcy {
+    /// MB is skipped: duplicate the reference MB verbatim, using a
+    /// zero MV. This is the "MB-coded=0" branch.
+    Skip,
+    /// Non-skipped MB: the decoded joint symbol + post-VLC ac_pred bit
+    /// (the binary reads the bit at `1c2178c4..1c2178cf` regardless of
+    /// bit-6 result; the ac_pred flag is consumed only for intra-in-P).
+    Coded { decode: McbpcyDecode, ac_pred: bool },
+}
+
+/// Read the P-frame MB skip flag, then (if not skipped) decode the
+/// joint MCBPCY + the post-VLC `ac_pred` bit.
+pub fn decode_mcbpcy_pframe(br: &mut BitReader<'_>) -> Result<PFrameMcbpcy> {
+    let skip = br.read_bit()?;
+    if skip {
+        return Ok(PFrameMcbpcy::Skip);
+    }
+    let decode = decode_mcbpcy(br)?;
+    // ac_pred bit is read after the joint VLC; it is meaningful only
+    // for intra-in-P MBs, but the decoder always consumes the bit
+    // regardless so subsequent parsing stays aligned.
+    let ac_pred = br.read_bit()?;
+    Ok(PFrameMcbpcy::Coded { decode, ac_pred })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

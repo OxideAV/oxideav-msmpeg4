@@ -34,6 +34,30 @@
 //! still an open clean-room extraction item** (spec §9 OPEN-O4); on
 //! coded blocks the AC plane is zero-filled (DC-only reconstruction)
 //! until the Extractor lands the real run/level/last table.
+//!
+//! ## P-frame decode path (round-9)
+//!
+//! Round 9 wires the P-frame skeleton around the intra pipeline
+//! (spec/05 §3.2, spec/06 §§1–3):
+//!
+//!   1. [`MsV3PictureHeader::parse`] now reads the `mv_table_sel` bit
+//!      for P-frames; we currently accept only `mv_table_sel == 0`
+//!      because the alternate MV VLC source at VMA `0x1c25a0b8` is
+//!      truncated in the extraction (see `tables/region_0594b8.meta`).
+//!   2. Per-MB loop — [`decode_pframe_mb`] reads the 1-bit skip flag,
+//!      then the 128-entry joint MCBPCY (shared with I-frames), then
+//!      the 1-bit `ac_pred` flag.
+//!   3. If the MCBPCY index falls in the high half (`idx >= 64`) the
+//!      MB is intra-in-P and reuses the intra pipeline via
+//!      [`decode_intra_mb_with_header`].
+//!   4. Otherwise it is inter: [`crate::mv::decode_mv`] consumes the
+//!      joint (MVDx, MVDy) VLC + byte-LUT lookup + ESC tail and
+//!      returns a half-pel MV in `[-63, +63]`; [`apply_mc_to_mb`]
+//!      copies the 16×16 luma + two 8×8 chroma blocks from the
+//!      reference with bilinear half-pel averaging.
+//!   5. Inter residual is **zero** in this round — the inter AC VLC
+//!      is still OPEN (spec/99 §9). Full inter-residual decode is
+//!      round-10+ territory.
 
 use oxideav_core::bits::BitReader;
 use oxideav_core::{Error, Result};
@@ -109,15 +133,38 @@ impl Picture {
 }
 
 /// Entry point: parse the picture header and decode a full picture.
-pub fn decode_picture(br: &mut BitReader<'_>, dims: PictureDims) -> Result<Picture> {
+///
+/// P-frames require a reference picture (normally the previous
+/// successfully decoded frame). Callers should thread the last-decoded
+/// `Picture` through `reference` — an I-frame is decoded without a
+/// reference (the reference argument is ignored for `PictureType::I`).
+pub fn decode_picture(
+    br: &mut BitReader<'_>,
+    dims: PictureDims,
+    reference: Option<&Picture>,
+) -> Result<Picture> {
     let hdr = MsV3PictureHeader::parse(br)?;
     match hdr.picture_type {
         PictureType::I => decode_iframe(br, dims, &hdr),
-        PictureType::P => Err(Error::unsupported(format!(
-            "msmpeg4v3: P-frame decode not yet implemented (quant={}, \
-             ac_chroma_sel={}, dc_size_sel={}, mv_table_sel={})",
-            hdr.quant, hdr.ac_chroma_sel, hdr.dc_size_sel, hdr.mv_table_sel,
-        ))),
+        PictureType::P => {
+            let reference = reference.ok_or_else(|| {
+                Error::invalid(
+                    "msmpeg4v3: P-frame decode requires a reference picture (\
+                     decoder state is missing the previous frame). Make sure \
+                     to feed packets in decode order starting with an I-frame.",
+                )
+            })?;
+            if hdr.mv_table_sel != 0 {
+                return Err(Error::unsupported(
+                    "msmpeg4v3: P-frame mv_table_sel = 1 (alternate MV VLC \
+                     at VMA 0x1c25a0b8) not supported — only a 256-byte \
+                     extraction dump is available. See \
+                     docs/video/msmpeg4/tables/region_0594b8.meta for the \
+                     truncation note.",
+                ));
+            }
+            decode_pframe(br, dims, &hdr, reference)
+        }
     }
 }
 
@@ -166,6 +213,258 @@ fn decode_iframe(
     }
 
     Ok(pic)
+}
+
+/// Decode a full v3 P-frame into a [`Picture`], using the supplied
+/// `reference` for motion compensation. Inter MBs read a joint (MVDx,
+/// MVDy) VLC, apply a median-of-3 predictor over the three neighbour
+/// MVs, and copy a 16×16 luma + two 8×8 chroma blocks from the
+/// reference at the resulting half-pel position (bilinear-averaged).
+/// Intra-in-P MBs are decoded via the same I-frame pipeline (spatial
+/// DC prediction + AC walk / placeholder).
+///
+/// Because the intra AC VLC is still a placeholder (spec/99 §9 OPEN),
+/// intra-in-P blocks are reconstructed DC-only when their CBP bit is
+/// set — same behaviour as in I-frames.
+///
+/// Because the *inter* AC VLC has not been extracted either, all
+/// inter MBs here are decoded with a **zero residual**: MC copy only.
+/// This is a partial P-frame decode that will show the reference
+/// frame's motion-compensated pixels without the residual detail.
+/// When the Extractor lands the inter AC VLC a future round will
+/// plug it in and the inter-residual path will activate.
+fn decode_pframe(
+    br: &mut BitReader<'_>,
+    dims: PictureDims,
+    hdr: &MsV3PictureHeader,
+    reference: &Picture,
+) -> Result<Picture> {
+    // Reference dimensions must match; otherwise MC indexing is
+    // meaningless.
+    if reference.width != dims.width || reference.height != dims.height {
+        return Err(Error::invalid(format!(
+            "msmpeg4v3: P-frame reference dimensions {}x{} differ from \
+             current {}x{}",
+            reference.width, reference.height, dims.width, dims.height,
+        )));
+    }
+
+    let (mb_w, mb_h) = dims.mb_dims();
+    let mut pic = Picture::alloc(dims, PictureType::P);
+    let mut dc_cache = DcCache::new(mb_w, mb_h);
+    let quant = hdr.quant as u32;
+
+    // MV grid: one (MVx, MVy) entry per MB. Skipped / intra MBs use
+    // (0, 0) so the predictor's zero-substitution semantics match
+    // spec/06 §3.4 (boundary zero-out).
+    let mut mv_grid: Vec<Option<crate::mv::Mv>> = vec![None; mb_w * mb_h];
+
+    for my in 0..mb_h {
+        for mx in 0..mb_w {
+            decode_pframe_mb(
+                br,
+                &mut pic,
+                &mut dc_cache,
+                &mut mv_grid,
+                reference,
+                mx,
+                my,
+                mb_w,
+                quant,
+            )?;
+        }
+    }
+
+    Ok(pic)
+}
+
+/// Decode one P-frame MB: skip-bit + MCBPCY + (if coded) per-block
+/// decode + MV/MC if inter.
+#[allow(clippy::too_many_arguments)]
+fn decode_pframe_mb(
+    br: &mut BitReader<'_>,
+    pic: &mut Picture,
+    dc_cache: &mut DcCache,
+    mv_grid: &mut [Option<crate::mv::Mv>],
+    reference: &Picture,
+    mb_x: usize,
+    mb_y: usize,
+    mb_w: usize,
+    quant: u32,
+) -> Result<()> {
+    use crate::mcbpcy::{decode_mcbpcy_pframe, PFrameMcbpcy};
+
+    let mb_idx = mb_y * mb_w + mb_x;
+    let (skip, mb_info) = match decode_mcbpcy_pframe(br)? {
+        PFrameMcbpcy::Skip => (true, None),
+        PFrameMcbpcy::Coded { decode, ac_pred } => (false, Some((decode, ac_pred))),
+    };
+
+    // Neighbour MV lookup for median predictor (spec/06 §3.4).
+    let left = if mb_x > 0 {
+        mv_grid[mb_y * mb_w + (mb_x - 1)]
+    } else {
+        None
+    };
+    let top = if mb_y > 0 {
+        mv_grid[(mb_y - 1) * mb_w + mb_x]
+    } else {
+        None
+    };
+    let top_right = if mb_y > 0 && mb_x + 1 < mb_w {
+        mv_grid[(mb_y - 1) * mb_w + (mb_x + 1)]
+    } else {
+        None
+    };
+
+    if skip {
+        // Skip MB: MV = predictor-based zero (spec/06 §3.4 says
+        // missing neighbours are zero-subbed; skipped MBs themselves
+        // contribute zero MV too per H.263 convention). Copy the MC
+        // prediction at MV=(0,0).
+        mv_grid[mb_idx] = Some(crate::mv::Mv::default());
+        apply_mc_to_mb(pic, reference, mb_x, mb_y, (0, 0));
+        return Ok(());
+    }
+
+    let (decode, _ac_pred) = mb_info.expect("Coded variant");
+
+    if decode.is_intra {
+        // Intra-in-P path: reuse the intra pipeline. The existing
+        // `IntraMbHeader` shape wants cbpy/cbp_cb/cbp_cr already
+        // decoded — we reuse the MCBPCY result here directly.
+        let header = crate::mb::IntraMbHeader {
+            ac_pred: _ac_pred,
+            cbpy: decode.cbpy,
+            cbp_cb: decode.cbp_cb,
+            cbp_cr: decode.cbp_cr,
+        };
+        decode_intra_mb_with_header(br, pic, dc_cache, &header, mb_x, mb_y, quant)?;
+        // Intra MBs clear the MV predictor chain: the per-row mv_grid
+        // entry stays `None` so downstream neighbours treat this
+        // column as zero.
+        return Ok(());
+    }
+
+    // Inter MB: decode the joint MV VLC using the median predictor.
+    let predictor = crate::mv::median_predictor(left, top, top_right);
+    let mv = crate::mv::decode_mv(br, predictor)?;
+    mv_grid[mb_idx] = Some(mv);
+
+    apply_mc_to_mb(pic, reference, mb_x, mb_y, (mv.x as i32, mv.y as i32));
+
+    // Inter residual: OPEN (no inter AC VLC extracted). Zero residual
+    // for now → the output is pure MC prediction.
+    Ok(())
+}
+
+/// Apply motion compensation to the (mb_x, mb_y) MB using the given
+/// half-pel MV. Writes luma + chroma into the picture.
+fn apply_mc_to_mb(
+    pic: &mut Picture,
+    reference: &Picture,
+    mb_x: usize,
+    mb_y: usize,
+    mv_half: (i32, i32),
+) {
+    let ref_y = crate::mc::RefPlane {
+        data: &reference.y,
+        stride: reference.y_stride,
+        width: reference.width as usize,
+        height: reference.height as usize,
+    };
+    let ref_cb = crate::mc::RefPlane {
+        data: &reference.cb,
+        stride: reference.c_stride,
+        width: (reference.width as usize).div_ceil(2),
+        height: (reference.height as usize).div_ceil(2),
+    };
+    let ref_cr = crate::mc::RefPlane {
+        data: &reference.cr,
+        stride: reference.c_stride,
+        width: (reference.width as usize).div_ceil(2),
+        height: (reference.height as usize).div_ceil(2),
+    };
+    crate::mc::mc_macroblock(
+        &ref_y,
+        &ref_cb,
+        &ref_cr,
+        &mut pic.y,
+        &mut pic.cb,
+        &mut pic.cr,
+        pic.y_stride,
+        pic.c_stride,
+        mb_x,
+        mb_y,
+        mv_half,
+    );
+}
+
+/// Variant of `decode_intra_mb_to_picture` that accepts a pre-decoded
+/// header (used by the P-frame intra-in-P path where the MCBPCY was
+/// decoded via `decode_mcbpcy_pframe`).
+fn decode_intra_mb_with_header(
+    br: &mut BitReader<'_>,
+    pic: &mut Picture,
+    dc_cache: &mut DcCache,
+    header: &IntraMbHeader,
+    mb_x: usize,
+    mb_y: usize,
+    quant: u32,
+) -> Result<()> {
+    for block_idx in 0..6usize {
+        let cbp_set = match block_idx {
+            0..=3 => header.cbpy & (1 << (3 - block_idx)) != 0,
+            4 => header.cbp_cb,
+            5 => header.cbp_cr,
+            _ => unreachable!(),
+        };
+        let (bx, by) = block_grid_pos(block_idx, mb_x, mb_y);
+        let pred: DcPrediction = match block_idx {
+            0..=3 => dc_cache.predict_luma(bx, by),
+            4 => dc_cache.predict_chroma(false, bx, by),
+            5 => dc_cache.predict_chroma(true, bx, by),
+            _ => unreachable!(),
+        };
+        let scan = if header.ac_pred {
+            pred.direction.ac_scan()
+        } else {
+            Scan::Zigzag
+        };
+        let block_result = if cbp_set && V3_INTRA_AC_TABLE.entries.is_empty() {
+            let dc_diff = crate::mb::decode_intra_dc_diff(br, block_idx)?;
+            let dc = crate::mb::reconstruct_intra_dc(dc_diff, pred.predictor, block_idx, quant);
+            crate::mb::DecodedIntraBlock {
+                coeffs: {
+                    let mut a = [0i32; 64];
+                    a[0] = dc;
+                    a
+                },
+                ac_nonzero: 0,
+            }
+        } else {
+            decode_intra_block_full(
+                br,
+                block_idx,
+                pred.predictor,
+                quant,
+                cbp_set,
+                scan,
+                &V3_INTRA_AC_TABLE,
+            )?
+        };
+        let reconstructed_dc = block_result.coeffs[0];
+        match block_idx {
+            0..=3 => dc_cache.luma_set(bx, by, reconstructed_dc),
+            4 => dc_cache.chroma_set(false, bx, by, reconstructed_dc),
+            5 => dc_cache.chroma_set(true, bx, by, reconstructed_dc),
+            _ => unreachable!(),
+        }
+        let mut pels = [0i32; 64];
+        idct8x8_to_pel(&block_result.coeffs, &mut pels);
+        write_block_to_picture(pic, mb_x, mb_y, block_idx, &pels);
+    }
+    Ok(())
 }
 
 /// Map a per-MB block index (0..5) to its block-grid (bx, by) position.
@@ -412,7 +711,7 @@ mod tests {
 
         let mut br = BitReader::new(&bytes);
         let dims = PictureDims::new(32, 32).unwrap();
-        let pic = decode_picture(&mut br, dims).expect("32x32 DC-only decode");
+        let pic = decode_picture(&mut br, dims, None).expect("32x32 DC-only decode");
 
         assert_eq!(pic.picture_type, PictureType::I);
         assert_eq!(pic.width, 32);
@@ -485,7 +784,7 @@ mod tests {
         let bytes = pack(&fields);
         let mut br = BitReader::new(&bytes);
         let dims = PictureDims::new(16, 16).unwrap();
-        let pic = decode_picture(&mut br, dims).expect("16x16 DC-prop decode");
+        let pic = decode_picture(&mut br, dims, None).expect("16x16 DC-prop decode");
 
         // Each block's DC = predictor + 1 * scaler. At block (0,0) the
         // predictor is 1024 (neutral) and luma scaler at q=8 is 16:
@@ -505,6 +804,284 @@ mod tests {
         assert!(
             br_y >= tl,
             "expected monotone DC propagation (tl={tl}, br={br_y})"
+        );
+    }
+
+    /// Hand-crafted P-frame that is entirely skipped MBs. Validates
+    /// end-to-end P-frame decode, reference-threading, MC copy path.
+    /// After decode the output should equal the reference picture
+    /// because every MB is "skip → MC with MV=(0,0)".
+    #[test]
+    fn handcrafted_all_skip_pframe_copies_reference() {
+        use oxideav_core::bits::BitReader;
+
+        fn pack(fields: &[(u32, u32)]) -> Vec<u8> {
+            let mut out: Vec<u8> = Vec::new();
+            let mut acc: u64 = 0;
+            let mut bits: u32 = 0;
+            for (v, w) in fields {
+                let mask = if *w == 32 { u32::MAX } else { (1u32 << w) - 1 };
+                acc = (acc << w) | ((*v & mask) as u64);
+                bits += w;
+                while bits >= 8 {
+                    let shift = bits - 8;
+                    out.push(((acc >> shift) & 0xff) as u8);
+                    acc &= (1u64 << shift) - 1;
+                    bits -= 8;
+                }
+            }
+            if bits > 0 {
+                out.push(((acc << (8 - bits)) & 0xff) as u8);
+            }
+            out
+        }
+
+        // Build a 16x16 reference picture with a simple ramp so we can
+        // verify MC copy produced the right pels.
+        let dims = PictureDims::new(16, 16).unwrap();
+        let mut reference = Picture::alloc(dims, PictureType::I);
+        for y in 0..16 {
+            for x in 0..16 {
+                reference.y[y * reference.y_stride + x] = ((x + y) * 4) as u8;
+            }
+        }
+        for y in 0..8 {
+            for x in 0..8 {
+                reference.cb[y * reference.c_stride + x] = (64 + x + y) as u8;
+                reference.cr[y * reference.c_stride + x] = (192 - x - y) as u8;
+            }
+        }
+
+        // P-frame header: picture_type=1 (P), quant=8, ac_chroma=0,
+        // dc_size_sel=0, mv_table_sel=0 (default MV VLC).
+        let mut fields: Vec<(u32, u32)> = vec![
+            (1, 2), // P
+            (8, 5), // quant
+            (0, 1), // ac_chroma_sel = 0
+            (0, 1), // dc_size_sel = 0
+            (0, 1), // mv_table_sel = 0 (default)
+        ];
+        // 16x16 → 1x1 MB. Single skip bit = 1.
+        fields.push((1, 1));
+        // Tail padding.
+        fields.push((0, 16));
+        let bytes = pack(&fields);
+        let mut br = BitReader::new(&bytes);
+        let pic = decode_picture(&mut br, dims, Some(&reference)).expect("all-skip P-frame decode");
+
+        assert_eq!(pic.picture_type, PictureType::P);
+        // Output should equal the reference (since all MBs were skipped
+        // with MV=(0,0), the MC copy is the identity).
+        assert_eq!(pic.y, reference.y, "luma plane should equal reference");
+        assert_eq!(pic.cb, reference.cb, "Cb plane should equal reference");
+        assert_eq!(pic.cr, reference.cr, "Cr plane should equal reference");
+    }
+
+    #[test]
+    fn pframe_rejects_alternate_mv_table() {
+        use oxideav_core::bits::BitReader;
+
+        fn pack(fields: &[(u32, u32)]) -> Vec<u8> {
+            let mut out: Vec<u8> = Vec::new();
+            let mut acc: u64 = 0;
+            let mut bits: u32 = 0;
+            for (v, w) in fields {
+                let mask = if *w == 32 { u32::MAX } else { (1u32 << w) - 1 };
+                acc = (acc << w) | ((*v & mask) as u64);
+                bits += w;
+                while bits >= 8 {
+                    let shift = bits - 8;
+                    out.push(((acc >> shift) & 0xff) as u8);
+                    acc &= (1u64 << shift) - 1;
+                    bits -= 8;
+                }
+            }
+            if bits > 0 {
+                out.push(((acc << (8 - bits)) & 0xff) as u8);
+            }
+            out
+        }
+
+        let dims = PictureDims::new(16, 16).unwrap();
+        let reference = Picture::alloc(dims, PictureType::I);
+        // P-frame with mv_table_sel = 1 (alternate) — should be rejected.
+        let fields: Vec<(u32, u32)> = vec![
+            (1, 2), // P
+            (8, 5), // quant
+            (0, 1), // ac_chroma_sel
+            (0, 1), // dc_size_sel
+            (1, 1), // mv_table_sel = 1
+        ];
+        let bytes = pack(&fields);
+        let mut br = BitReader::new(&bytes);
+        let err = decode_picture(&mut br, dims, Some(&reference)).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("mv_table_sel")
+                || msg.contains("alternate MV VLC")
+                || msg.contains("0x1c25a0b8"),
+            "expected alternate-MV-table unsupported error; got: {msg}"
+        );
+    }
+
+    /// Hand-crafted P-frame with a single non-skipped inter MB that
+    /// has CBP = 0 (no coded AC in any block). Exercises the MV decode
+    /// + MC copy path. The MV VLC symbol 0 is a 1-bit code `0` and the
+    ///   MVDx/MVDy LUT entry at index 0 is byte 0x20 = 32, so after the
+    ///   bias subtraction the MV is (0, 0) → MC copy from reference.
+    #[test]
+    fn handcrafted_inter_mb_copies_reference() {
+        use oxideav_core::bits::BitReader;
+
+        fn pack(fields: &[(u32, u32)]) -> Vec<u8> {
+            let mut out: Vec<u8> = Vec::new();
+            let mut acc: u64 = 0;
+            let mut bits: u32 = 0;
+            for (v, w) in fields {
+                let mask = if *w == 32 { u32::MAX } else { (1u32 << w) - 1 };
+                acc = (acc << w) | ((*v & mask) as u64);
+                bits += w;
+                while bits >= 8 {
+                    let shift = bits - 8;
+                    out.push(((acc >> shift) & 0xff) as u8);
+                    acc &= (1u64 << shift) - 1;
+                    bits -= 8;
+                }
+            }
+            if bits > 0 {
+                out.push(((acc << (8 - bits)) & 0xff) as u8);
+            }
+            out
+        }
+
+        let dims = PictureDims::new(16, 16).unwrap();
+        let mut reference = Picture::alloc(dims, PictureType::I);
+        for i in 0..reference.y.len() {
+            reference.y[i] = (i % 211) as u8;
+        }
+
+        // MCBPCY joint idx 0 has low-6-bits = 0 (CBP=0, no coded blocks)
+        // and bit-6 = 0 → inter MB. Its canonical code is the first
+        // entry in canonical order. Per spec/99 §3.1 the first
+        // canonical entry is symbol 0 (bit 1, all-zero CBP, skip/no-ac).
+        //
+        // The canonical MCBPCY table is built in mcbpcy.rs and the
+        // smallest bit_length is 2 per the region_05eac8 extract
+        // (row 0 = (bl=7, code=5065) but that's the first *in CSV
+        // order*, not the first canonical). The minimum bit-length
+        // actually observed is 2 (two entries), and the first
+        // canonical code is 0b00.
+        //
+        // For this test we bypass that uncertainty by using the
+        // mcbpcy module directly to find what code goes with idx 0.
+        let t_mcbpcy = {
+            // Helper mirroring the canonical build in mcbpcy.rs.
+            let mut syms: Vec<(u32, u8)> = crate::tables_data::MCBPCY_V3_RAW
+                .iter()
+                .enumerate()
+                .filter_map(|(i, &(bl, _))| if bl == 0 { None } else { Some((bl, i as u8)) })
+                .collect();
+            syms.sort_by_key(|&(bl, idx)| (bl, idx));
+            let mut entries: Vec<(u8, u32, u8)> = Vec::new();
+            let mut code: u32 = 0;
+            let mut prev_bl: u32 = 0;
+            for (i, &(bl, idx)) in syms.iter().enumerate() {
+                if i == 0 {
+                    code = 0;
+                } else {
+                    code = (code + 1) << (bl - prev_bl);
+                }
+                entries.push((bl as u8, code, idx));
+                prev_bl = bl;
+            }
+            entries
+        };
+        // Find the entry for symbol 0 (inter, CBP=0).
+        let (bl_sym0, code_sym0) = t_mcbpcy
+            .iter()
+            .find(|(_, _, sym)| *sym == 0)
+            .map(|(bl, code, _)| (*bl as u32, *code))
+            .expect("symbol 0 in canonical MCBPCY");
+
+        // MV VLC symbol 0 (1-bit code 0) → MVDx/MVDy raw = 0x20 = 32.
+        // Pred (0,0), 32 - 32 = 0 → MV output = (0, 0).
+
+        // P-frame header: P, q=8, ac_chroma=0, dc_size_sel=0, mv_table_sel=0.
+        let mut fields: Vec<(u32, u32)> = vec![
+            (1, 2), // P
+            (8, 5), // quant
+            (0, 1), // ac_chroma_sel = 0
+            (0, 1), // dc_size_sel = 0
+            (0, 1), // mv_table_sel = 0 (default)
+        ];
+        // 1 MB: skip-bit=0, MCBPCY sym 0, ac_pred bit, MV sym 0 (1 bit `0`).
+        fields.push((0, 1)); // skip = 0
+        fields.push((code_sym0, bl_sym0));
+        fields.push((0, 1)); // ac_pred (ignored for inter)
+        fields.push((0, 1)); // MV sym 0 (canonical code = 0)
+        fields.push((0, 16));
+        let bytes = pack(&fields);
+        let mut br = BitReader::new(&bytes);
+        let pic =
+            decode_picture(&mut br, dims, Some(&reference)).expect("inter-copy P-frame decode");
+
+        assert_eq!(pic.picture_type, PictureType::P);
+        // Since MV resolves to (0,0) and there's no residual, the
+        // output luma should equal the reference luma exactly.
+        let mut mismatches = 0;
+        for i in 0..pic.y.len() {
+            if pic.y[i] != reference.y[i] {
+                mismatches += 1;
+            }
+        }
+        assert_eq!(
+            mismatches, 0,
+            "inter-MB with MV=(0,0) should match reference exactly",
+        );
+    }
+
+    #[test]
+    fn pframe_requires_reference() {
+        use oxideav_core::bits::BitReader;
+
+        fn pack(fields: &[(u32, u32)]) -> Vec<u8> {
+            let mut out: Vec<u8> = Vec::new();
+            let mut acc: u64 = 0;
+            let mut bits: u32 = 0;
+            for (v, w) in fields {
+                let mask = if *w == 32 { u32::MAX } else { (1u32 << w) - 1 };
+                acc = (acc << w) | ((*v & mask) as u64);
+                bits += w;
+                while bits >= 8 {
+                    let shift = bits - 8;
+                    out.push(((acc >> shift) & 0xff) as u8);
+                    acc &= (1u64 << shift) - 1;
+                    bits -= 8;
+                }
+            }
+            if bits > 0 {
+                out.push(((acc << (8 - bits)) & 0xff) as u8);
+            }
+            out
+        }
+
+        let dims = PictureDims::new(16, 16).unwrap();
+        let fields: Vec<(u32, u32)> = vec![
+            (1, 2), // P
+            (8, 5), // quant
+            (0, 1), // ac_chroma_sel
+            (0, 1), // dc_size_sel
+            (0, 1), // mv_table_sel
+            (1, 1), // skip bit
+            (0, 8),
+        ];
+        let bytes = pack(&fields);
+        let mut br = BitReader::new(&bytes);
+        let err = decode_picture(&mut br, dims, None).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("reference") || msg.contains("P-frame"),
+            "expected missing-reference error; got: {msg}"
         );
     }
 }
