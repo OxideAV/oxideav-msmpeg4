@@ -143,9 +143,45 @@ pub fn decode_picture(
     dims: PictureDims,
     reference: Option<&Picture>,
 ) -> Result<Picture> {
+    decode_picture_with_ac(br, dims, reference, AcSelection::default())
+}
+
+/// Selector for which intra-AC VLC table the picture decoder uses.
+///
+/// The clean-room extraction has shipped one table candidate
+/// (`region_05eed0` / VMA `0x1c25fad0`) but its role is OPEN per
+/// `docs/video/msmpeg4/spec/99-current-understanding.md` §0.1 row 8 and
+/// §9 OPEN-O6 — the bytes are a complete 64-entry canonical-Huffman
+/// prefix code (Kraft sum = 1) but the `(last, run, level)` mapping is
+/// the Implementer's hypothesis. The default is therefore still the
+/// placeholder: callers that want to exercise the candidate plumb it
+/// in explicitly via [`AcSelection::Candidate`].
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AcSelection {
+    /// Empty placeholder: when a coded block is encountered, the
+    /// decoder falls back to DC-only reconstruction. This is the
+    /// shipping default (no risk of producing garbage on real DIV3
+    /// content where the candidate's symbol mapping may be wrong).
+    #[default]
+    Placeholder,
+    /// Candidate VLC built from `region_05eed0.csv` via
+    /// [`AcVlcTable::v3_intra_candidate`]. Useful for synthetic content
+    /// and pipeline integration tests where AC bits are present and
+    /// the bit-aligned VLC walk needs to actually advance.
+    Candidate,
+}
+
+/// Variant of [`decode_picture`] with explicit control over which
+/// intra-AC VLC table is used. See [`AcSelection`] for the trade-offs.
+pub fn decode_picture_with_ac(
+    br: &mut BitReader<'_>,
+    dims: PictureDims,
+    reference: Option<&Picture>,
+    ac_selection: AcSelection,
+) -> Result<Picture> {
     let hdr = MsV3PictureHeader::parse(br)?;
     match hdr.picture_type {
-        PictureType::I => decode_iframe(br, dims, &hdr),
+        PictureType::I => decode_iframe(br, dims, &hdr, ac_selection),
         PictureType::P => {
             let reference = reference.ok_or_else(|| {
                 Error::invalid(
@@ -163,16 +199,22 @@ pub fn decode_picture(
                      truncation note.",
                 ));
             }
-            decode_pframe(br, dims, &hdr, reference)
+            decode_pframe(br, dims, &hdr, reference, ac_selection)
         }
     }
 }
 
-/// Default AC VLC table used for I-frames. Currently the clean-room
-/// placeholder (see [`AcVlcTable::V3_INTRA_PLACEHOLDER`] for the OPEN
-/// extraction dependency). When the Extractor lands real data, plug it
-/// in here and the decoder will start emitting AC coefficients.
-const V3_INTRA_AC_TABLE: AcVlcTable = AcVlcTable::V3_INTRA_PLACEHOLDER;
+/// Resolve the picture decoder's [`AcSelection`] into a concrete
+/// [`AcVlcTable`] value. Centralising this lets the per-block code
+/// branch on `entries.is_empty()` for the placeholder DC-only fallback
+/// path while still composing into [`decode_intra_block_full`] for the
+/// candidate path.
+fn ac_table_for(selection: AcSelection) -> AcVlcTable {
+    match selection {
+        AcSelection::Placeholder => AcVlcTable::V3_INTRA_PLACEHOLDER,
+        AcSelection::Candidate => AcVlcTable::v3_intra_candidate(),
+    }
+}
 
 /// Decode a full v3 I-frame into a [`Picture`].
 ///
@@ -196,6 +238,7 @@ fn decode_iframe(
     br: &mut BitReader<'_>,
     dims: PictureDims,
     hdr: &MsV3PictureHeader,
+    ac_selection: AcSelection,
 ) -> Result<Picture> {
     let (mb_w, mb_h) = dims.mb_dims();
     let mut pic = Picture::alloc(dims, PictureType::I);
@@ -205,10 +248,11 @@ fn decode_iframe(
     let mut dc_cache = DcCache::new(mb_w, mb_h);
 
     let quant = hdr.quant as u32;
+    let ac_table = ac_table_for(ac_selection);
 
     for my in 0..mb_h {
         for mx in 0..mb_w {
-            decode_intra_mb_to_picture(br, &mut pic, &mut dc_cache, mx, my, quant)?;
+            decode_intra_mb_to_picture(br, &mut pic, &mut dc_cache, mx, my, quant, &ac_table)?;
         }
     }
 
@@ -238,6 +282,7 @@ fn decode_pframe(
     dims: PictureDims,
     hdr: &MsV3PictureHeader,
     reference: &Picture,
+    ac_selection: AcSelection,
 ) -> Result<Picture> {
     // Reference dimensions must match; otherwise MC indexing is
     // meaningless.
@@ -253,6 +298,7 @@ fn decode_pframe(
     let mut pic = Picture::alloc(dims, PictureType::P);
     let mut dc_cache = DcCache::new(mb_w, mb_h);
     let quant = hdr.quant as u32;
+    let ac_table = ac_table_for(ac_selection);
 
     // MV grid: one (MVx, MVy) entry per MB. Skipped / intra MBs use
     // (0, 0) so the predictor's zero-substitution semantics match
@@ -271,6 +317,7 @@ fn decode_pframe(
                 my,
                 mb_w,
                 quant,
+                &ac_table,
             )?;
         }
     }
@@ -291,6 +338,7 @@ fn decode_pframe_mb(
     mb_y: usize,
     mb_w: usize,
     quant: u32,
+    ac_table: &AcVlcTable,
 ) -> Result<()> {
     use crate::mcbpcy::{decode_mcbpcy_pframe, PFrameMcbpcy};
 
@@ -339,7 +387,7 @@ fn decode_pframe_mb(
             cbp_cb: decode.cbp_cb,
             cbp_cr: decode.cbp_cr,
         };
-        decode_intra_mb_with_header(br, pic, dc_cache, &header, mb_x, mb_y, quant)?;
+        decode_intra_mb_with_header(br, pic, dc_cache, &header, mb_x, mb_y, quant, ac_table)?;
         // Intra MBs clear the MV predictor chain: the per-row mv_grid
         // entry stays `None` so downstream neighbours treat this
         // column as zero.
@@ -403,6 +451,7 @@ fn apply_mc_to_mb(
 /// Variant of `decode_intra_mb_to_picture` that accepts a pre-decoded
 /// header (used by the P-frame intra-in-P path where the MCBPCY was
 /// decoded via `decode_mcbpcy_pframe`).
+#[allow(clippy::too_many_arguments)]
 fn decode_intra_mb_with_header(
     br: &mut BitReader<'_>,
     pic: &mut Picture,
@@ -411,6 +460,7 @@ fn decode_intra_mb_with_header(
     mb_x: usize,
     mb_y: usize,
     quant: u32,
+    ac_table: &AcVlcTable,
 ) -> Result<()> {
     for block_idx in 0..6usize {
         let cbp_set = match block_idx {
@@ -431,7 +481,7 @@ fn decode_intra_mb_with_header(
         } else {
             Scan::Zigzag
         };
-        let block_result = if cbp_set && V3_INTRA_AC_TABLE.entries.is_empty() {
+        let block_result = if cbp_set && ac_table.entries.is_empty() {
             let dc_diff = crate::mb::decode_intra_dc_diff(br, block_idx)?;
             let dc = crate::mb::reconstruct_intra_dc(dc_diff, pred.predictor, block_idx, quant);
             crate::mb::DecodedIntraBlock {
@@ -450,7 +500,7 @@ fn decode_intra_mb_with_header(
                 quant,
                 cbp_set,
                 scan,
-                &V3_INTRA_AC_TABLE,
+                ac_table,
             )?
         };
         let reconstructed_dc = block_result.coeffs[0];
@@ -488,6 +538,7 @@ fn decode_intra_mb_to_picture(
     mb_x: usize,
     mb_y: usize,
     quant: u32,
+    ac_table: &AcVlcTable,
 ) -> Result<()> {
     let header = IntraMbHeader::parse_v3_mcbpcy(br)?;
 
@@ -517,10 +568,13 @@ fn decode_intra_mb_to_picture(
             Scan::Zigzag
         };
 
-        // AC path: the AC VLC is still a placeholder (spec §9 OPEN) —
-        // fall back to DC-only when CBP is set AND table is empty. When
-        // the table is non-empty a future round will plug it in.
-        let block_result = if cbp_set && V3_INTRA_AC_TABLE.entries.is_empty() {
+        // AC path: when the placeholder table is in use (entries empty)
+        // fall back to DC-only — the bitstream's AC bits are skipped,
+        // which means subsequent block reads will misalign on real
+        // content but the decoder continues for synthetic DC-only
+        // streams. When a real (or candidate) AC VLC table is plugged
+        // in, the regular `decode_intra_block_full` path runs.
+        let block_result = if cbp_set && ac_table.entries.is_empty() {
             let dc_diff = crate::mb::decode_intra_dc_diff(br, block_idx)?;
             let dc = crate::mb::reconstruct_intra_dc(dc_diff, pred.predictor, block_idx, quant);
             crate::mb::DecodedIntraBlock {
@@ -539,7 +593,7 @@ fn decode_intra_mb_to_picture(
                 quant,
                 cbp_set,
                 scan,
-                &V3_INTRA_AC_TABLE,
+                ac_table,
             )?
         };
 
@@ -804,6 +858,150 @@ mod tests {
         assert!(
             br_y >= tl,
             "expected monotone DC propagation (tl={tl}, br={br_y})"
+        );
+    }
+
+    /// Hand-crafted 16×16 I-frame whose single MB has CBP=0xF
+    /// (every luma block has coded AC). Decodes through
+    /// [`decode_picture_with_ac`] with [`AcSelection::Candidate`] —
+    /// the candidate VLC built from `region_05eed0.csv` actually
+    /// consumes the AC bits per block. The synthetic stream uses the
+    /// candidate's `(last=true, run=0, level=1)` symbol as the
+    /// terminator for every coded block, so each block gets exactly
+    /// one AC coefficient placed at zigzag position 1 (after DC).
+    ///
+    /// The point is to demonstrate end-to-end that the picture
+    /// decoder routes the candidate AC table through the per-MB,
+    /// per-block path correctly — DC predict, AC walk, dequant,
+    /// IDCT, and pel write all compose. The numeric output is not
+    /// expected to match a real DIV3 stream because the candidate's
+    /// `(last, run, level)` mapping is a hypothesis; this test
+    /// verifies the *plumbing*.
+    #[test]
+    fn handcrafted_iframe_with_candidate_ac_decodes() {
+        use oxideav_core::bits::BitReader;
+
+        fn pack(fields: &[(u32, u32)]) -> Vec<u8> {
+            let mut out: Vec<u8> = Vec::new();
+            let mut acc: u64 = 0;
+            let mut bits: u32 = 0;
+            for (v, w) in fields {
+                let mask = if *w == 32 { u32::MAX } else { (1u32 << w) - 1 };
+                acc = (acc << w) | ((*v & mask) as u64);
+                bits += w;
+                while bits >= 8 {
+                    let shift = bits - 8;
+                    out.push(((acc >> shift) & 0xff) as u8);
+                    acc &= (1u64 << shift) - 1;
+                    bits -= 8;
+                }
+            }
+            if bits > 0 {
+                out.push(((acc << (8 - bits)) & 0xff) as u8);
+            }
+            out
+        }
+
+        // Find the candidate AC VLC entry whose decoded triple is
+        // `(last=true, run=0, level=1)` — under the candidate's
+        // hypothesis this is the symbol at idx == count_B + 1 == 2.
+        let ac_table = AcVlcTable::v3_intra_candidate();
+        let term = ac_table
+            .entries
+            .iter()
+            .find(|e| {
+                matches!(
+                    e.value,
+                    crate::ac::Symbol::RunLevel {
+                        last: true,
+                        run: 0,
+                        level: 1
+                    }
+                )
+            })
+            .expect("candidate table contains the (last=1, run=0, level=1) terminator");
+
+        // We need the joint MCBPCY symbol whose CBP pattern is 0b111111
+        // (all luma + chroma blocks coded) and whose MB-type is intra.
+        // Per `decode_mcbpcy`, intra is the high half (idx >= 64) and
+        // CBP = idx & 0x3f. We want CBP = 0x3f and high half, so target
+        // idx = 0x7f = 127. Find that entry's canonical code.
+        let mut syms: Vec<(u32, u8)> = crate::tables_data::MCBPCY_V3_RAW
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &(bl, _))| if bl == 0 { None } else { Some((bl, i as u8)) })
+            .collect();
+        syms.sort_by_key(|&(bl, idx)| (bl, idx));
+        let mut mc_code = 0u32;
+        let mut prev_bl = 0u32;
+        let mut mc_bl = 0u32;
+        let mut mc_found = false;
+        for (i, &(bl, idx)) in syms.iter().enumerate() {
+            if i == 0 {
+                mc_code = 0;
+            } else {
+                mc_code = (mc_code + 1) << (bl - prev_bl);
+            }
+            prev_bl = bl;
+            if idx == 127 {
+                mc_bl = bl;
+                mc_found = true;
+                break;
+            }
+        }
+        assert!(
+            mc_found,
+            "MCBPCY table must contain idx 127 (all-coded intra)"
+        );
+
+        // Picture header: I-frame, q=8, all selectors default (0).
+        let mut fields: Vec<(u32, u32)> = vec![(0, 2), (8, 5), (0, 1), (0, 1), (0, 1)];
+
+        // 16x16 = 1 MB. MCBPCY = idx 127 (all-coded intra), ac_pred = 0.
+        fields.push((mc_code, mc_bl));
+        fields.push((0, 1));
+
+        // Per block (6 blocks in MS-MPEG4v3 raster order): DC size = 1
+        // (luma `11` for blocks 0..3; chroma `10` for blocks 4..5),
+        // DC mag bit = 1 (positive +1 differential), then ONE AC token
+        // (the candidate terminator) + sign bit = 0 (positive).
+        for block_idx in 0..6 {
+            let dc_size_code = if block_idx < 4 {
+                (0b11u32, 2u32)
+            } else {
+                (0b10, 2)
+            };
+            fields.push(dc_size_code);
+            fields.push((1, 1)); // DC mag = +1
+            fields.push((term.code, term.bits as u32));
+            fields.push((0, 1)); // AC sign +
+        }
+
+        // Tail padding so the bit-reader never starves.
+        fields.push((0, 32));
+        fields.push((0, 32));
+
+        let bytes = pack(&fields);
+        let mut br = BitReader::new(&bytes);
+        let dims = PictureDims::new(16, 16).unwrap();
+        let pic = decode_picture_with_ac(&mut br, dims, None, AcSelection::Candidate)
+            .expect("candidate-AC I-frame decode");
+
+        assert_eq!(pic.picture_type, PictureType::I);
+        assert_eq!(pic.width, 16);
+        assert_eq!(pic.height, 16);
+        // Output is non-trivial: at least some pels deviate from the
+        // pure DC reconstruction because the AC contribution shifts
+        // the per-block IDCT response. We don't assert exact values
+        // (the candidate's symbol mapping is a hypothesis), only that
+        // the decode reached the end without erroring and produced
+        // YUV planes whose luma is non-uniform across the picture.
+        let y_max = *pic.y.iter().max().unwrap();
+        let y_min = *pic.y.iter().min().unwrap();
+        assert!(
+            y_max != y_min,
+            "luma plane is uniform — AC contribution didn't reach the IDCT \
+             (decoder may have skipped the AC walk)"
         );
     }
 

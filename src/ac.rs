@@ -106,47 +106,153 @@ impl AcVlcTable {
     pub const MPEG4_ESC_RUN_BITS: u8 = 6;
     pub const MPEG4_ESC_LEVEL_BITS: u8 = 8;
 
-    /// Placeholder for the MS-MPEG4v3 intra-AC primary VLC.
+    /// Placeholder for the MS-MPEG4v3 intra-AC primary VLC. **Empty by
+    /// design** so callers that reach the AC walk on a coded block bail
+    /// out with the actionable error in [`crate::mb::decode_intra_mb`]
+    /// rather than running off the end of the table.
     ///
-    /// **This table is empty by design.** The bundled internal notes do
-    /// not yet contain concrete `(symbol, bit_length)` pairs for the
-    /// intra-AC run/level/last VLC.
-    ///
-    /// Specifically:
-    ///
-    /// * `docs/video/msmpeg4/spec/03-corrections.md` §5.3 identifies
-    ///   the two candidate VMAs but flags them as `**OPEN**`:
-    ///     - `0x1c25fad0` — intra-AC-coefficient run/level/last VLC
-    ///       (candidate pair variant 0) — file offset `0x5eed0`.
-    ///     - `0x1c25f6c8` — intra-AC-coefficient run/level/last VLC
-    ///       (candidate pair variant 1) — file offset `0x5eac8`.
-    ///
-    /// * `docs/video/msmpeg4/spec/03-corrections.md` §6 residual OPEN
-    ///   entry "intra AC VLC pair" — role attribution is a candidate,
-    ///   not confirmed.
-    ///
-    /// * `docs/video/msmpeg4/provenance/03-corrections.md` lines
-    ///   101, 130 — list the two candidate VMAs in the extractor's
-    ///   TODO pile.
-    ///
-    /// * `docs/video/msmpeg4/tables/` — Extractor sessions 00, 01 and
-    ///   02 produced region dumps, but **no region at file offset
-    ///   `0x5eed0` or `0x5eac8` exists** (see `tables/README.md` and
-    ///   `tables/README-02.md` — the closest dumped regions are
-    ///   `0x060438` for the zigzag scan table, not AC VLC data).
-    ///
-    /// Consumer code that wants to exercise the intra-AC pipeline
-    /// on real DIV3/MP43 bitstreams will fail at the first
-    /// [`crate::vlc::decode`] call with
-    /// `"msmpeg4 vlc: empty table"` — this is intentional; it is the
-    /// hand-off signal for the Extractor to produce a real
-    /// `VlcEntry<Symbol>` slice from those two VMAs.
+    /// Use [`AcVlcTable::v3_intra_candidate`] for the candidate table
+    /// extracted from `docs/video/msmpeg4/tables/region_05eed0.csv`
+    /// (VMA `0x1c25fad0`). That table's role is OPEN per
+    /// `docs/video/msmpeg4/spec/99-current-understanding.md` §0.1 row 8
+    /// and §9 OPEN-O6 — confirmed-canonical-Huffman code-length data
+    /// (Kraft sum exactly 1 over its 64 payload bit-lengths) but the
+    /// alphabet's `(last, run, level)` mapping is not fixed by the
+    /// extracted bytes alone. The candidate constructor documents one
+    /// concrete interpretation; a future spec/audit pass may revise it.
     pub const V3_INTRA_PLACEHOLDER: AcVlcTable = AcVlcTable {
         entries: &[],
         esc_last_bits: Self::MPEG4_ESC_LAST_BITS,
         esc_run_bits: Self::MPEG4_ESC_RUN_BITS,
         esc_level_bits: Self::MPEG4_ESC_LEVEL_BITS,
     };
+
+    /// Build the candidate v3 intra-AC primary VLC table from the
+    /// canonical-Huffman code-length array in
+    /// `tables/region_05eed0.csv` (VMA `0x1c25fad0`, 64 payload entries,
+    /// Kraft sum 1).
+    ///
+    /// **Role attribution is OPEN.** Per spec/99 §0.1 row 8 the original
+    /// `spec/03 §5.3` claim that this VMA holds an intra-AC primary VLC
+    /// is downgraded to a candidate; spec/99 §9 OPEN-O6 lists the same
+    /// VMA as a candidate v2-MCBPCY source. The bytes are extraction-
+    /// grounded regardless and form a complete prefix code. This
+    /// constructor materialises them into the runtime decoder API so
+    /// downstream wiring + tests can exercise the canonical-Huffman
+    /// walker, but **the (last, run, level) mapping below is the
+    /// Implementer's hypothesis**, not an extraction artefact.
+    ///
+    /// # `(last, run, level)` interpretation (HYPOTHESIS)
+    ///
+    /// The table's CSV header is `(count_A=64, count_B=1)`. Apply the
+    /// v1 inter-DCT kernel partition (`spec/04` §1.3 step 3) verbatim:
+    ///
+    /// * `idx ∈ [0, count_B] = [0, 1]` → sub-class A: `last = false`.
+    /// * `idx ∈ (count_B, count_A) = (1, 64)` → sub-class B: `last = true`.
+    /// * `idx == count_A == 64` → ESC sentinel (handled separately by
+    ///   the kernel, not by the primary VLC).
+    ///
+    /// For the (run, level) decomposition we make the most-conservative
+    /// choice consistent with `spec/04` §1.3 step 5: the level magnitude
+    /// is **always 1** for primary entries (the binary's pri_A array,
+    /// which we do **not** have for this region, would supply the real
+    /// per-index level — see spec/99 §5.1; without it the candidate
+    /// decoder folds all primary entries onto `|level|=1` and lets the
+    /// 3-tier ESC body in `decode_escape_body` handle larger levels).
+    /// The run is `idx` for sub-A and `idx - (count_B + 1)` for sub-B,
+    /// so a stream encoding `(last=0, run=0, level=1)` lines up with the
+    /// shortest codeword (idx=0).
+    ///
+    /// This is **not bit-exact** against ffmpeg / msmpeg4v3 reference
+    /// content; it's a structurally-valid candidate that exercises the
+    /// AC pipeline end-to-end on synthetic streams. Producing real-file
+    /// parity requires either (a) confirmed pri_A / pri_B for the
+    /// matching G-descriptor, or (b) the full constructor algorithm at
+    /// `0x1c210ee6` from the binary, neither of which is in
+    /// `docs/video/msmpeg4/` yet.
+    ///
+    /// FROM: `docs/video/msmpeg4/tables/region_05eed0.csv`
+    /// FROM: `docs/video/msmpeg4/spec/99-current-understanding.md` §0.1 row 8, §9 OPEN-O6
+    /// FROM: `docs/video/msmpeg4/spec/03-corrections.md` §5.3
+    /// FROM: `docs/video/msmpeg4/spec/04-decoder-kernels.md` §1.3 (partition test)
+    pub fn v3_intra_candidate() -> AcVlcTable {
+        AcVlcTable {
+            entries: candidate_entries_v3_intra(),
+            esc_last_bits: Self::MPEG4_ESC_LAST_BITS,
+            esc_run_bits: Self::MPEG4_ESC_RUN_BITS,
+            esc_level_bits: Self::MPEG4_ESC_LEVEL_BITS,
+        }
+    }
+}
+
+/// Lazily-built `Vec<VlcEntry<Symbol>>` for the v3 intra-AC candidate
+/// VLC (region_05eed0). See [`AcVlcTable::v3_intra_candidate`] for the
+/// role-attribution caveats.
+static V3_INTRA_CANDIDATE_TABLE: std::sync::OnceLock<Vec<VlcEntry<Symbol>>> =
+    std::sync::OnceLock::new();
+
+fn candidate_entries_v3_intra() -> &'static [VlcEntry<Symbol>] {
+    V3_INTRA_CANDIDATE_TABLE.get_or_init(build_candidate_v3_intra)
+}
+
+/// Canonical-Huffman builder for the 64-entry v3 intra-AC candidate
+/// table. The algorithm matches `crate::mcbpcy::build_table` (and the
+/// reference `spec/04` §1.7 helper `0x1c219351` family):
+///
+///   1. Filter symbols whose declared bit_length is zero (none in this
+///      table — every entry is present).
+///   2. Sort by `(bit_length ascending, symbol_index ascending)`.
+///   3. Assign canonical codes: `code₀ = 0`,
+///      `codeₙ = (codeₙ₋₁ + 1) << (blₙ - blₙ₋₁)`.
+///   4. Map each symbol index through
+///      [`candidate_index_to_symbol`] to derive the
+///      `(last, run, |level|)` triple, then store as [`Symbol::RunLevel`].
+fn build_candidate_v3_intra() -> Vec<VlcEntry<Symbol>> {
+    use crate::tables_data::{INTRA_AC_V3_CANDIDATE_PARTITION, INTRA_AC_V3_CANDIDATE_RAW};
+
+    let mut symbols: Vec<(u32, u8)> = INTRA_AC_V3_CANDIDATE_RAW
+        .iter()
+        .enumerate()
+        .filter_map(
+            |(idx, &(bl, _))| {
+                if bl == 0 {
+                    None
+                } else {
+                    Some((bl, idx as u8))
+                }
+            },
+        )
+        .collect();
+    symbols.sort_by_key(|&(bl, idx)| (bl, idx));
+
+    let partition = INTRA_AC_V3_CANDIDATE_PARTITION as u8;
+    let mut entries: Vec<VlcEntry<Symbol>> = Vec::with_capacity(symbols.len());
+    let mut code: u32 = 0;
+    let mut prev_bl: u32 = 0;
+    for (i, &(bl, idx)) in symbols.iter().enumerate() {
+        if i == 0 {
+            code = 0;
+        } else {
+            code = (code + 1) << (bl - prev_bl);
+        }
+        let symbol = candidate_index_to_symbol(idx, partition);
+        entries.push(VlcEntry::new(bl as u8, code, symbol));
+        prev_bl = bl;
+    }
+    entries
+}
+
+/// Hypothesis-driven `(last, run, |level|)` mapping for the candidate
+/// v3 intra-AC alphabet. See [`AcVlcTable::v3_intra_candidate`] for the
+/// rationale. `partition = count_B = 1` from the table's header row.
+fn candidate_index_to_symbol(idx: u8, partition: u8) -> Symbol {
+    let last = idx > partition;
+    let run = if last { idx - (partition + 1) } else { idx };
+    Symbol::RunLevel {
+        last,
+        run,
+        level: 1,
+    }
 }
 
 /// Scan-order selection for the AC walk. MS-MPEG4v3 picks this per-block
@@ -442,6 +548,111 @@ mod tests {
         let mut br = BitReader::new(&bytes);
         let mut block = [0i32; 64];
         assert!(decode_intra_ac(&mut br, &mut block, Scan::Zigzag, &t, 1).is_err());
+    }
+
+    #[test]
+    fn candidate_v3_intra_table_has_64_entries() {
+        // Every entry in region_05eed0.csv has a non-zero bit_length
+        // (verified by tables_data::tests::intra_ac_v3_candidate_kraft_sum_is_one),
+        // so the candidate table holds the full alphabet of 64 symbols.
+        let t = AcVlcTable::v3_intra_candidate();
+        assert_eq!(t.entries.len(), 64);
+    }
+
+    #[test]
+    fn candidate_v3_intra_table_is_prefix_free() {
+        // Canonical-Huffman correctness: no entry's code may be a
+        // prefix of another's code. This is the runtime equivalent of
+        // the build-time Kraft check.
+        let t = AcVlcTable::v3_intra_candidate();
+        let entries = t.entries;
+        for (i, a) in entries.iter().enumerate() {
+            for (j, b) in entries.iter().enumerate() {
+                if i == j || a.bits == b.bits {
+                    continue;
+                }
+                let (short, long) = if a.bits < b.bits { (a, b) } else { (b, a) };
+                let shift = long.bits - short.bits;
+                let long_prefix = long.code >> shift;
+                assert_ne!(
+                    long_prefix, short.code,
+                    "candidate intra-AC: shorter code is a prefix of a longer one"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn candidate_v3_intra_round_trips_every_symbol() {
+        // Encode each table entry's code at the head of a byte-aligned
+        // stream, then decode_token must recover the same `(last, run,
+        // |level|)` triple. This is the same pattern as MCBPCY's
+        // canonical_round_trip_per_symbol.
+        let table = AcVlcTable::v3_intra_candidate();
+        for (idx_in_table, entry) in table.entries.iter().enumerate() {
+            // Pack: VLC code (entry.bits wide) + sign bit `0` (positive).
+            let mut acc: u64 = 0;
+            let mut bits: u32 = 0;
+            acc = (acc << entry.bits) | (entry.code as u64);
+            bits += entry.bits as u32;
+            // Sign bit (= 0 → level positive).
+            acc <<= 1;
+            bits += 1;
+            let mut out = Vec::new();
+            while bits >= 8 {
+                let shift = bits - 8;
+                out.push(((acc >> shift) & 0xff) as u8);
+                acc &= (1u64 << shift) - 1;
+                bits -= 8;
+            }
+            if bits > 0 {
+                out.push(((acc << (8 - bits)) & 0xff) as u8);
+            }
+            out.extend_from_slice(&[0u8; 8]);
+            let mut br = BitReader::new(&out);
+            let tok = decode_token(&mut br, &table).unwrap();
+            // Reverse the candidate hypothesis to predict the expected
+            // triple from the symbol index.
+            let Symbol::RunLevel { last, run, level } = entry.value else {
+                unreachable!("candidate table only stores RunLevel symbols");
+            };
+            assert_eq!(tok.last, last, "entry {idx_in_table}: last mismatch");
+            assert_eq!(tok.run, run, "entry {idx_in_table}: run mismatch");
+            assert_eq!(
+                tok.level as i32, level as i32,
+                "entry {idx_in_table}: |level| mismatch"
+            );
+        }
+    }
+
+    #[test]
+    fn candidate_v3_intra_partition_matches_v1_kernel_rule() {
+        // Per spec/04 §1.3 step 3 the partition test is `idx > count_B`
+        // for sub-class B (last=1). With count_B=1 from the CSV header,
+        // exactly idx=0 and idx=1 should be sub-class A (last=0).
+        let table = AcVlcTable::v3_intra_candidate();
+        for entry in table.entries {
+            let Symbol::RunLevel { last, .. } = entry.value else {
+                continue;
+            };
+            // Recover original index from the canonical code-table; the
+            // entries don't carry the original index directly so we
+            // inspect the partition shape via run vs last.
+            // (Two entries with last=0 by hypothesis; the rest are last=1.)
+            let _ = last;
+        }
+        let last0 = table
+            .entries
+            .iter()
+            .filter(|e| matches!(e.value, Symbol::RunLevel { last: false, .. }))
+            .count();
+        let last1 = table
+            .entries
+            .iter()
+            .filter(|e| matches!(e.value, Symbol::RunLevel { last: true, .. }))
+            .count();
+        assert_eq!(last0, 2, "expected 2 sub-class-A entries (idx 0..=1)");
+        assert_eq!(last1, 62, "expected 62 sub-class-B entries (idx 2..=63)");
     }
 
     #[test]

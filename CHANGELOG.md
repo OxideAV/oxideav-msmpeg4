@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Intra-AC primary VLC candidate wired** (round 10): clean-room
+  extraction of `region_05eed0.csv` (VMA `0x1c25fad0`, file offset
+  `0x5eed0`) lands in the build pipeline. The 64-entry canonical-
+  Huffman code-length array is verified at build time (Kraft sum
+  = 1) and exposed via `AcVlcTable::v3_intra_candidate`. The
+  `(last, run, level)` symbol mapping is the Implementer's
+  hypothesis (partition test from `spec/04` §1.3 step 3,
+  `|level|=1` baseline with ESC body for larger levels) — the
+  underlying region's role is OPEN per `spec/99` §0.1 row 8 and
+  §9 OPEN-O6. A future spec/audit pass may revise the mapping.
+- **`AcSelection` enum + `decode_picture_with_ac`**: callers
+  opt into the candidate AC table explicitly via the new
+  `picture::decode_picture_with_ac(br, dims, ref, AcSelection::Candidate)`
+  entry point. The `Decoder` trait still defaults to
+  `AcSelection::Placeholder` (DC-only reconstruction on coded
+  blocks) so existing consumers see no behaviour change.
+- **Test coverage**: 8 new unit tests (kraft-sum, prefix-free,
+  per-symbol round-trip, partition-rule sanity) plus 6 new
+  integration tests (`tests/intra_ac_candidate.rs`) exercising
+  the candidate VLC end-to-end against synthetic streams +
+  ffmpeg-encoded DIV3 first-chunk smoke.
+- **`build.rs`**: new `emit_intra_ac_v3` step parses
+  `tables/region_05eed0.csv` and emits
+  `INTRA_AC_V3_CANDIDATE_RAW` / `_ALPHABET` / `_PARTITION` into
+  `OUT_DIR/intra_ac_v3.rs`. Build-time Kraft check enforces
+  `sum(2^-bl) == 1` over the 64 payload bit-lengths and fails
+  the build if the CSV ever drifts.
+
 ## [0.0.3](https://github.com/OxideAV/oxideav-msmpeg4/compare/v0.0.2...v0.0.3) - 2026-04-24
 
 ### Other

@@ -16,6 +16,19 @@
 //!   `region_05e228.hex` / `region_05e678.hex`, VMAs `0x1c25ee28` /
 //!   `0x1c25f278`). 1104 bytes each; only indices 0..1099 are read by
 //!   the decoder.
+//! * `intra_ac_v3.rs` — candidate v3 intra AC TCOEF run/level/last
+//!   primary VLC source (`region_05eed0.csv`, VMA `0x1c25fad0`, file
+//!   offset `0x5eed0`). 64 `(bit_length, code_value)` payload entries
+//!   plus a `(count_A=64, count_B=1)` header row. Kraft sum over the
+//!   64 bit-lengths is exactly 1, confirming the table is a complete
+//!   canonical-Huffman prefix code. Per spec/99 §0.1 row 8 the role
+//!   attribution of this region is **OPEN** (candidate v2 MCBPCY
+//!   source vs intra-AC TCOEF candidate per spec/03 §5.3); the bytes
+//!   are extracted reproducibly regardless and the Implementer wires
+//!   them through the same canonical-Huffman builder used for MCBPCY,
+//!   leaving the (last, run, level) symbol decoding behind a guarded
+//!   constructor (`AcVlcTable::v3_intra_candidate`) so callers opt in
+//!   explicitly.
 //!
 //! The CSV column naming is historically mis-labelled: the `symbol_dec`
 //! column holds the `bit_length`, the `bit_length` column holds the
@@ -50,6 +63,12 @@ fn main() {
     println!("cargo:rerun-if-changed={}", mvdx_hex.display());
     println!("cargo:rerun-if-changed={}", mvdy_hex.display());
     emit_mv_byte_lut_v3(&mvdx_hex, &mvdy_hex, &out_dir.join("mv_lut_v3.rs"));
+
+    // Intra AC candidate primary VLC — 05eed0 (VMA 0x1c25fad0).
+    // 64-entry canonical Huffman; role attribution OPEN per spec/99 §0.1.
+    let ac_csv = tables_dir.join("region_05eed0.csv");
+    println!("cargo:rerun-if-changed={}", ac_csv.display());
+    emit_intra_ac_v3(&ac_csv, &out_dir.join("intra_ac_v3.rs"));
 
     println!("cargo:rerun-if-changed=build.rs");
 }
@@ -248,6 +267,126 @@ fn emit_mv_byte_lut_v3(mvdx_path: &Path, mvdy_path: &Path, out_path: &Path) {
     writeln!(f, "];\n").unwrap();
     writeln!(f, "pub static MVDY_V3_BYTES: &[u8; 1104] = &[").unwrap();
     emit_byte_array(&mut f, &mvdy);
+    writeln!(f, "];").unwrap();
+}
+
+/// Parse `region_05eed0.csv` and emit the candidate v3 intra AC TCOEF
+/// primary VLC source. The CSV uses the same column convention as
+/// MCBPCY: the `symbol_dec` column is the bit_length, the `bit_length`
+/// column is the code_value (see spec/99 §8.1). Row 0 is the header
+/// `(count_A=64, count_B=1)`; rows 1..=64 are the 64 payload entries.
+///
+/// Provenance: `docs/video/msmpeg4/tables/region_05eed0.csv` —
+/// extracted from `mpg4c32.dll` (SHA-256
+/// `aedb4cf3...b3c099`) at file offset `0x5eed0`, VMA `0x1c25fad0`.
+/// Spec/99 §0.1 row 8 flags this VMA as a candidate intra-AC primary
+/// VLC (per spec/03 §5.3) but also notes it could be the v2 MCBPCY
+/// source (`spec/99` §9 OPEN-O6) — the role is unresolved. The bytes
+/// are extraction-grounded regardless and Kraft sums to exactly 1
+/// over the 64 payload bit-lengths (verified at build time below).
+fn emit_intra_ac_v3(csv_path: &Path, out_path: &Path) {
+    let text = fs::read_to_string(csv_path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", csv_path.display()));
+
+    let mut records: Vec<(u32, u32)> = Vec::with_capacity(65);
+    for (line_no, line) in text.lines().enumerate() {
+        if line_no == 0 {
+            continue; // CSV column header
+        }
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = line.split(',').collect();
+        if parts.len() < 5 {
+            panic!("malformed row at line {}: {line}", line_no + 1);
+        }
+        // Same column convention as MCBPCY: parts[3] = symbol_dec column =
+        // bit_length value; parts[4] = bit_length column = code_value.
+        let bit_length: u32 = parts[3]
+            .parse()
+            .unwrap_or_else(|_| panic!("bad bit_length at line {}: {}", line_no + 1, parts[3]));
+        let code_value: u32 = parts[4]
+            .parse()
+            .unwrap_or_else(|_| panic!("bad code_value at line {}: {}", line_no + 1, parts[4]));
+        records.push((bit_length, code_value));
+    }
+
+    if records.len() != 65 {
+        panic!(
+            "expected 65 records in {} (1 header + 64 payload), got {}",
+            csv_path.display(),
+            records.len()
+        );
+    }
+
+    let (alphabet_size, partition) = records[0];
+    if alphabet_size != 64 {
+        panic!(
+            "unexpected alphabet size {alphabet_size} in {} (expected 64)",
+            csv_path.display()
+        );
+    }
+    if partition != 1 {
+        panic!(
+            "unexpected partition {partition} in {} (expected 1)",
+            csv_path.display()
+        );
+    }
+
+    // Verify Kraft sum == 1 over the 64 payload bit-lengths (in 2^-bl
+    // arithmetic). All bls must be in [1, 32] for a valid
+    // canonical-Huffman code. Compute exactly using the LCM trick:
+    // sum of 2^-bl == 1 iff sum of 2^(MAX-bl) == 2^MAX.
+    let max_bl = 32u32;
+    let target: u64 = 1u64 << max_bl;
+    let mut sum: u64 = 0;
+    for &(bl, _) in &records[1..] {
+        if !(1..=32).contains(&bl) {
+            panic!(
+                "intra-AC candidate: bit_length {bl} out of range [1, 32] — \
+                 cannot form a canonical-Huffman code"
+            );
+        }
+        sum += 1u64 << (max_bl - bl);
+    }
+    if sum != target {
+        panic!(
+            "intra-AC candidate: Kraft sum != 1 (sum of 2^-bl gives {} / {} \
+             in fixed-point); the table is not a complete prefix code",
+            sum, target
+        );
+    }
+
+    let mut f = fs::File::create(out_path)
+        .unwrap_or_else(|e| panic!("failed to create {}: {e}", out_path.display()));
+    writeln!(
+        f,
+        "// Auto-generated by build.rs from \
+         docs/video/msmpeg4/tables/region_05eed0.csv. DO NOT EDIT.\n\
+         // Source binary: mpg4c32.dll SHA-256 \
+         aedb4cf3d33c8554ab8acf04afe2d936eaa7c49107c5fefe163bca2e94b3c099\n\
+         // Role (CANDIDATE — OPEN per spec/99 §0.1 row 8 / §9 OPEN-O6):\n\
+         //   v3 intra AC TCOEF run/level/last primary VLC source\n\
+         //   (alternative: v2 joint-MCBPCY source). Kraft sum of the\n\
+         //   64 payload bit-lengths is exactly 1 (verified at build time).\n\
+         \n\
+         pub const INTRA_AC_V3_CANDIDATE_ALPHABET: usize = {};\n\
+         pub const INTRA_AC_V3_CANDIDATE_PARTITION: usize = {};\n\
+         \n\
+         /// 64 × (bit_length, code_value) canonical-Huffman entries for\n\
+         /// the v3 intra AC TCOEF primary VLC candidate. The `code_value`\n\
+         /// column is the runtime LUT/state byte (same convention as\n\
+         /// MCBPCY — spec/99 §8.1) and is **not** the Huffman bit-pattern;\n\
+         /// the bit-pattern is reconstructed by the canonical-Huffman\n\
+         /// builder from the bit_length array alone.\n\
+         pub const INTRA_AC_V3_CANDIDATE_RAW: &[(u32, u32)] = &[",
+        alphabet_size, partition,
+    )
+    .unwrap();
+    for &(bl, code) in &records[1..] {
+        writeln!(f, "    ({bl}, {code}),").unwrap();
+    }
     writeln!(f, "];").unwrap();
 }
 
