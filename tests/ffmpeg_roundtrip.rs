@@ -18,9 +18,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use oxideav_codec::CodecRegistry;
 use oxideav_core::bits::BitReader;
 use oxideav_core::time::TimeBase;
+use oxideav_core::CodecRegistry;
 use oxideav_core::{CodecId, CodecParameters, Packet};
 use oxideav_msmpeg4::header::{MsV3PictureHeader, PictureType};
 

@@ -51,11 +51,11 @@
 
 use std::collections::VecDeque;
 
-use oxideav_codec::{CodecInfo, CodecRegistry, Decoder};
 use oxideav_core::{
     format::PixelFormat, time::TimeBase, CodecCapabilities, CodecId, CodecParameters, CodecTag,
     Error, Frame, Packet, ProbeContext, Result, VideoFrame, VideoPlane,
 };
+use oxideav_core::{CodecInfo, CodecRegistry, Decoder};
 
 pub mod ac;
 pub mod dc_pred;
