@@ -66,6 +66,38 @@
 //! Huffman `(symbol, bit_length, code)` triples; the runtime decoder
 //! goes through the same linear-scan VLC path as v3's MCBPCY.
 //!
+//! **v1 / v2 per-component MV decoder.** Round 12 (2026-04-25) lands the
+//! 65-entry MV VLC table at VMA `0x1c24f930` and the per-axis decoder
+//! [`mv::decode_mv_v1v2`]. Per spec/06 §2.3 / spec/07 §3, the v1/v2
+//! decoder body at `0x1c217e56` (v<4 branch) does two separate
+//! canonical-Huffman reads against the same shared table, applies the
+//! median-of-3 predictor (re-using v3's [`mv::median_predictor`]),
+//! subtracts the bias 32, then toroidally wraps each component into
+//! `[-63, +63]`. Three notable findings drove the round:
+//!
+//! - The docs region at `tables/region_04ed30.hex` only captures the
+//!   first 4096 bytes (1/4 of the LUT). The helper `0x1c215811` is
+//!   invoked with max-bitlen 13 → 8192 entries × 2 bytes = 16384 bytes;
+//!   the FULL extraction lives in
+//!   `crates/oxideav-msmpeg4/tables/region_04ed30_full.hex`, copied
+//!   directly from the source DLL (verified SHA-256).
+//! - The alphabet is **65 entries (0..=64)**, not 33 as documented in
+//!   spec/06 §2.3 / spec/07 §3.3. The `eax + ecx - 0x20` bias
+//!   arithmetic gives signed `[-32, +32]` only when the raw idx ranges
+//!   `[0, 64]` (33 would only cover `[-32, 0]`). Symbol 32 = MVD 0 is
+//!   the most-probable code at 1 bit.
+//! - The 65 codes plus 4 escape sentinel slots (the bit-reader-error
+//!   path at helper offset `1c21587f`) saturate the 13-bit prefix space
+//!   (Kraft sum = 1 - 4/2^13 over the 65 codes).
+//!
+//! Per-MB pixel reconstruction for v1/v2 P-frames is still gated on the
+//! per-version intra-AC and inter-AC VLC tables (spec/99 §9 OPEN-O4) —
+//! the MV decoder produces the (MVx, MVy) byte pair that the MC
+//! fetcher consumes, but the residual path needs the AC tables for a
+//! complete pipeline. The v1/v2 `send_packet` therefore continues to
+//! return the same documented `Unsupported` after parsing the picture
+//! header.
+//!
 //! The full v1/v2 per-MB decode (intra-AC, inter-AC) still requires the
 //! corresponding VLC tables which are spec/99 §9 OPEN — `send_packet`
 //! parses the picture header successfully and then surfaces a

@@ -1,0 +1,31 @@
+source: docs/video/msmpeg4/reference/binaries/wmpcdcs8-2001/mpg4c32.dll
+sha256: aedb4cf3d33c8554ab8acf04afe2d936eaa7c49107c5fefe163bca2e94b3c099
+file_range: 0x0004ed30..0x00052d30
+vma_range: 0x1c24f930..0x1c253930
+length_bytes: 16384
+record_count: 8192
+interpretation: little-endian halfword pairs (bit_length:u8, symbol:u8) — directly indexed
+                tiered-Huffman LUT for the v1/v2/v4+ per-component MV VLC, consumed by
+                helper 0x1c215811 with max_bitlen=13.
+role: per-component MVD VLC table for MSMPEG4 v1/v2 (also used by v4+ as the
+      f_code prefix table). Loaded at 0x1c217e8d (v<4 path of decoder
+      0x1c217e56) and at 0x1c217dd2 (v4+ helper 0x1c217dca).
+provenance: spec/06 §2.3, spec/07 §3 — confirmed.
+extraction_note: docs/video/msmpeg4/tables/region_04ed30.hex captures only the
+                 first 4096 bytes (1/4 of the full LUT). The helper indexes
+                 with 13 bits => 8192 entries × 2 bytes = 16384 bytes. The
+                 docs region was truncated; this file copies the FULL 16384
+                 bytes directly from the source binary (verified SHA-256).
+alphabet: 65 symbols (raw indices 0..64). After bias subtraction (eax - 0x20)
+          maps to signed MVD residual [-32, +32]. Index 255 (0xff) at LUT
+          slot 0 is an escape / unused-prefix sentinel (4 entries, all bl=0).
+kraft_sum: 8188 / 8192 = 1 - 4/2^13 (the 4 sentinel entries account for the
+           missing 4/8192 mass). The 65-symbol alphabet is otherwise
+           Kraft-saturated.
+shortest_codes:
+  sym=32 (MVD=0):  bl=1, code='1'   (most-probable)
+  sym=33 (MVD=+1): bl=3, code='010'
+  sym=31 (MVD=-1): bl=3, code='011'
+  sym=34 (MVD=+2): bl=4, code='0010'
+  sym=30 (MVD=-2): bl=4, code='0011'
+  ... (longer codes for larger magnitudes; symmetric ± pairs)
