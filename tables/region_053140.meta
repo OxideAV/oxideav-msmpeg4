@@ -1,0 +1,41 @@
+source: /home/magicaltux/projects/oxideav-docs/video/msmpeg4/reference/binaries/wmpcdcs8-2001/mpg4c32.dll
+sha256: aedb4cf3d33c8554ab8acf04afe2d936eaa7c49107c5fefe163bca2e94b3c099
+file_range: 0x00053140..0x00053640
+vma_range: 0x1c253d40..0x1c254240
+length_bytes: 1280
+record_count: 160
+records_out_of_[1,32]: 160
+opener_signature_hits: 0
+zero_pair_count: 0
+repeating_pairs_ge5: 7
+  repeat@0x000531c0 sym=0x02040204 bl=33817092 count=8
+  repeat@0x00053200 sym=0x01040104 bl=17039620 count=8
+  repeat@0x00053240 sym=0x08030803 bl=134416387 count=16
+  repeat@0x000532c0 sym=0x04030403 bl=67306499 count=16
+  repeat@0x00053340 sym=0x00010001 bl=65537 count=64
+  repeat@0x00053540 sym=0x01020102 bl=16908546 count=8
+  repeat@0x000535c0 sym=0x00010001 bl=65537 count=16
+bit_length_histogram:
+  bl=65537: 80
+  bl=16908546: 8
+  bl=17039620: 8
+  bl=33751555: 4
+  bl=33817092: 8
+  bl=50660101: 1
+  bl=50725638: 2
+  bl=67306499: 16
+  bl=67372036: 2
+  bl=84346119: 1
+  bl=101123591: 1
+  bl=117835526: 1
+  bl=134416387: 16
+  bl=151456007: 1
+  bl=168233479: 1
+  bl=185076488: 1
+  bl=201657349: 4
+  bl=235408904: 1
+  bl=252120839: 1
+  bl=268832774: 2
+  bl=302584585: 1
+anomalies: ['out_of_range_frac=1.000', 'repeating_pairs=7']
+verdict: suspect

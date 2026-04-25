@@ -41,11 +41,36 @@
 //! (`0x1c25a0b8`) has only a 256-byte extraction dump and is rejected
 //! with a documented `Unsupported` error.
 //!
-//! v1 and v2 are still stubs — the v1/v2 MCBPC + CBPY separated
-//! tables (`0x1c253d40` / `0x1c254240` / `0x1c254140`) and the 33-entry
-//! per-component MV VLC (`0x1c24f930`) are not yet extracted into
-//! `tables/`. See `docs/video/msmpeg4/spec/07-remaining-opens.md` for
-//! the traced decoder bodies.
+//! **v1 / v2 picture header + MCBPCY decoders.** Round 11 (2026-04-25)
+//! wires:
+//!
+//! - [`header::MsV1V2PictureHeader::parse_v1`] / `::parse_v2` — picture
+//!   header parsers per spec/99 §2.2 / §2.4 (including the v1 37-bit
+//!   opaque preamble and 1-bit UMV flag on P-frames).
+//! - [`mcbpcy::decode_mcbpcy_v1`] — v1 MB-header decoder per spec/07 §1
+//!   (`0x1c2171c7`), driving the separated 21-entry MCBPC VLC at VMA
+//!   `0x1c253d40` (max-bitlen 9) + the shared 16-entry CBPY VLC at VMA
+//!   `0x1c254240` (max-bitlen 6, with the `15 - cbpy_raw` one's-
+//!   complement wrap).
+//! - [`mcbpcy::decode_mcbpcy_v2`] — v2 MB-header decoder per spec/07 §2
+//!   (`0x1c21729c`), driving the 8-entry MCBPC VLC at VMA `0x1c254140`
+//!   (max-bitlen 7) + the same shared CBPY, with v2's frame-type
+//!   conditional skip-bit, intra-in-P AC-prediction bit, and
+//!   conditional-wrap path for `mcbpc % 4 == 3`.
+//!
+//! Both MCBPC VLC tables are extracted directly from
+//! `docs/video/msmpeg4/tables/region_053140.hex` (1280-byte combined
+//! LUT region: bytes 0..1024 are the v1 9-bit LUT, bytes 1024..1280 are
+//! the v2 7-bit LUT). The build script (`build.rs::emit_mcbpc_v1_v2`)
+//! parses the 2-byte `(bit_length, symbol)` records and emits canonical-
+//! Huffman `(symbol, bit_length, code)` triples; the runtime decoder
+//! goes through the same linear-scan VLC path as v3's MCBPCY.
+//!
+//! The full v1/v2 per-MB decode (intra-AC, inter-AC) still requires the
+//! corresponding VLC tables which are spec/99 §9 OPEN — `send_packet`
+//! parses the picture header successfully and then surfaces a
+//! documented `Unsupported` citing the open spec item, so callers can
+//! distinguish "header malformed" from "decoder gap".
 
 #![deny(unsafe_code)]
 
@@ -393,12 +418,6 @@ impl Decoder for MsMpeg4Decoder {
                 self.version.codec_id(),
             ))),
             _ => {
-                if self.version != MsVersion::V3 {
-                    return Err(Error::unsupported(format!(
-                        "{}: decode not implemented yet (only v3 parser is in progress).",
-                        self.version.codec_id(),
-                    )));
-                }
                 let dims = self.dims.ok_or_else(|| {
                     Error::invalid(format!(
                         "{}: CodecParameters missing width/height — MS-MPEG4 needs \
@@ -407,11 +426,43 @@ impl Decoder for MsMpeg4Decoder {
                     ))
                 })?;
                 let mut br = oxideav_core::bits::BitReader::new(&packet.data);
-                let pic = picture::decode_picture(&mut br, dims, self.last_picture.as_ref())?;
-                let frame = picture_to_video_frame(&pic, packet.pts);
-                self.last_picture = Some(pic);
-                self.output_queue.push_back(Frame::Video(frame));
-                Ok(())
+                match self.version {
+                    MsVersion::V3 => {
+                        let pic =
+                            picture::decode_picture(&mut br, dims, self.last_picture.as_ref())?;
+                        let frame = picture_to_video_frame(&pic, packet.pts);
+                        self.last_picture = Some(pic);
+                        self.output_queue.push_back(Frame::Video(frame));
+                        Ok(())
+                    }
+                    MsVersion::V1 | MsVersion::V2 => {
+                        // v1/v2 picture-header parse + MCBPCY decoders
+                        // are wired (spec/07 §1-§2). The downstream
+                        // intra-AC and inter-AC VLCs are not yet
+                        // extracted (spec/99 §9 OPEN). For now we parse
+                        // the header (proves wiring is end-to-end) and
+                        // surface a documented Unsupported with the
+                        // exact spec citation so callers can tell apart
+                        // "header malformed" from "decoder gap".
+                        let hdr = match self.version {
+                            MsVersion::V1 => header::MsV1V2PictureHeader::parse_v1(&mut br)?,
+                            MsVersion::V2 => header::MsV1V2PictureHeader::parse_v2(&mut br)?,
+                            _ => unreachable!(),
+                        };
+                        Err(Error::unsupported(format!(
+                            "{}: parsed picture header (type={:?}, quant={}, umv={}) \
+                             but per-MB decode requires the v1/v2 intra-AC and \
+                             inter-AC VLC tables which are still OPEN per \
+                             docs/video/msmpeg4/spec/99-current-understanding.md \
+                             §9 OPEN-O4. The MCBPC + CBPY pipeline (spec/07 \
+                             §1, §2) is wired and tested.",
+                            self.version.codec_id(),
+                            hdr.picture_type,
+                            hdr.quant,
+                            hdr.v1_umv_flag,
+                        )))
+                    }
+                }
             }
         }
     }

@@ -134,6 +134,91 @@ impl MsV3PictureHeader {
     }
 }
 
+// =====================================================================
+// v1 / v2 picture-header parsers (spec §2.2 / §2.4)
+// =====================================================================
+//
+// MSMPEG4 v1 and v2 share the picture-layer skeleton with v3 but skip
+// the v3-only per-frame table selectors. v1 also carries an opaque
+// 37-bit preamble that the decoder reads-and-discards, and a 1-bit UMV
+// flag on P-frames. v2 has neither.
+//
+// Per spec/99 §2.2 / §2.4:
+//
+//   v1 P-frame: [37-bit preamble] picture_type(2) PQUANT(5) UMV_flag(1)
+//   v1 I-frame: [37-bit preamble] picture_type(2) PQUANT(5)
+//   v2 frames:  picture_type(2) PQUANT(5)         (no per-frame selectors)
+//
+// (The optional 5-bit "first-of-sequence" extension at I-frames §2.2 is
+// for the per-sequence init payload — not part of the per-frame loop —
+// and is OPEN per spec/99. We do not consume it here.)
+
+/// MSMPEG4 v1 / v2 picture header.
+///
+/// The v3 header (`MsV3PictureHeader`) carries extra per-frame table
+/// selector bits that v1 / v2 lack; using a separate type keeps the
+/// downstream wiring explicit about which version it's working with.
+#[derive(Clone, Debug)]
+pub struct MsV1V2PictureHeader {
+    /// I or P. v1/v2 do not support B-frames either.
+    pub picture_type: PictureType,
+    /// Frame-wide quantiser, 1..=31.
+    pub quant: u8,
+    /// **v1 only**: Unrestricted-Motion-Vectors flag (H.263 Annex D),
+    /// stored at `[esi+0x88]`. Read on P-frames per spec/99 §2.4. Always
+    /// `false` for v2 frames and for v1 I-frames.
+    pub v1_umv_flag: bool,
+}
+
+impl MsV1V2PictureHeader {
+    /// Parse a v1 picture header. Consumes the 37-bit opaque preamble
+    /// first, then the picture-type / PQUANT / (P-only) UMV-flag fields.
+    ///
+    /// Per spec/99 §2.1: the preamble is "32 bits read and discarded at
+    /// `1c211f35`, then 5 more at `1c211f40`" — never matched against a
+    /// fixed pattern. We read and discard the same way.
+    pub fn parse_v1(br: &mut BitReader<'_>) -> Result<Self> {
+        // 37-bit opaque preamble (32 + 5). Consume but discard.
+        let _ = br.read_u32(32)?;
+        let _ = br.read_u32(5)?;
+        Self::parse_inner(br, /*has_umv=*/ true)
+    }
+
+    /// Parse a v2 picture header. No preamble, no UMV flag.
+    pub fn parse_v2(br: &mut BitReader<'_>) -> Result<Self> {
+        Self::parse_inner(br, /*has_umv=*/ false)
+    }
+
+    fn parse_inner(br: &mut BitReader<'_>, has_umv: bool) -> Result<Self> {
+        let ptype = br.read_u32(2)?;
+        let picture_type = match ptype {
+            0 => PictureType::I,
+            1 => PictureType::P,
+            other => {
+                return Err(Error::invalid(format!(
+                    "msmpeg4 v1/v2: reserved picture_type {other}"
+                )));
+            }
+        };
+        let quant = br.read_u32(5)? as u8;
+        if !(1..=31).contains(&quant) {
+            return Err(Error::invalid(format!(
+                "msmpeg4 v1/v2: pquant {quant} out of range 1..=31"
+            )));
+        }
+        let v1_umv_flag = if has_umv && picture_type == PictureType::P {
+            br.read_bit()?
+        } else {
+            false
+        };
+        Ok(Self {
+            picture_type,
+            quant,
+            v1_umv_flag,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -246,5 +331,94 @@ mod tests {
         let mut br = BitReader::new(&bytes);
         let h = MsV3PictureHeader::parse(&mut br).unwrap();
         assert_eq!(h.quant, 31);
+    }
+
+    #[test]
+    fn v1_iframe_header_parses() {
+        // 37-bit opaque preamble (any value), then I-frame header.
+        // 32 zero bits + 5 zero bits = 37-bit zero preamble; then
+        // picture_type=0 (I, 2 bits), quant=10 (5 bits).
+        let bytes = pack(&[
+            (0, 32), // preamble lo
+            (0, 5),  // preamble hi
+            (0, 2),  // picture_type = I
+            (10, 5), // quant = 10
+        ]);
+        let mut br = BitReader::new(&bytes);
+        let h = MsV1V2PictureHeader::parse_v1(&mut br).unwrap();
+        assert_eq!(h.picture_type, PictureType::I);
+        assert_eq!(h.quant, 10);
+        assert!(!h.v1_umv_flag, "I-frame must not have UMV flag set");
+    }
+
+    #[test]
+    fn v1_pframe_with_umv_flag_parses() {
+        let bytes = pack(&[
+            (0xdead_beef, 32), // preamble lo (any opaque)
+            (0x1f, 5),         // preamble hi (any opaque)
+            (1, 2),            // picture_type = P
+            (8, 5),            // quant = 8
+            (1, 1),            // UMV flag = 1
+        ]);
+        let mut br = BitReader::new(&bytes);
+        let h = MsV1V2PictureHeader::parse_v1(&mut br).unwrap();
+        assert_eq!(h.picture_type, PictureType::P);
+        assert_eq!(h.quant, 8);
+        assert!(h.v1_umv_flag);
+    }
+
+    #[test]
+    fn v2_iframe_header_parses_without_preamble() {
+        // No preamble in v2 — reads picture_type (2 bits) immediately.
+        let bytes = pack(&[(0, 2), (15, 5)]);
+        let mut br = BitReader::new(&bytes);
+        let h = MsV1V2PictureHeader::parse_v2(&mut br).unwrap();
+        assert_eq!(h.picture_type, PictureType::I);
+        assert_eq!(h.quant, 15);
+        assert!(!h.v1_umv_flag, "v2 has no UMV flag");
+    }
+
+    #[test]
+    fn v2_pframe_does_not_read_umv_bit() {
+        // After picture_type + quant, the v2 path must NOT consume the
+        // next bit (which would belong to MCBPCY's skip flag in real
+        // streams). Verify by checking the bit-reader position after the
+        // header.
+        let bytes = pack(&[
+            (1, 2),  // P
+            (12, 5), // quant
+            (1, 1),  // following bit (would-be skip flag in MCBPCY)
+        ]);
+        let mut br = BitReader::new(&bytes);
+        let h = MsV1V2PictureHeader::parse_v2(&mut br).unwrap();
+        assert_eq!(h.picture_type, PictureType::P);
+        assert_eq!(h.quant, 12);
+        assert!(!h.v1_umv_flag);
+        // The bit that we appended after the header must still be
+        // available — bit reader should sit at offset 7 (2+5) bits.
+        let next = br.read_bit().unwrap();
+        assert!(next, "next bit should be the 1 we packed (skip bit)");
+    }
+
+    #[test]
+    fn v1_v2_reject_reserved_picture_type() {
+        let bytes = pack(&[(0, 32), (0, 5), (2, 2), (5, 5)]);
+        let mut br = BitReader::new(&bytes);
+        assert!(MsV1V2PictureHeader::parse_v1(&mut br).is_err());
+
+        let bytes = pack(&[(3, 2), (5, 5)]);
+        let mut br = BitReader::new(&bytes);
+        assert!(MsV1V2PictureHeader::parse_v2(&mut br).is_err());
+    }
+
+    #[test]
+    fn v1_v2_reject_zero_quant() {
+        let bytes = pack(&[(0, 32), (0, 5), (0, 2), (0, 5)]);
+        let mut br = BitReader::new(&bytes);
+        assert!(MsV1V2PictureHeader::parse_v1(&mut br).is_err());
+
+        let bytes = pack(&[(0, 2), (0, 5)]);
+        let mut br = BitReader::new(&bytes);
+        assert!(MsV1V2PictureHeader::parse_v2(&mut br).is_err());
     }
 }
