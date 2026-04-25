@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.3](https://github.com/OxideAV/oxideav-msmpeg4/compare/v0.0.2...v0.0.3) - 2026-04-24
+
+### Other
+
+- v3 P-frame skeleton — MV VLC + MC copy + reference threading
+- DC spatial predictor + AC-scan dispatcher + MCBPCY wire
+- v3 I-frame first light — end-to-end Frame::Video output
+- wire 6-block intra MB decode + annotate OPEN intra AC VLC
+- add intra AC coefficient decoder + ffmpeg integration test
+- wire first-MB decode path + update README status
+- add intra macroblock header + DC differential decode
+- add CBPY + DC-size VLC tables
+- add scan tables, H.263-style dequant, and 8x8 IDCT
+- add picture module + wire decoder to v3 parser
+- add linear-scan VLC decoder infrastructure
+- add v3 picture-header parser module
+
 ### Added
 
 - **v3 P-frame decoder skeleton** (round 9): `decode_pframe` wires
