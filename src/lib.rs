@@ -109,8 +109,8 @@
 use std::collections::VecDeque;
 
 use oxideav_core::{
-    format::PixelFormat, time::TimeBase, CodecCapabilities, CodecId, CodecParameters, CodecTag,
-    Error, Frame, Packet, ProbeContext, Result, VideoFrame, VideoPlane,
+    CodecCapabilities, CodecId, CodecParameters, CodecTag, Error, Frame, Packet, ProbeContext,
+    Result, VideoFrame, VideoPlane,
 };
 use oxideav_core::{CodecInfo, CodecRegistry, Decoder};
 
@@ -350,16 +350,12 @@ pub fn register(reg: &mut CodecRegistry) {
 ///
 /// The picture's internal strides are MB-aligned multiples of 16 (luma)
 /// and 8 (chroma); `VideoFrame` carries `(stride, data)` per plane
-/// verbatim. `pts` is propagated from the source packet.
+/// verbatim. `pts` is propagated from the source packet. Stream-level
+/// properties (pixel format, width, height, time base) live on the
+/// stream's [`CodecParameters`], not the frame.
 fn picture_to_video_frame(pic: &picture::Picture, pts: Option<i64>) -> VideoFrame {
     VideoFrame {
-        format: PixelFormat::Yuv420P,
-        width: pic.width,
-        height: pic.height,
         pts,
-        // MSMPEG4 has no intrinsic time base — the container (AVI) owns
-        // the frame rate. Caller can override after receive_frame().
-        time_base: TimeBase::new(1, 1),
         planes: vec![
             VideoPlane {
                 stride: pic.y_stride,

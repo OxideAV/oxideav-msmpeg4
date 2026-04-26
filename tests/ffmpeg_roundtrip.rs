@@ -247,9 +247,8 @@ fn ffmpeg_generated_div3_decodes_to_video_frame() {
     let frame = dec.receive_frame().expect("first frame");
     match frame {
         oxideav_core::Frame::Video(v) => {
-            assert_eq!(v.format, oxideav_core::format::PixelFormat::Yuv420P);
-            assert_eq!(v.width, 16);
-            assert_eq!(v.height, 16);
+            // Stream-level params (format, width, height) live on
+            // CodecParameters now — frames carry only pts + planes.
             assert_eq!(v.planes.len(), 3);
             // Y plane
             assert_eq!(v.planes[0].stride, 16);
@@ -517,9 +516,8 @@ fn pframe_smoke_32x32_decodes() {
             let frame = dec.receive_frame().expect("P-frame output");
             match frame {
                 oxideav_core::Frame::Video(v) => {
-                    assert_eq!(v.format, oxideav_core::format::PixelFormat::Yuv420P);
-                    assert_eq!(v.width, 32);
-                    assert_eq!(v.height, 32);
+                    // Stream-level params (format, width, height) live on
+                    // CodecParameters now — frames carry only pts + planes.
                     assert_eq!(v.planes.len(), 3);
                     let y_max = v.planes[0].data.iter().copied().max().unwrap_or(0);
                     assert!(y_max > 0, "P-frame luma plane was all zeros");
