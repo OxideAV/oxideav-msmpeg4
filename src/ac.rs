@@ -111,15 +111,22 @@ impl AcVlcTable {
     /// out with the actionable error in [`crate::mb::decode_intra_mb`]
     /// rather than running off the end of the table.
     ///
+    /// This is the **production default** for v3 stream decode and will
+    /// remain so until the G5 (intra-luma DCT AC TCOEF) descriptor's
+    /// canonical-Huffman code-length array is extracted into `tables/`.
+    /// The G5 packed-Huffman input source lives at VMA `0x1c259d78`
+    /// (file `0x59178`) per spec/99 §8.1 / §10.3, but the constructor
+    /// algorithm that turns the packed input into a runtime descriptor
+    /// (located at VMA `0x1c210ee6` per spec/99 §10.1) has not been
+    /// disassembled, so the live `count_A = 102, count_B = 66`
+    /// canonical-Huffman shape required by §5 cannot yet be wired.
+    ///
     /// Use [`AcVlcTable::v3_intra_candidate`] for the candidate table
     /// extracted from `docs/video/msmpeg4/tables/region_05eed0.csv`
-    /// (VMA `0x1c25fad0`). That table's role is OPEN per
-    /// `docs/video/msmpeg4/spec/99-current-understanding.md` §0.1 row 8
-    /// and §9 OPEN-O6 — confirmed-canonical-Huffman code-length data
-    /// (Kraft sum exactly 1 over its 64 payload bit-lengths) but the
-    /// alphabet's `(last, run, level)` mapping is not fixed by the
-    /// extracted bytes alone. The candidate constructor documents one
-    /// concrete interpretation; a future spec/audit pass may revise it.
+    /// (VMA `0x1c25fad0`). That candidate is **structurally not** the
+    /// G5 source (alphabet shape mismatches — see the candidate's
+    /// doc-comment) and is intended only for synthetic-stream pipeline
+    /// tests, not real-content decode.
     pub const V3_INTRA_PLACEHOLDER: AcVlcTable = AcVlcTable {
         entries: &[],
         esc_last_bits: Self::MPEG4_ESC_LAST_BITS,
@@ -141,6 +148,20 @@ impl AcVlcTable {
     /// downstream wiring + tests can exercise the canonical-Huffman
     /// walker, but **the (last, run, level) mapping below is the
     /// Implementer's hypothesis**, not an extraction artefact.
+    ///
+    /// **Structural mismatch with G5 (intra-luma DCT AC TCOEF).** Per
+    /// spec/99 §5, the v3 intra-AC primary VLC is the G5 descriptor
+    /// with `count_A = 102, count_B = 66`. The 64-entry / partition-1
+    /// shape of `region_05eed0` therefore cannot be the runtime G5
+    /// descriptor that the per-block AC kernel `0x1c216d97` consumes.
+    /// The likeliest correct attribution per spec/99 §9 OPEN-O6 is
+    /// **v2 MCBPCY**, not v3 intra-AC. Until a future Extractor session
+    /// (a) disassembles the packed-Huffman constructor at VMA
+    /// `0x1c210ee6` and (b) extracts the G5 packed-Huffman input source
+    /// at VMA `0x1c259d78` (file `0x59178`) to a code-length array, the
+    /// real v3 intra-AC table cannot be wired. The candidate retained
+    /// here is plumbing for synthetic-stream tests, NOT a real-content
+    /// table.
     ///
     /// # `(last, run, level)` interpretation (HYPOTHESIS)
     ///

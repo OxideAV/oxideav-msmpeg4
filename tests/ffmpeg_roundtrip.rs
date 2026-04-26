@@ -563,3 +563,150 @@ fn tempdir() -> PathBuf {
     writeln!(s, "{}", nonce).unwrap();
     p
 }
+
+/// Real-content gap diagnostic: take a 176×144 testsrc DIV3 stream
+/// (CIF resolution, real-world enough to exercise multiple MBs and
+/// a non-trivial CBP distribution), drive the I-frame through the
+/// crate's decoder with the candidate AC table engaged, and capture
+/// the pel-domain delta against ffmpeg's decode of the same chunk.
+///
+/// **This test never fails the build** — it documents the actual
+/// PSNR floor so that whoever lands the real G4 / G5 AC tables in a
+/// future round can compare-against-baseline. The current expected
+/// floor is single-digit Y PSNR (5–10 dB) because the candidate
+/// `(last, run, level)` mapping is structurally wrong (alphabet
+/// shape mismatch with G5; see `AcVlcTable::v3_intra_candidate`'s
+/// doc-comment for the spec/99 §5 reference).
+///
+/// Output (eprintln) shape, on a working ffmpeg install:
+///
+/// ```text
+/// real_fixture_psnr_diagnostic: dims=176x144, AC=Placeholder
+///   our_decode = Err("...spec/99 §9 OPEN-O4 ...")
+/// real_fixture_psnr_diagnostic: dims=176x144, AC=Candidate
+///   our_decode = Ok, Y PSNR = 6.84 dB, Cb = 17.21 dB, Cr = 16.95 dB
+/// ```
+#[test]
+fn real_fixture_psnr_diagnostic() {
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg not available — skipping diagnostic test");
+        return;
+    }
+    let tmp = tempdir();
+    let avi = tmp.join("cif.avi");
+    let ok = Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=size=176x144:rate=10:duration=0.3",
+            "-c:v",
+            "msmpeg4v3",
+            "-g",
+            "1",
+            "-qscale:v",
+            "5",
+            "-f",
+            "avi",
+            "-y",
+        ])
+        .arg(&avi)
+        .status()
+        .ok()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !ok {
+        eprintln!("ffmpeg failed to mint CIF DIV3 — skipping");
+        return;
+    }
+    let bytes = std::fs::read(&avi).expect("read AVI");
+    let chunks = all_video_chunks(&bytes);
+    if chunks.is_empty() {
+        eprintln!("no video chunks — skipping");
+        return;
+    }
+    let chunk = &chunks[0];
+
+    // ffmpeg-side reference decode → raw YUV420p.
+    let ref_y = tmp.join("ref.yuv");
+    let rd = Command::new("ffmpeg")
+        .args(["-hide_banner", "-loglevel", "error", "-i"])
+        .arg(&avi)
+        .args([
+            "-vframes", "1", "-f", "rawvideo", "-pix_fmt", "yuv420p", "-y",
+        ])
+        .arg(&ref_y)
+        .status()
+        .ok()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !rd {
+        eprintln!("ffmpeg reference decode failed — skipping");
+        return;
+    }
+    let raw = std::fs::read(&ref_y).expect("read ref YUV");
+    let y_len = 176 * 144;
+    let c_len = 88 * 72;
+    if raw.len() < y_len + 2 * c_len {
+        eprintln!("ref YUV too short — skipping");
+        return;
+    }
+    let y_ref = &raw[..y_len];
+    let cb_ref = &raw[y_len..y_len + c_len];
+    let cr_ref = &raw[y_len + c_len..y_len + 2 * c_len];
+
+    fn psnr(ours: &[u8], theirs: &[u8]) -> f64 {
+        assert_eq!(ours.len(), theirs.len());
+        let mut sse: f64 = 0.0;
+        for (a, b) in ours.iter().zip(theirs.iter()) {
+            let d = *a as f64 - *b as f64;
+            sse += d * d;
+        }
+        let mse = sse / ours.len() as f64;
+        if mse == 0.0 {
+            return f64::INFINITY;
+        }
+        20.0 * (255.0_f64.log10()) - 10.0 * mse.log10()
+    }
+
+    use oxideav_msmpeg4::picture::{decode_picture_with_ac, AcSelection, PictureDims};
+
+    for selection in [AcSelection::Placeholder, AcSelection::Candidate] {
+        let mut br = BitReader::new(chunk);
+        let dims = PictureDims::new(176, 144).expect("dims");
+        eprintln!(
+            "real_fixture_psnr_diagnostic: dims=176x144, AC={:?}",
+            selection
+        );
+        match decode_picture_with_ac(&mut br, dims, None, selection) {
+            Ok(pic) => {
+                // Crop to nominal dims (decoder allocates MB-aligned).
+                let mut y_ours = Vec::with_capacity(y_len);
+                for j in 0..144 {
+                    let off = j * pic.y_stride;
+                    y_ours.extend_from_slice(&pic.y[off..off + 176]);
+                }
+                let mut cb_ours = Vec::with_capacity(c_len);
+                let mut cr_ours = Vec::with_capacity(c_len);
+                for j in 0..72 {
+                    let off = j * pic.c_stride;
+                    cb_ours.extend_from_slice(&pic.cb[off..off + 88]);
+                    cr_ours.extend_from_slice(&pic.cr[off..off + 88]);
+                }
+                let y_psnr = psnr(&y_ours, y_ref);
+                let cb_psnr = psnr(&cb_ours, cb_ref);
+                let cr_psnr = psnr(&cr_ours, cr_ref);
+                eprintln!(
+                    "  our_decode = Ok, Y PSNR = {:.2} dB, Cb = {:.2} dB, Cr = {:.2} dB",
+                    y_psnr, cb_psnr, cr_psnr
+                );
+            }
+            Err(e) => {
+                eprintln!("  our_decode = Err({:?})", format!("{e}"));
+            }
+        }
+    }
+}

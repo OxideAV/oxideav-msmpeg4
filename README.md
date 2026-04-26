@@ -40,21 +40,45 @@ right decoder when a packet arrives.
 | Intra AC `(last, run, level)` symbol mapping   | OPEN — hypothesis     |
 | P-frame MV VLC + half-pel MC (default table)   | complete              |
 | P-frame MV VLC alternate table                 | unsupported (truncated dump) |
-| Inter AC run/level VLC                         | pending               |
-| V1 / V2 bitstream                              | pending               |
+| Inter AC run/level VLC                         | pending — spec OPEN   |
+| V1 / V2 bitstream                              | header + MV + MCBPC done; AC OPEN |
 
-The intra-AC primary VLC was wired this round from a clean-room
-extraction of `region_05eed0.csv` (VMA `0x1c25fad0`, file offset
-`0x5eed0`). The 64-entry canonical-Huffman code-length array is
-verified at build time (Kraft sum = 1) and exposed via
-[`AcVlcTable::v3_intra_candidate`]. The role attribution of the
-underlying region is **OPEN** per
-`docs/video/msmpeg4/spec/99-current-understanding.md` §0.1 row 8 and
-§9 OPEN-O6 (candidate intra-AC TCOEF source per `spec/03` §5.3,
-alternative v2 MCBPCY source). The candidate's `(last, run, level)`
-mapping is the Implementer's hypothesis (see the doc-comment on
-`v3_intra_candidate` for the exact partition rule); a future spec
-audit may revise it.
+### What's still spec-OPEN for real-content decode
+
+Despite the spec-doc consolidation in `docs/video/msmpeg4/spec/99`,
+the **real intra-AC and inter-AC VLC code-length tables** for v3
+(per the G5 / G4 descriptors at VMAs `0x1c258430` / `0x1c258230`)
+have not been extracted into `tables/` in a form an Implementer can
+consume. What's extracted is:
+
+* `region_05eed0.csv` — a 64-entry canonical-Huffman block at VMA
+  `0x1c25fad0`. **Wired as the v3 intra-AC candidate** in
+  [`AcVlcTable::v3_intra_candidate`], but its role is OPEN per
+  `spec/99 §0.1 row 8` / `§9 OPEN-O6`. Critically, **the alphabet
+  size mismatches G5**: G5 has `count_A = 102, count_B = 66`
+  (spec/99 §5), but `region_05eed0` declares `count_A = 64,
+  count_B = 1`. The candidate is therefore structurally **not** the
+  v3 intra-AC primary VLC source — but it is a complete prefix code
+  in its own right and is retained as Implementer plumbing for
+  pipeline tests.
+* No corresponding extraction exists for G4 (inter-AC); the G4 / G5
+  Huffman code-length data lives in the packed-Huffman input source
+  regions `0x1c259a38` / `0x1c259d78` (file `0x58e38` / `0x59178`),
+  which were dumped as 256-byte over-dumps under the wrong role
+  label ("scan order candidate") per spec/99 §8.3. The constructor
+  algorithm at VMA `0x1c210ee6` that turns these packed inputs into
+  the runtime-walker descriptor has not been disassembled — without
+  that algorithm or a verified canonical-Huffman code-length list,
+  the Implementer cannot wire the v3 inter-AC or the spec-correct
+  v3 intra-AC.
+
+Net effect: real `.avi` v3 fixtures decode the picture / MB /
+MCBPCY / DC layers but produce DC-only intra reconstruction (PSNR
+≈ 5–16 dB on `testsrc2 32×32`) and zero-residual inter MBs. The
+decoder reports the gap with a `Result::Err` citing
+`docs/video/msmpeg4/spec/99-current-understanding.md` §9 OPEN-O4
+when the candidate AC plumbing is engaged on bitstream that diverges
+from its hypothesis.
 
 `send_packet` on a v3 stream defaults to the AC placeholder
 (DC-only reconstruction); callers that want to exercise the

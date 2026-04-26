@@ -230,15 +230,25 @@ pub fn decode_intra_mb(
     // doc-line citations of what's OPEN.
     if ac_table.entries.is_empty() {
         return Err(Error::unsupported(
-            "msmpeg4v3 intra AC VLC: placeholder table in use — no concrete \
-             (symbol, bit_length) pairs available yet. Candidate source VMAs \
-             per docs/video/msmpeg4/spec/03-corrections.md §5.3: 0x1c25fad0 \
-             (file offset 0x5eed0) and 0x1c25f6c8 (file offset 0x5eac8). \
-             Both flagged OPEN in §6 and provenance/03-corrections.md line \
-             101. No Extractor dump exists for either offset — see \
-             tables/README.md. Extractor must produce a region dump and \
-             translate it into a VlcEntry<Symbol> slice before this code \
-             path can decode real bitstreams.",
+            "msmpeg4v3 intra AC VLC: placeholder table in use — the G5 \
+             (intra-luma DCT AC TCOEF) descriptor's canonical-Huffman \
+             code-length array has not been extracted into a runtime \
+             VlcEntry<Symbol> slice. Per docs/video/msmpeg4/spec/99 §5, \
+             the G5 source lives at the packed-Huffman input region VMA \
+             0x1c259d78 (file offset 0x59178) with runtime alphabet \
+             count_A=102, count_B=66 — but the constructor algorithm at \
+             VMA 0x1c210ee6 that turns the packed input into the runtime \
+             descriptor (per spec/99 §10.1) has not been disassembled. \
+             A standalone candidate canonical-Huffman block was extracted \
+             into tables/region_05eed0.csv (VMA 0x1c25fad0, 64 entries) \
+             but its alphabet shape mismatches G5 and per spec/99 §9 \
+             OPEN-O6 it is more likely the v2-MCBPCY source. The OPEN \
+             gating item is spec/99 §9 OPEN-O4 (G0..G3 entry-by-entry \
+             enumeration also missing). To unblock real-content decode, \
+             a future Extractor + Specifier session needs to (a) trace \
+             the constructor at 0x1c210ee6, or (b) capture the runtime \
+             descriptor bytes via Frida instrumentation of mpg4c32.dll \
+             during a known-good decode.",
         ));
     }
 
@@ -378,12 +388,16 @@ mod tests {
         )
         .unwrap_err();
         let msg = format!("{err}");
-        // The error must pin down *both* candidate VMAs and cite the
-        // spec doc section so whoever reads the failure can find the
-        // OPEN line without grep-diving.
-        assert!(msg.contains("0x1c25fad0"), "msg = {msg}");
-        assert!(msg.contains("0x1c25f6c8"), "msg = {msg}");
-        assert!(msg.contains("§5.3"), "msg = {msg}");
+        // The error must cite the actual G5 source VMA, the constructor
+        // VMA whose disassembly is the gating action, and the spec/99
+        // OPEN-O4 reference so whoever reads the failure can find the
+        // gate item without grep-diving.
+        assert!(msg.contains("0x1c259d78"), "msg = {msg}");
+        assert!(msg.contains("0x1c210ee6"), "msg = {msg}");
+        assert!(
+            msg.contains("OPEN-O4") || msg.contains("OPEN-O6"),
+            "msg = {msg}"
+        );
     }
 
     #[test]
