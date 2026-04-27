@@ -9,6 +9,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 18 — G4 / G5 DCT-descriptor pri_A / pri_B wiring**
+  (2026-04-26): clean-room extraction of `region_0569c0.hex`
+  (file `0x569c0..0x57898`, 3800 bytes — the G-descriptor
+  cluster per `spec/99 §10.3`) is copied verbatim into
+  `crates/oxideav-msmpeg4/tables/region_0569c0.hex` and
+  `build.rs::emit_g_descriptor_cluster` slices out four byte
+  arrays:
+    - `G4_PRI_A` (102 bytes, file `0x57630..0x57696`) — `|level|`
+      per symbol for the inter DCT TCOEF alphabet.
+    - `G4_PRI_B` (102 bytes, low byte of u32-LE record at
+      file `0x57698..0x57830`) — `run` per symbol.
+    - `G5_PRI_A` (102 bytes, file `0x57830..0x57896`) —
+      `|level|` per symbol for intra-luma DCT TCOEF.
+    - `G5_PRI_B` is **not yet captured**: it lives in a 408-byte
+      gap between `region_0569c0`'s end (`0x57898`) and
+      `region_057a30`'s start, not in any `tables/*` file.
+  All slice offsets are derived from `spec/99 §5` VMAs minus the
+  region base — no numeric values are typed by the Implementer.
+  Build-time guards verify the canonical level prefix
+  (`01 02 03 ...` per `spec/99 §5.1`), the run-zero prefix in
+  pri_B (12 zero u32s for G4 sub-A start), and the partition
+  cross-check against `audit/01 §2.2` (`pri_B[count_B] == 26` for
+  G4's sub-A last run, `pri_B[count_B+1] == 0` for sub-B restart).
+- **`g_descriptor` module** — public `(idx → (last, run, level_mag))`
+  decoder for G4 (full alphabet + ESC) and G5 (sub-class A + ESC,
+  sub-class B returns `None` until G5 pri_B is captured). Wraps
+  `spec/04 §1.3 step 3`'s partition test and `spec/99 §4.2` step 2.
+- **18 new `g_descriptor::tests`** + **7 new
+  `tests/g_descriptor_g4.rs` integration tests** + **11 new
+  `tables_data::tests` invariants**: total +36 tests vs r17, all
+  passing. Coverage includes:
+    - LMAX-per-run cross-check against `audit/01 §3.3` (G4 inter
+      ESCL(b) profile) and `§4.2` (G5 intra ESCL(a) profile).
+    - sub-A / sub-B partition strict-monotone check across all 102
+      G4 indices.
+    - byte-level round-trip: pri_A/pri_B values match decoder output
+      for every idx in [0, count_A).
+    - sentinel-byte guards (no `0` or `0xff` in pri_A per
+      `audit/01 §2.3`).
+- **Spec-OPEN documentation refreshed**: README status table now
+  carries explicit rows for G4/G5 wiring state and the
+  bit-length / G5-pri_B gaps. The "What's still spec-OPEN"
+  section names the walker tree at file `0x3df40` (per
+  `spec/99 §5.3`) as the remaining blocker for runnable AC decode.
+
+  PSNR baseline on `testsrc2 32×32` is unchanged at 5.30 dB Y —
+  this round wires the data structures and validates them against
+  the audit's per-row enumeration; runnable bit-stream AC decode
+  awaits the next round's bit-length resolution.
+
 - **Intra-AC primary VLC candidate wired** (round 10): clean-room
   extraction of `region_05eed0.csv` (VMA `0x1c25fad0`, file offset
   `0x5eed0`) lands in the build pipeline. The 64-entry canonical-

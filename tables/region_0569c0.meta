@@ -1,0 +1,30 @@
+source: mpg4c32.dll
+source_sha256: aedb4cf3d33c8554ab8acf04afe2d936eaa7c49107c5fefe163bca2e94b3c099
+file_offset_start_hex: 0x0569c0
+file_offset_end_exclusive_hex: 0x057898
+vma_start_hex: 0x1c2575c0
+byte_length: 3800
+role: G0..G5 DCT-descriptor pri_A / pri_B cluster (12 tables total)
+note: This is the cluster region described in spec/99 §10.3 holding all six
+  G-descriptor pri_A (byte-per-symbol |level|) and pri_B (u32-per-symbol run)
+  arrays. Per the order in spec/99 §10.3 the layout is:
+    G0 pri_B (count_A=168 -> 672 bytes)
+    G0 pri_A (count_A=168 -> 168 bytes)
+    G1 pri_B (count_A=185 -> 740 bytes)
+    G1 pri_A (count_A=185 -> 185 bytes)
+    G2 pri_B (count_A=148 -> 592 bytes)
+    G2 pri_A (count_A=148 -> 148 bytes)
+    G3 pri_B (count_A=132 -> 528 bytes)
+    G3 pri_A (count_A=132 -> 132 bytes)
+    G4 pri_A (count_A=102 -> 102 bytes) at file 0x57630
+    G4 pri_B (count_A=102 -> 408 bytes) at file 0x57698
+    G5 pri_A (count_A=102 -> 102 bytes) at file 0x57830
+    G5 pri_B (count_A=102 -> 408 bytes) at file 0x57898 — beyond region end!
+  Audit/01 §3 verified G4 matches MPEG-4 Part 2 Table 11-16 Inter LMAX exactly;
+  Audit/01 §4 verified G5 matches MPEG-4 Part 2 Table 11-15 Intra LMAX exactly.
+  This crate currently wires only G4 pri_A (file 0x57630..0x57696, 102 bytes)
+  and G4 pri_B (file 0x57698..0x57830, 408 bytes); G5 pri_A is at file 0x57830
+  but its pri_B extends beyond the region's end — it lives in the next
+  contiguous .data block which is NOT included in region_0569c0.
+provenance: copied verbatim from
+  docs/video/msmpeg4/tables/region_0569c0.hex (Extractor session 01).

@@ -103,6 +103,15 @@
 //! parses the picture header successfully and then surfaces a
 //! documented `Unsupported` citing the open spec item, so callers can
 //! distinguish "header malformed" from "decoder gap".
+//!
+//! **Round 18 (2026-04-26)** wires the G4 (inter chroma + all-inter)
+//! and G5 (intra-luma) DCT-descriptor `pri_A` / `pri_B` byte arrays
+//! from the cluster region `region_0569c0` — see [`g_descriptor`] for
+//! the `(idx → (last, run, |level|))` mapping that v1/v2/v3 inter and
+//! intra kernels share post-VLC. The canonical-Huffman bit-length
+//! array (which feeds the VLC walk itself) still lives in the shared
+//! 68 KB walker tree at file `0x3df40` and is OPEN; see this crate's
+//! README "What's still spec-OPEN" section for the resolution path.
 
 #![deny(unsafe_code)]
 
@@ -116,6 +125,7 @@ use oxideav_core::{CodecInfo, CodecRegistry, Decoder};
 
 pub mod ac;
 pub mod dc_pred;
+pub mod g_descriptor;
 pub mod header;
 pub mod idct;
 pub mod iq;
