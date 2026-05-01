@@ -87,8 +87,20 @@ What's **still missing for runnable AC decode**:
   requires either (a) disassembling the constructor at
   `0x1c210ee6` (which builds the runtime descriptor from the packed
   source regions `0x1c259a38` / `0x1c259d78`) or (b) decoding the
-  walker structure directly. Neither is in `docs/video/msmpeg4/`
-  yet; both are next-round Specifier work.
+  walker structure directly.
+* **Round 25 (2026-05-01)** confirmed the byte layout: 8 544
+  records of `(symbol:u32-LE, bit_length:u32-LE)` partitioned as
+  4 096 (primary) + 4 096 (refill A) + 352 (refill B / tail), with
+  `(sym=11, bl=4)` as the dominant primary sentinel and `(sym=0, bl=8)`
+  as the dominant refill-A sentinel. **The bit-reader semantics that
+  navigate the walker (window width, MSB/LSB, refill index
+  derivation) cannot be derived from the data alone** — three
+  obvious indexing hypotheses (12-bit MSB-first, 12-bit LSB-first,
+  8-bit pre-expansion stacked 16×) were tested against the
+  observed entry distribution and all refuted. See
+  `docs/video/msmpeg4/spec/10-walker-investigation.md` for the
+  detailed write-up. Next round needs binary disassembly of
+  helper `0x1c219351` and/or constructor `0x1c210ee6`.
 
 The previously-shipped `region_05eed0.csv` candidate — a 64-entry
 canonical-Huffman block at VMA `0x1c25fad0` — remains wired as
