@@ -181,13 +181,24 @@ fn main() {
     //
     // FROM: docs/video/msmpeg4/spec/07-remaining-opens.md §5.4
     // FROM: docs/video/msmpeg4/spec/99-current-understanding.md §4.5
+    // Per task #114 / spec/07 §5.4 the four 968-byte VMAs in
+    // file-offset order are:
+    //
+    //   0x05f0d8 (VMA 0x1c25fcd8) → INTRA_DC_LUMA_SEL0
+    //   0x05f4a0 (VMA 0x1c2600a0) → INTRA_DC_LUMA_SEL1
+    //   0x05f868 (VMA 0x1c260468) → INTRA_DC_CHROMA_SEL0
+    //   0x05fc30 (VMA 0x1c260830) → INTRA_DC_CHROMA_SEL1
+    //
+    // The pair-by-axis order is consistent with the binary's call-site
+    // grouping where the luma path (VMA 0x1c214b0e) accesses the first
+    // pair and the chroma paths (Cb / Cr) access the second pair.
     let dc_luma_sel0 = tables_dir.join("region_05f0d8.hex");
-    let dc_chroma_sel0 = tables_dir.join("region_05f4a0.hex");
-    let dc_luma_sel1 = tables_dir.join("region_05f868.hex");
+    let dc_luma_sel1 = tables_dir.join("region_05f4a0.hex");
+    let dc_chroma_sel0 = tables_dir.join("region_05f868.hex");
     let dc_chroma_sel1 = tables_dir.join("region_05fc30.hex");
     println!("cargo:rerun-if-changed={}", dc_luma_sel0.display());
-    println!("cargo:rerun-if-changed={}", dc_chroma_sel0.display());
     println!("cargo:rerun-if-changed={}", dc_luma_sel1.display());
+    println!("cargo:rerun-if-changed={}", dc_chroma_sel0.display());
     println!("cargo:rerun-if-changed={}", dc_chroma_sel1.display());
     emit_intra_dc_vlc(
         &dc_luma_sel0,
@@ -197,16 +208,16 @@ fn main() {
         0x1c25fcd8,
     );
     emit_intra_dc_vlc(
-        &dc_chroma_sel0,
-        &out_dir.join("intra_dc_chroma_sel0.rs"),
-        "INTRA_DC_CHROMA_SEL0",
+        &dc_luma_sel1,
+        &out_dir.join("intra_dc_luma_sel1.rs"),
+        "INTRA_DC_LUMA_SEL1",
         0x5f4a0,
         0x1c2600a0,
     );
     emit_intra_dc_vlc(
-        &dc_luma_sel1,
-        &out_dir.join("intra_dc_luma_sel1.rs"),
-        "INTRA_DC_LUMA_SEL1",
+        &dc_chroma_sel0,
+        &out_dir.join("intra_dc_chroma_sel0.rs"),
+        "INTRA_DC_CHROMA_SEL0",
         0x5f868,
         0x1c260468,
     );
@@ -1230,37 +1241,41 @@ fn emit_packed_huffman_primary(
 
 /// Parse an MS-MPEG4 intra-DC packed-Huffman source.
 ///
-/// Same `4 + 120 * 8`-byte container as the G4/G5 primary VLC sources
-/// (per `docs/video/msmpeg4/spec/11-walker-format-resolved.md` §3-§4):
-/// header `(count: u32, partition_or_other: u32)` followed by 120
-/// records of `(a: u32, b: u32)`. **Critical convention difference:**
-/// for the intra-DC tables the convention is `(a, b) = (bit_length,
-/// code_value)`, the *opposite* of G4/G5 which uses
-/// `(code_value, bit_length)`. The Kraft sum check below proves it —
-/// summing `2^-a` over all entries gives exactly 1, while summing
-/// `2^-b` would diverge wildly.
+/// Per `docs/video/msmpeg4/spec/11-walker-format-resolved.md` §3-§4
+/// the source layout is identical for ALL 14 packed-Huffman slots
+/// (G4 / G5 / MCBPCY / MV / intra-DC):
+///
+/// ```text
+/// +0x00 : count : u32                       ; alphabet size
+/// +0x04 : records[0..count] : <8 B each>
+///           (a:u32, b:u32) where
+///             a == 0xFFFFFFFF → hole sentinel: stored as (0,0)
+///             otherwise       → (a, b) = (canonical_code_value, bit_length)
+/// ```
+///
+/// The decoded `idx` from a successful VLC walk is the symbol's
+/// position in the records array (per spec/07 §5.4 for intra-DC):
+/// idx 0..118 → DC differential magnitude (±idx with a separately
+/// read sign bit); idx 119 → ESC sentinel that triggers an 8-bit
+/// raw + sign read.
 ///
 /// We emit a `&[(u32, u32)]` of `(bit_length, code_value)` records
-/// (matching the runtime convention of G4/G5 and the candidate
-/// region_05eed0 emitter), so the consumer can build a
-/// canonical-Huffman table with the existing
-/// `crate::ac::build_g_primary`-style walker.
+/// for parity with the runtime conventions used by the rest of the
+/// crate (G4/G5 emitter and the candidate region_05eed0 emitter both
+/// store `(bl, code)`).
 fn emit_intra_dc_vlc(hex_path: &Path, out_path: &Path, label: &str, file_off: u32, vma: u32) {
     let bytes = parse_xxd(hex_path);
-    // MS-MPEG4 intra-DC sources use a different container layout from
-    // G4/G5: 121 × 8-byte records with no separate `count: u32` prefix.
-    // Record 0 is the header `(count=120, partition=1)` and records
-    // 1..120 are the payload entries. (G4/G5 use `4 + count*8` with an
-    // explicit u32-LE prefix.) Total file size = 121 * 8 = 968 bytes.
-    if bytes.len() < 121 * 8 {
+    // 4-byte u32-LE count header + 120 * 8-byte records = 964 bytes
+    // total. The xxd extract may include trailing padding from the
+    // adjacent region (this is fine — we only consume `4 + 120 * 8`).
+    let needed = 4 + 120 * 8;
+    if bytes.len() < needed {
         panic!(
-            "{label}: expected at least {} bytes in {} (121 × 8 records, no separate count prefix), got {}",
-            121 * 8,
+            "{label}: expected at least {needed} bytes in {} (4-byte count + 120 * 8 records), got {}",
             hex_path.display(),
             bytes.len()
         );
     }
-    // Header record (index 0): (count, partition).
     let header_count = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
     if header_count != 120 {
         panic!(
@@ -1269,8 +1284,8 @@ fn emit_intra_dc_vlc(hex_path: &Path, out_path: &Path, label: &str, file_off: u3
     }
     let mut records: Vec<(u32, u32)> = Vec::with_capacity(header_count as usize);
     for i in 0..header_count as usize {
-        // Payload starts after the 8-byte header record.
-        let off = 8 + i * 8;
+        // Payload starts at offset 4 (immediately after the count u32).
+        let off = 4 + i * 8;
         let a = u32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]]);
         let b = u32::from_le_bytes([
             bytes[off + 4],
@@ -1278,30 +1293,26 @@ fn emit_intra_dc_vlc(hex_path: &Path, out_path: &Path, label: &str, file_off: u3
             bytes[off + 6],
             bytes[off + 7],
         ]);
-        // Hole sentinel handling — same as G4/G5 (spec/11 §4): a record
-        // whose first u32 is 0xFFFFFFFF is an empty slot (consume 8
-        // bytes, store as (0, 0)). For DC tables we haven't seen any in
-        // the four 120-entry sources, but the helper-A path supports it
-        // structurally so we keep the check.
-        let (bl, code) = if a == 0xFFFF_FFFF {
+        // Per spec/11 §4: a == 0xFFFFFFFF marks a hole; helper A
+        // writes (0, 0) but advances 8 source bytes either way.
+        let (code, bl) = if a == 0xFFFF_FFFF {
             (0u32, 0u32)
         } else {
-            // OPPOSITE convention from G4/G5: a = bit_length, b = code_value.
+            // Canonical convention per spec/11 §4 / §6: a = code_value,
+            // b = bit_length. Same convention as G4/G5/MCBPCY/MV.
             (a, b)
         };
         if bl > 26 {
             panic!(
                 "{label}: record {i} has bit_length {bl} > 26 — exceeds the binary's max-bitlen \
-                 budget for these tables (largest bl is 26 across all 4 dc tables); extraction \
-                 misalignment suspected"
+                 budget for these tables; extraction misalignment suspected"
             );
         }
         records.push((bl, code));
     }
 
-    // Kraft sum check — must equal exactly 1 in 2^-bl arithmetic. The
-    // `max_bl` for our DC tables can be up to 26 across the four
-    // sources; carry the arithmetic in 2^-32 fixed-point to keep margin.
+    // Kraft sum check — must equal exactly 1 in 2^-bl arithmetic.
+    // Carry the arithmetic in 2^-32 fixed-point to keep margin.
     let max_bl_for_kraft: u32 = 32;
     let target: u64 = 1u64 << max_bl_for_kraft;
     let sum: u64 = records
@@ -1312,9 +1323,8 @@ fn emit_intra_dc_vlc(hex_path: &Path, out_path: &Path, label: &str, file_off: u3
     if sum != target {
         panic!(
             "{label}: Kraft sum {sum} != expected {target} (= 1 in 2^-32 fixed point) — \
-             intra-DC VLC source is not a complete prefix code with the (bl, code) convention. \
-             Check that the binary's (a, b) record order is `(bit_length, code_value)` and not \
-             the opposite G4/G5 convention."
+             intra-DC VLC source is not a complete prefix code under the spec/11 §4 \
+             (a=code, b=bl) convention."
         );
     }
 
@@ -1330,8 +1340,7 @@ fn emit_intra_dc_vlc(hex_path: &Path, out_path: &Path, label: &str, file_off: u3
          // Region: file offset 0x{file_off:06x}, VMA 0x{vma:08x}, 964 bytes (4 + 120 * 8).\n\
          // Format (per docs/video/msmpeg4/spec/11-walker-format-resolved.md §4 +\n\
          // docs/video/msmpeg4/spec/07-remaining-opens.md §5.4):\n\
-         //   u32-LE count = 120, then 120 * (a:u32-LE = bit_length, b:u32-LE = code_value).\n\
-         //   NOTE the (a, b) order is OPPOSITE to G4/G5 primary VLC sources.\n\
+         //   u32-LE count = 120, then 120 * (a:u32-LE = code_value, b:u32-LE = bit_length).\n\
          // Role: {label} intra-DC differential VLC source.\n\
          // Symbol idx 0..118 = direct DC differential magnitude (±idx with separate sign bit).\n\
          // Symbol idx 119 = ESC sentinel (decoder reads 8-bit raw + sign).\n\

@@ -20,10 +20,14 @@
 //!        in one go, then reads the post-VLC `ac_pred_flag` bit.
 //!      - For each of 6 blocks: MPEG-4 §7.4.3 spatial DC prediction
 //!        (gradient test on the three already-decoded neighbours),
-//!        `decode_intra_dc_diff` for the DC-differential VLC, reconstruct
-//!        DC = predictor + diff * scaler, then (if CBP bit is set and
-//!        we have a real AC VLC table available) the AC walk through
-//!        the scan table chosen from the DC direction (spec/04 §4.4).
+//!        [`crate::mb::decode_intra_dc_diff_v3`] for the v3 custom
+//!        120-entry direct-value DC-differential VLC (per spec/07
+//!        §5.4 + spec/11 §4 + spec/12 §3), with the picture-header
+//!        `dc_size_sel` bit choosing between the two table pairs;
+//!        reconstruct DC = predictor + diff * scaler, then (if CBP
+//!        bit is set and we have a real AC VLC table available)
+//!        the AC walk through the scan table chosen from the DC
+//!        direction (spec/04 §4.4).
 //!      - IDCT (float reference in `idct.rs`).
 //!      - Output pels are written into the corresponding MB slot of the
 //!        Y / Cb / Cr planes.
@@ -66,7 +70,7 @@ use crate::ac::{AcVlcTable, Scan};
 use crate::dc_pred::{DcCache, DcPrediction};
 use crate::header::{MsV3PictureHeader, PictureType};
 use crate::idct::idct8x8_to_pel;
-use crate::mb::{decode_intra_block_full, IntraMbHeader};
+use crate::mb::{decode_intra_block_full_v3, IntraMbHeader};
 
 /// Dimensions of a picture, derived from the container's
 /// [`oxideav_core::CodecParameters`]. MS-MPEG4v3 does not carry
@@ -291,6 +295,7 @@ fn decode_iframe(
                 mx,
                 my,
                 quant,
+                hdr.dc_size_sel,
                 &luma_ac,
                 &chroma_ac,
             )?;
@@ -359,6 +364,7 @@ fn decode_pframe(
                 my,
                 mb_w,
                 quant,
+                hdr.dc_size_sel,
                 &luma_ac,
                 &chroma_ac,
             )?;
@@ -381,6 +387,7 @@ fn decode_pframe_mb(
     mb_y: usize,
     mb_w: usize,
     quant: u32,
+    dc_size_sel: u8,
     luma_ac: &AcVlcTable,
     chroma_ac: &AcVlcTable,
 ) -> Result<()> {
@@ -432,7 +439,16 @@ fn decode_pframe_mb(
             cbp_cr: decode.cbp_cr,
         };
         decode_intra_mb_with_header(
-            br, pic, dc_cache, &header, mb_x, mb_y, quant, luma_ac, chroma_ac,
+            br,
+            pic,
+            dc_cache,
+            &header,
+            mb_x,
+            mb_y,
+            quant,
+            dc_size_sel,
+            luma_ac,
+            chroma_ac,
         )?;
         // Intra MBs clear the MV predictor chain: the per-row mv_grid
         // entry stays `None` so downstream neighbours treat this
@@ -506,6 +522,7 @@ fn decode_intra_mb_with_header(
     mb_x: usize,
     mb_y: usize,
     quant: u32,
+    dc_size_sel: u8,
     luma_ac: &AcVlcTable,
     chroma_ac: &AcVlcTable,
 ) -> Result<()> {
@@ -530,7 +547,7 @@ fn decode_intra_mb_with_header(
         };
         let ac_table = if block_idx <= 3 { luma_ac } else { chroma_ac };
         let block_result = if cbp_set && ac_table.entries.is_empty() {
-            let dc_diff = crate::mb::decode_intra_dc_diff(br, block_idx)?;
+            let dc_diff = crate::mb::decode_intra_dc_diff_v3(br, block_idx, dc_size_sel)?;
             let dc = crate::mb::reconstruct_intra_dc(dc_diff, pred.predictor, block_idx, quant);
             crate::mb::DecodedIntraBlock {
                 coeffs: {
@@ -541,7 +558,7 @@ fn decode_intra_mb_with_header(
                 ac_nonzero: 0,
             }
         } else {
-            decode_intra_block_full(
+            decode_intra_block_full_v3(
                 br,
                 block_idx,
                 pred.predictor,
@@ -549,6 +566,7 @@ fn decode_intra_mb_with_header(
                 cbp_set,
                 scan,
                 ac_table,
+                dc_size_sel,
             )?
         };
         let reconstructed_dc = block_result.coeffs[0];
@@ -587,6 +605,7 @@ fn decode_intra_mb_to_picture(
     mb_x: usize,
     mb_y: usize,
     quant: u32,
+    dc_size_sel: u8,
     luma_ac: &AcVlcTable,
     chroma_ac: &AcVlcTable,
 ) -> Result<()> {
@@ -640,7 +659,7 @@ fn decode_intra_mb_to_picture(
         // in, the regular `decode_intra_block_full` path runs.
         let bit_before = br.bit_position();
         let block_result = if cbp_set && ac_table.entries.is_empty() {
-            let dc_diff = crate::mb::decode_intra_dc_diff(br, block_idx)?;
+            let dc_diff = crate::mb::decode_intra_dc_diff_v3(br, block_idx, dc_size_sel)?;
             let dc = crate::mb::reconstruct_intra_dc(dc_diff, pred.predictor, block_idx, quant);
             crate::mb::DecodedIntraBlock {
                 coeffs: {
@@ -651,7 +670,7 @@ fn decode_intra_mb_to_picture(
                 ac_nonzero: 0,
             }
         } else {
-            decode_intra_block_full(
+            decode_intra_block_full_v3(
                 br,
                 block_idx,
                 pred.predictor,
@@ -659,6 +678,7 @@ fn decode_intra_mb_to_picture(
                 cbp_set,
                 scan,
                 ac_table,
+                dc_size_sel,
             )?
         };
         if trace {

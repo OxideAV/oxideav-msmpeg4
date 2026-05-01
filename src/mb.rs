@@ -660,4 +660,39 @@ mod tests {
             assert_eq!(b.ac_nonzero, 1, "chroma block {i} non-zero count");
         }
     }
+
+    /// The first three luma sel=0 entries are `(bl=1, code=1)`,
+    /// `(bl=2, code=1)`, `(bl=4, code=1)` for symbols 0, 1, 2 (from
+    /// `region_05f0d8`). Symbol 0 ⇒ DC=0 (no sign read); symbol 1 with
+    /// sign bit "1" ⇒ DC=+1; symbol 2 with sign bit "0" ⇒ DC=-2.
+    /// This locks in both the (a=code, b=bl) parser convention from
+    /// spec/11 §4 / §6 AND the spec/07 §5.2 sign convention.
+    #[test]
+    fn decode_intra_dc_diff_v3_luma_sel0_first_symbols() {
+        // Symbol 0: bl=1 code=1 → bit `1`, no sign bit follows.
+        let bytes = pack(&[(0b1, 1), (0, 8)]);
+        let mut br = BitReader::new(&bytes);
+        assert_eq!(decode_intra_dc_diff_v3(&mut br, 0, 0).unwrap(), 0);
+
+        // Symbol 1: bl=2 code=1 → bits `01`, then sign=1 ⇒ +1.
+        let bytes = pack(&[(0b01, 2), (0b1, 1), (0, 8)]);
+        let mut br = BitReader::new(&bytes);
+        assert_eq!(decode_intra_dc_diff_v3(&mut br, 0, 0).unwrap(), 1);
+
+        // Symbol 2: bl=4 code=1 → bits `0001`, then sign=0 ⇒ -2.
+        let bytes = pack(&[(0b0001, 4), (0b0, 1), (0, 8)]);
+        let mut br = BitReader::new(&bytes);
+        assert_eq!(decode_intra_dc_diff_v3(&mut br, 0, 0).unwrap(), -2);
+    }
+
+    /// Chroma sel=0 (region_05f868) has `(bl=2, code=2)` for symbol 0.
+    /// With dc_size_sel=0, block_idx=4 (Cb), the bits `10` should
+    /// decode to symbol 0 (DC=0, no sign bit).
+    #[test]
+    fn decode_intra_dc_diff_v3_chroma_sel0_symbol_zero() {
+        // Symbol 0: bl=2 code=2 → bits `10`. No sign bit.
+        let bytes = pack(&[(0b10, 2), (0, 8)]);
+        let mut br = BitReader::new(&bytes);
+        assert_eq!(decode_intra_dc_diff_v3(&mut br, 4, 0).unwrap(), 0);
+    }
 }
