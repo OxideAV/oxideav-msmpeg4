@@ -1,0 +1,20 @@
+source: mpg4c32.dll
+source_sha256: aedb4cf3d33c8554ab8acf04afe2d936eaa7c49107c5fefe163bca2e94b3c099
+file_offset_start_hex: 0x057898
+file_offset_end_exclusive_hex: 0x057a30
+vma_start_hex: 0x1c258498
+byte_length: 408
+interpretation: u32 little-endian, record size 4 bytes; 102 records
+record_count: 102
+role: G5 pri_B (run count per symbol) for the MS-MPEG4 intra-block DCT AC
+  TCOEF run/level/last alphabet. Per spec/99 §5.1 / §10.3 this is the second
+  half of the G5 G-descriptor; G5 pri_A lives at file 0x57830..0x57896
+  (102 bytes) inside region_0569c0. count_A = 102, count_B = 66.
+note: extracted as a stand-alone region because it falls in the 408-byte gap
+  between region_0569c0's end (0x57898) and region_057a30's start (0x57a30).
+  Audit/01 §4.1 enumerates the (run, level) per index for sub-class A and
+  sub-class B; the build-time check in build.rs cross-validates the bytes
+  against that enumeration before emitting the constant.
+provenance: copied verbatim from
+  docs/video/msmpeg4/tables/region_057898.hex (Extractor session 01;
+  command `xxd -s 0x57898 -l 408 mpg4c32.dll > region_057898.hex`).

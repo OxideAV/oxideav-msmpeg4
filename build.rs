@@ -98,16 +98,27 @@ fn main() {
     // G-descriptor pri_A / pri_B cluster — 0569c0 (3800 bytes at file
     // offset 0x569c0 / VMA 0x1c2575c0). Per spec/99 §10.3 this region
     // holds all six G-descriptor pri_A (byte-per-symbol |level|) and
-    // pri_B (u32-per-symbol run) arrays. Round 18 wires G4 (chroma +
+    // pri_B (u32-per-symbol run) arrays. Round 18 wired G4 (chroma +
     // all-inter, default for v1/v2 streams; selected on v3 when
     // [esi+0xad0]=2) — count_A=102, count_B=57, sub-A 58 entries
-    // (last=0), sub-B 44 entries (last=1). G5 pri_A is also extracted
-    // (count_A=102, count_B=66) but G5 pri_B starts at file 0x57898 which
-    // is beyond region_0569c0's end (0x57898 exclusive); the bytes are
-    // in a 408-byte gap not yet captured by any tables/* extraction.
+    // (last=0), sub-B 44 entries (last=1) — and G5 pri_A
+    // (count_A=102, count_B=66). G5 pri_B was missing because it lives
+    // in a 408-byte gap immediately after the cluster region ends.
+    //
+    // Round 19 fills that gap: `tables/region_057898.hex` carries the
+    // 408 bytes (102 × u32-LE) at file 0x57898..0x57a30 / VMA
+    // 0x1c258498. emit_g_descriptor_cluster now consumes BOTH region
+    // dumps and emits a complete G5 pri_B (run-count low byte per
+    // symbol) alongside G4 / G5 pri_A and G4 pri_B.
     let g_cluster_hex = tables_dir.join("region_0569c0.hex");
+    let g5_pri_b_hex = tables_dir.join("region_057898.hex");
     println!("cargo:rerun-if-changed={}", g_cluster_hex.display());
-    emit_g_descriptor_cluster(&g_cluster_hex, &out_dir.join("g_descriptors.rs"));
+    println!("cargo:rerun-if-changed={}", g5_pri_b_hex.display());
+    emit_g_descriptor_cluster(
+        &g_cluster_hex,
+        &g5_pri_b_hex,
+        &out_dir.join("g_descriptors.rs"),
+    );
 
     println!("cargo:rerun-if-changed=build.rs");
 }
@@ -652,17 +663,20 @@ fn emit_mv_v1_v2(hex_path: &Path, out_path: &Path) {
     writeln!(f, "];").unwrap();
 }
 
-/// Parse `region_0569c0.hex` and emit byte slices for the G-descriptor
-/// pri_A (`|level|`) and pri_B (`run`) tables. Round 18 wires G4 fully
-/// (pri_A + pri_B in-region) and G5's pri_A only (pri_B is in a 408-byte
-/// gap between region_0569c0's end at 0x57898 and the next extracted
-/// region region_057a30 at 0x57a30 — not yet captured).
+/// Parse `region_0569c0.hex` (G-descriptor cluster) and `region_057898.hex`
+/// (G5 pri_B gap fill) and emit byte slices for the G-descriptor pri_A
+/// (`|level|`) and pri_B (`run`) tables. Round 18 wired G4 (full) and G5's
+/// pri_A; round 19 fills G5's pri_B from `region_057898.hex` which captures
+/// the 408 bytes that live immediately after the cluster region ends
+/// (file 0x57898..0x57a30, VMA 0x1c258498).
 ///
-/// Provenance: every byte is sliced verbatim from the cluster region;
-/// the Implementer never types numeric values. The slice offsets are
-/// derived from the absolute VMAs in spec/99 §5 (G4 pri_A `0x1c258230`,
-/// G4 pri_B `0x1c258298`, G5 pri_A `0x1c258430`) minus the region's
-/// base VMA `0x1c2575c0` (= file offset 0x569c0).
+/// Provenance: every byte is sliced verbatim from one of the two cluster
+/// dumps; the Implementer never types numeric values. The slice offsets
+/// are derived from the absolute VMAs in spec/99 §5 (G4 pri_A `0x1c258230`,
+/// G4 pri_B `0x1c258298`, G5 pri_A `0x1c258430`, G5 pri_B `0x1c258498`)
+/// minus the region's base VMA. `region_057898.hex` is its own region —
+/// G5 pri_B starts exactly at its first byte, so no in-region slice
+/// arithmetic is needed.
 ///
 /// The shape (count_A, count_B) for each group is the spec/99 §5 row
 /// values. Sub-class A entries (`idx <= count_B`) carry `last=0`;
@@ -670,13 +684,21 @@ fn emit_mv_v1_v2(hex_path: &Path, out_path: &Path) {
 /// (run, level) decomposition is then `pri_A[idx]` = `|level|` and
 /// `pri_B[idx] & 0xFF` = `run` (the upper bytes of pri_B are zero for
 /// G4/G5 per audit/01 §2.4 and §4.4 — verified at build time below).
-fn emit_g_descriptor_cluster(hex_path: &Path, out_path: &Path) {
+fn emit_g_descriptor_cluster(hex_path: &Path, g5_pri_b_path: &Path, out_path: &Path) {
     let bytes = parse_xxd(hex_path);
     if bytes.len() != 3800 {
         panic!(
             "expected 3800 bytes in {} (G-descriptor cluster region_0569c0), got {}",
             hex_path.display(),
             bytes.len()
+        );
+    }
+    let g5_pri_b_bytes = parse_xxd(g5_pri_b_path);
+    if g5_pri_b_bytes.len() != 408 {
+        panic!(
+            "expected 408 bytes in {} (G5 pri_B = 102 × u32-LE), got {}",
+            g5_pri_b_path.display(),
+            g5_pri_b_bytes.len()
         );
     }
 
@@ -696,23 +718,20 @@ fn emit_g_descriptor_cluster(hex_path: &Path, out_path: &Path) {
 
     // Decode pri_B as little-endian u32, low byte = run count. Audit/01
     // §2.4 / §4.4 confirm the upper 24 bits are always zero for G4 / G5.
-    let mut g4_pri_b: Vec<u32> = Vec::with_capacity(G4_COUNT_A);
-    for chunk in g4_pri_b_bytes.chunks_exact(4) {
-        let v = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-        if v > 0xff {
-            panic!(
-                "G4 pri_B u32 {:#x} has bits above bit 7 — contradicts audit/01 §2.4 \
-                 (extraction error or wrong slice offset)",
-                v
-            );
-        }
-        g4_pri_b.push(v);
-    }
+    let g4_pri_b = decode_pri_b_u32_le(g4_pri_b_bytes, "G4 pri_B");
+    let g5_pri_b = decode_pri_b_u32_le(&g5_pri_b_bytes, "G5 pri_B");
     if g4_pri_b.len() != G4_COUNT_A {
         panic!(
             "G4 pri_B decoded {} entries, expected {}",
             g4_pri_b.len(),
             G4_COUNT_A
+        );
+    }
+    if g5_pri_b.len() != G5_COUNT_A {
+        panic!(
+            "G5 pri_B decoded {} entries, expected {}",
+            g5_pri_b.len(),
+            G5_COUNT_A
         );
     }
 
@@ -749,6 +768,14 @@ fn emit_g_descriptor_cluster(hex_path: &Path, out_path: &Path) {
             );
         }
     }
+    for (i, &v) in g5_pri_b.iter().take(27).enumerate() {
+        if v != 0 {
+            panic!(
+                "G5 pri_B[{}] = {:#x}, expected 0 (run=0 prefix); region_057898 misaligned",
+                i, v
+            );
+        }
+    }
     // Cross-check the partition: pri_B values strictly increase across
     // sub-class A then restart at zero or stay flat across sub-class B.
     // Sub-A's last entry (idx = count_B = 57) has run = 26 per audit/01
@@ -768,13 +795,62 @@ fn emit_g_descriptor_cluster(hex_path: &Path, out_path: &Path) {
             g4_pri_b[G4_COUNT_B + 1]
         );
     }
+    // G5 partition cross-check: per audit/01 §4.1 sub-A's last entry
+    // (idx 66 = count_B) is (run=14, level=1); sub-B's first entry
+    // (idx 67) restarts at run=0.
+    if g5_pri_b[G5_COUNT_B] != 14 {
+        panic!(
+            "G5 pri_B[count_B={}] = {}, expected 14 (sub-A last entry, run=14 \
+             per audit/01 §4.1); region_057898 may be misaligned",
+            G5_COUNT_B, g5_pri_b[G5_COUNT_B]
+        );
+    }
+    if g5_pri_b[G5_COUNT_B + 1] != 0 {
+        panic!(
+            "G5 pri_B[count_B+1={}] = {}, expected 0 (sub-B restart per \
+             audit/01 §4.1); region_057898 may be misaligned",
+            G5_COUNT_B + 1,
+            g5_pri_b[G5_COUNT_B + 1]
+        );
+    }
+    // G5 sub-B last entry: idx 101 = (run=20, level=1) per audit/01 §4.1.
+    if g5_pri_b[G5_COUNT_A - 1] != 20 {
+        panic!(
+            "G5 pri_B[{}] = {}, expected 20 (sub-B last entry, run=20 per \
+             audit/01 §4.1); region_057898 may be misaligned",
+            G5_COUNT_A - 1,
+            g5_pri_b[G5_COUNT_A - 1]
+        );
+    }
+    // G5 sub-B per-row LMAX cross-check against audit/01 §4.1:
+    //   r0:8 entries (idx 67..74), r1:3 (75..77), r2..6:2 each (78..87),
+    //   r7..20: 1 each (88..101).
+    let mut g5_subb_expected_runs: Vec<u32> = Vec::with_capacity(35);
+    g5_subb_expected_runs.extend(std::iter::repeat(0u32).take(8));
+    g5_subb_expected_runs.extend(std::iter::repeat(1u32).take(3));
+    for r in 2u32..=6 {
+        g5_subb_expected_runs.push(r);
+        g5_subb_expected_runs.push(r);
+    }
+    g5_subb_expected_runs.extend(7u32..=20);
+    assert_eq!(g5_subb_expected_runs.len(), 35, "sub-B row count");
+    for (i, &expected_run) in g5_subb_expected_runs.iter().enumerate() {
+        let idx = G5_COUNT_B + 1 + i;
+        if g5_pri_b[idx] != expected_run {
+            panic!(
+                "G5 pri_B[{idx}] = {}, expected {} (audit/01 §4.1 sub-B row {i})",
+                g5_pri_b[idx], expected_run
+            );
+        }
+    }
 
     let mut f = fs::File::create(out_path)
         .unwrap_or_else(|e| panic!("failed to create {}: {e}", out_path.display()));
     writeln!(
         f,
         "// Auto-generated by build.rs from \
-         crates/oxideav-msmpeg4/tables/region_0569c0.hex.\n\
+         crates/oxideav-msmpeg4/tables/region_0569c0.hex\n\
+         // and crates/oxideav-msmpeg4/tables/region_057898.hex.\n\
          // DO NOT EDIT.\n\
          // Source binary: mpg4c32.dll SHA-256 \
          aedb4cf3d33c8554ab8acf04afe2d936eaa7c49107c5fefe163bca2e94b3c099\n\
@@ -788,9 +864,8 @@ fn emit_g_descriptor_cluster(hex_path: &Path, out_path: &Path) {
          //        shape-equivalent to MPEG-4 Part 2 Table 11-15 Intra under\n\
          //        ESCL(a) LMAX. count_A=102, count_B=66. Live slot\n\
          //        [esi+0xab4] (intra-luma); selected when [esi+0xad4]=2.\n\
-         //        pri_B is **not yet wired** — its 408 bytes live in the\n\
-         //        408-byte gap between region_0569c0 (ends 0x57898) and\n\
-         //        region_057a30 (starts 0x57a30); not in any tables/* file.\n\
+         //        Round 19 fills G5 pri_B from region_057898.hex (the\n\
+         //        408 bytes immediately following the cluster region).\n\
          \n\
          pub const G4_COUNT_A: usize = {};\n\
          pub const G4_COUNT_B: usize = {};\n\
@@ -828,7 +903,41 @@ fn emit_g_descriptor_cluster(hex_path: &Path, out_path: &Path) {
     )
     .unwrap();
     emit_byte_array(&mut f, g5_pri_a);
+    writeln!(f, "];\n").unwrap();
+
+    writeln!(
+        f,
+        "/// G5 pri_B — `run` count per symbol (low byte of u32-LE record;\n\
+         /// upper 24 bits zero per audit/01 §4.4). Loaded from\n\
+         /// region_057898.hex (file 0x57898..0x57a30, 408 bytes = 102 ×\n\
+         /// u32-LE) — the gap immediately after the G-descriptor cluster.\n\
+         pub static G5_PRI_B: &[u8; {}] = &[",
+        G5_COUNT_A,
+    )
+    .unwrap();
+    let g5_pri_b_low: Vec<u8> = g5_pri_b.iter().map(|&v| v as u8).collect();
+    emit_byte_array(&mut f, &g5_pri_b_low);
     writeln!(f, "];").unwrap();
+}
+
+/// Decode a sequence of u32-LE records and assert each fits in a u8 (low
+/// byte is the run count; upper 24 bits must be zero per audit/01 §2.4 and
+/// §4.4). Returns the run count per record as a `u32` for downstream
+/// numeric checks (the emitter casts to `u8` when writing the constant).
+fn decode_pri_b_u32_le(bytes: &[u8], label: &str) -> Vec<u32> {
+    let mut out: Vec<u32> = Vec::with_capacity(bytes.len() / 4);
+    for (i, chunk) in bytes.chunks_exact(4).enumerate() {
+        let v = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        if v > 0xff {
+            panic!(
+                "{label}[{i}] u32 {:#x} has bits above bit 7 — contradicts \
+                 audit/01 §2.4 / §4.4 (extraction error or wrong slice offset)",
+                v
+            );
+        }
+        out.push(v);
+    }
+    out
 }
 
 /// Walk a packed-tiered-Huffman LUT (each 2-byte record is `(bit_length,

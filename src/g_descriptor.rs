@@ -19,12 +19,14 @@
 //!   * `count_B < idx < count_A` → sub-class B: `last = 1`,
 //!   * `idx == count_A` → ESC (caller handles separately).
 //!
-//! Round 18 wires G4 (chroma + all-inter, default for v1/v2 streams)
-//! and G5 (intra-luma) data — both `pri_A` arrays plus G4's `pri_B`.
-//! G5's `pri_B` lives in a 408-byte gap between `region_0569c0`'s end
-//! at file offset `0x57898` and the next extracted region at `0x57a30`;
-//! it is not yet captured in `tables/`. See `tables/region_0569c0.meta`
-//! for the gap analysis.
+//! Round 18 wired G4 (chroma + all-inter, default for v1/v2 streams)
+//! and G5 (intra-luma) `pri_A` plus G4's `pri_B`; G5's `pri_B` lived in
+//! a 408-byte gap between `region_0569c0`'s end at file offset `0x57898`
+//! and the next extracted region at `0x57a30`. **Round 19 fills that
+//! gap**: `tables/region_057898.hex` carries the 102 × u32-LE records
+//! and `build.rs` slices their low bytes into `G5_PRI_B`. G5's full
+//! alphabet (sub-class A + sub-class B + ESC) now decodes through a
+//! single byte-array lookup just like G4's.
 //!
 //! **This module exposes the decode logic ONLY**, not the bitstream
 //! VLC. The canonical-Huffman bit-length array (the prefix-code shape)
@@ -36,7 +38,7 @@
 //! the G4/G5 hooks for a future round once the walker is resolved.
 
 use crate::tables_data::{
-    G4_COUNT_A, G4_COUNT_B, G4_PRI_A, G4_PRI_B, G5_COUNT_A, G5_COUNT_B, G5_PRI_A,
+    G4_COUNT_A, G4_COUNT_B, G4_PRI_A, G4_PRI_B, G5_COUNT_A, G5_COUNT_B, G5_PRI_A, G5_PRI_B,
 };
 
 /// Decoded (last, run, level_mag) post-VLC token for a G-descriptor
@@ -84,10 +86,11 @@ pub fn g4_decode(idx: usize) -> Option<GSymbol> {
 
 /// Resolve a primary-VLC index through the G5 descriptor.
 ///
-/// **Partial wiring** — `pri_B` for G5 is not yet extracted (spec/99 §10.3
-/// gap), so this function returns `None` for any sub-class B index
-/// (`count_B < idx < count_A`). Sub-class A and ESC paths work today.
-/// See `tables/region_0569c0.meta` for the gap analysis.
+/// Round 19 wires the full G5 alphabet (sub-class A + sub-class B +
+/// ESC). Returns `None` if `idx > count_A`; otherwise returns the
+/// `(last, run, level_mag)` triple drawn straight from the byte arrays
+/// `G5_PRI_A` / `G5_PRI_B` (the latter is the low byte of each u32-LE
+/// record at file `0x57898..0x57a30`).
 pub fn g5_decode(idx: usize) -> Option<GSymbol> {
     if idx > G5_COUNT_A {
         return None;
@@ -96,68 +99,11 @@ pub fn g5_decode(idx: usize) -> Option<GSymbol> {
         return Some(GSymbol::Esc);
     }
     let last = idx > G5_COUNT_B;
-    if last {
-        // sub-class B requires G5 pri_B which is not yet wired.
-        return None;
-    }
-    // For sub-class A entries we only need pri_A; pri_B is implicitly
-    // derivable from the canonical-level-prefix structure (run advances
-    // when the level magnitude resets to 1 from a higher value), but we
-    // refuse to derive it here — callers should treat G5 sub-A access
-    // as informational until the gap is filled.
     Some(GSymbol::Token(GToken {
         last,
-        run: g5_pri_b_sub_a_derived(idx)?,
+        run: G5_PRI_B[idx],
         level_mag: G5_PRI_A[idx],
     }))
-}
-
-/// Reconstruct G5 pri_B sub-class A entries from the canonical-level
-/// prefix structure. Per audit/01 §4.1, sub-A's (run, level) pairs are
-/// laid out as:
-///
-///   run=0 levels 1..27   (idx 0..26)
-///   run=1 levels 1..10   (idx 27..36)
-///   run=2 levels 1..5    (idx 37..41)
-///   run=3 levels 1..4    (idx 42..45)
-///   run=4..7 levels 1..3 (idx 46..57)
-///   run=8..9 levels 1..2 (idx 58..61)
-///   run=10..14 level 1   (idx 62..66)
-///
-/// This is the LMAX(intra) profile from MPEG-4 Part 2 Table 11-18 (per
-/// audit/01 §4.2), and it's reproduced here from the audit's per-row
-/// dump — NOT the binary's pri_B bytes. The function returns `None` if
-/// `idx >= count_B + 1` (sub-A boundary); the caller should fall back
-/// to the not-yet-wired pri_B for sub-class B.
-fn g5_pri_b_sub_a_derived(idx: usize) -> Option<u8> {
-    // Cumulative count per (run, max_level) row:
-    const SUBA_BREAKS: &[(u8, u8)] = &[
-        // (run, count_at_this_run)
-        (0, 27),
-        (1, 10),
-        (2, 5),
-        (3, 4),
-        (4, 3),
-        (5, 3),
-        (6, 3),
-        (7, 3),
-        (8, 2),
-        (9, 2),
-        (10, 1),
-        (11, 1),
-        (12, 1),
-        (13, 1),
-        (14, 1),
-    ];
-    let mut cum: usize = 0;
-    for &(run, n) in SUBA_BREAKS {
-        let next = cum + n as usize;
-        if idx < next {
-            return Some(run);
-        }
-        cum = next;
-    }
-    None
 }
 
 /// Inspect G4's full alphabet — produces 102 + 1 (ESC) = 103 entries for
@@ -166,11 +112,19 @@ pub fn g4_iter() -> impl Iterator<Item = (usize, GSymbol)> {
     (0..=G4_COUNT_A).map(|idx| (idx, g4_decode(idx).unwrap()))
 }
 
-/// Inspect G5's sub-class A + ESC slice (sub-class B not yet wired).
+/// Inspect G5's full alphabet — produces 102 + 1 (ESC) = 103 entries
+/// for validation tests. Round 19 promoted `g5_iter_partial` to a full
+/// iterator now that G5 pri_B is wired; the legacy name is kept as an
+/// alias for source compatibility.
+pub fn g5_iter() -> impl Iterator<Item = (usize, GSymbol)> {
+    (0..=G5_COUNT_A).map(|idx| (idx, g5_decode(idx).unwrap()))
+}
+
+/// Backwards-compatible alias for [`g5_iter`]. Now that G5 pri_B is
+/// wired (round 19) the partial / full distinction is academic, but
+/// keeping the alias avoids breaking external test corpora.
 pub fn g5_iter_partial() -> impl Iterator<Item = (usize, GSymbol)> {
-    (0..=G5_COUNT_B)
-        .chain(std::iter::once(G5_COUNT_A))
-        .map(|idx| (idx, g5_decode(idx).unwrap()))
+    g5_iter()
 }
 
 #[cfg(test)]
@@ -364,26 +318,132 @@ mod tests {
     }
 
     #[test]
-    fn g5_sub_b_returns_none_until_table_fully_wired() {
-        // Round 18 has G5 pri_B in a gap — sub-B access is not yet
-        // available. Caller-visible semantics: explicit None.
-        for idx in (G5_COUNT_B + 1)..G5_COUNT_A {
-            assert_eq!(g5_decode(idx), None, "G5 sub-B idx {idx} should be None");
-        }
+    fn g5_sub_b_first_entry_is_run0_level1_last() {
+        // Round 19: G5 pri_B is wired. audit/01 §4.1 sub-B row 0:
+        // (run=0, level=1, last=1) at idx 67.
+        assert_eq!(
+            g5_decode(G5_COUNT_B + 1),
+            Some(GSymbol::Token(GToken {
+                last: true,
+                run: 0,
+                level_mag: 1,
+            })),
+        );
     }
 
     #[test]
-    fn g5_esc_works_despite_subb_gap() {
+    fn g5_sub_b_last_entry_is_run20_level1_last() {
+        // audit/01 §4.1 sub-B last row: idx 101 = (run=20, level=1, last=1).
+        assert_eq!(
+            g5_decode(G5_COUNT_A - 1),
+            Some(GSymbol::Token(GToken {
+                last: true,
+                run: 20,
+                level_mag: 1,
+            })),
+        );
+    }
+
+    #[test]
+    fn g5_esc_works() {
         assert_eq!(g5_decode(G5_COUNT_A), Some(GSymbol::Esc));
+    }
+
+    #[test]
+    fn g5_idx_out_of_range_is_none() {
+        assert_eq!(g5_decode(G5_COUNT_A + 1), None);
+        assert_eq!(g5_decode(usize::MAX), None);
     }
 
     #[test]
     fn g5_sub_a_count_matches_audit() {
         // audit/01 §4.1: 67 sub-A entries.
-        let n = g5_iter_partial()
+        let n = g5_iter()
             .filter(|(_, s)| matches!(s, GSymbol::Token(t) if !t.last))
             .count();
         assert_eq!(n, 67);
+    }
+
+    #[test]
+    fn g5_sub_b_count_matches_audit() {
+        // audit/01 §4.1: 35 sub-B entries (idx 67..101).
+        let n = g5_iter()
+            .filter(|(_, s)| matches!(s, GSymbol::Token(t) if t.last))
+            .count();
+        assert_eq!(n, 35);
+    }
+
+    #[test]
+    fn g5_alphabet_size_is_102_plus_esc() {
+        let total = g5_iter().count();
+        assert_eq!(total, 103, "102 alphabet + 1 ESC");
+        let escs = g5_iter().filter(|(_, s)| matches!(s, GSymbol::Esc)).count();
+        assert_eq!(escs, 1);
+    }
+
+    #[test]
+    fn g5_sub_a_partition_strict() {
+        // Every idx in [0, 66] is sub-A (last=false); every idx in
+        // [67, 101] is sub-B (last=true).
+        for idx in 0..=G5_COUNT_B {
+            let GSymbol::Token(t) = g5_decode(idx).unwrap() else {
+                panic!()
+            };
+            assert!(!t.last, "idx {idx} should be sub-A");
+        }
+        for idx in (G5_COUNT_B + 1)..G5_COUNT_A {
+            let GSymbol::Token(t) = g5_decode(idx).unwrap() else {
+                panic!()
+            };
+            assert!(t.last, "idx {idx} should be sub-B");
+        }
+    }
+
+    #[test]
+    fn g5_sub_b_per_run_lmax_matches_audit() {
+        // audit/01 §4.1 sub-B (last=1):
+        //   run 0 LMAX=8, run 1 LMAX=3, run 2..6 LMAX=2, run 7..20 LMAX=1.
+        let mut max_per_run: std::collections::BTreeMap<u8, u8> = std::collections::BTreeMap::new();
+        for idx in (G5_COUNT_B + 1)..G5_COUNT_A {
+            let GSymbol::Token(t) = g5_decode(idx).unwrap() else {
+                unreachable!()
+            };
+            let e = max_per_run.entry(t.run).or_insert(0);
+            *e = (*e).max(t.level_mag);
+        }
+        assert_eq!(max_per_run[&0], 8);
+        assert_eq!(max_per_run[&1], 3);
+        for r in 2..=6u8 {
+            assert_eq!(max_per_run[&r], 2, "sub-B run {r}");
+        }
+        for r in 7..=20u8 {
+            assert_eq!(max_per_run[&r], 1, "sub-B run {r}");
+        }
+    }
+
+    #[test]
+    fn g5_sub_b_per_run_count_matches_audit() {
+        // audit/01 §4.1 sub-B count-per-run:
+        //   run 0: 8, run 1: 3, run 2..6: 2 each, run 7..20: 1 each.
+        let mut count_per_run: std::collections::BTreeMap<u8, usize> =
+            std::collections::BTreeMap::new();
+        for idx in (G5_COUNT_B + 1)..G5_COUNT_A {
+            let GSymbol::Token(t) = g5_decode(idx).unwrap() else {
+                unreachable!()
+            };
+            *count_per_run.entry(t.run).or_insert(0) += 1;
+        }
+        assert_eq!(count_per_run[&0], 8);
+        assert_eq!(count_per_run[&1], 3);
+        for r in 2..=6u8 {
+            assert_eq!(count_per_run[&r], 2, "sub-B run {r} count");
+        }
+        for r in 7..=20u8 {
+            assert_eq!(count_per_run[&r], 1, "sub-B run {r} count");
+        }
+        // 8 + 3 + 5*2 + 14 = 35.
+        let total: usize = count_per_run.values().sum();
+        assert_eq!(total, 35);
     }
 
     #[test]

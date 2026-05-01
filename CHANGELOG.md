@@ -9,6 +9,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 19 — G5 pri_B gap fill (full G5 alphabet wired)**
+  (2026-04-30): clean-room extraction of the 408-byte gap that
+  immediately follows `region_0569c0` (file `0x57898..0x57a30`,
+  VMA `0x1c258498`) lands in
+  `crates/oxideav-msmpeg4/tables/region_057898.hex` (102 × u32-LE
+  records). `build.rs::emit_g_descriptor_cluster` now consumes
+  both `region_0569c0.hex` and `region_057898.hex` and emits a
+  complete `G5_PRI_B: &[u8; 102]` (low byte of each u32-LE record
+  per `audit/01 §4.4`). Build-time guards verify:
+    - run-zero prefix `[0; 27]` for sub-class A's run=0 row
+      (LMAX(intra, run=0) = 27 per `audit/01 §4.2`),
+    - sub-A boundary at idx=count_B=66 carries run=14 (last sub-A
+      entry per `audit/01 §4.1`),
+    - sub-B restart at idx=67 carries run=0,
+    - sub-B last entry at idx=101 carries run=20,
+    - per-row LMAX cross-check across all 35 sub-B entries
+      (r0×8, r1×3, r2..6×2, r7..20×1) against the audit's
+      enumeration.
+  `g_descriptor::g5_decode` now handles the full alphabet (102
+  symbols + ESC) — sub-class B used to return `None` because pri_B
+  wasn't wired. The legacy `g5_iter_partial` remains as an alias
+  for `g5_iter` for source-compatibility. The hand-derived
+  `g5_pri_b_sub_a_derived` helper is removed; runs come straight
+  from the byte array now.
+- **Test coverage delta**: +21 tests (current total 218).
+    - `src/g_descriptor.rs::tests`: +7 tests including
+      `g5_sub_b_first_entry_is_run0_level1_last`,
+      `g5_sub_b_last_entry_is_run20_level1_last`,
+      `g5_sub_b_per_run_lmax_matches_audit`,
+      `g5_sub_b_per_run_count_matches_audit`,
+      `g5_alphabet_size_is_102_plus_esc`,
+      `g5_sub_a_partition_strict`,
+      `g5_idx_out_of_range_is_none`.
+    - `src/tables_data.rs::tests`: +7 tests including
+      `g5_pri_b_run_zero_prefix`,
+      `g5_partition_matches_audit_table`,
+      `g5_pri_b_max_run_is_20`,
+      `g5_pri_b_sub_a_run_progression`,
+      `g5_pri_a_sub_b_canonical_level_prefix`,
+      `g5_pri_b_sub_b_run_progression`,
+      `g5_pri_b_no_sentinel`.
+    - `tests/g_descriptor_g5.rs`: NEW 7-test integration suite
+      mirroring `g_descriptor_g4.rs` (alphabet round-trip, audit
+      §4.1 row-by-row sub-A and sub-B cross-checks, decoder/byte-array
+      consistency, no-zero / no-sentinel pri_A invariant, low-byte
+      pri_B invariant).
+- **PSNR baseline unchanged** at 5.30 dB Y on `testsrc2 32×32`.
+  The G5 pri_B wiring closes the data half of G5's descriptor;
+  runnable AC decode still awaits the canonical-Huffman bit-length
+  walker tree at file `0x3df40` (`spec/99 §5.3`) which maps
+  bitstream bits to the alphabet idx.
+
 - **Round 18 — G4 / G5 DCT-descriptor pri_A / pri_B wiring**
   (2026-04-26): clean-room extraction of `region_0569c0.hex`
   (file `0x569c0..0x57898`, 3800 bytes — the G-descriptor

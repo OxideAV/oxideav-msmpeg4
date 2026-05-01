@@ -40,7 +40,7 @@ right decoder when a packet arrives.
 | Intra AC `(last, run, level)` symbol mapping   | OPEN — hypothesis     |
 | G4 (inter) `pri_A` + `pri_B` byte arrays       | wired (round 18)      |
 | G5 (intra-luma) `pri_A`                        | wired (round 18)      |
-| G5 (intra-luma) `pri_B`                        | gap — file `0x57898..0x57a30` not extracted |
+| G5 (intra-luma) `pri_B`                        | wired (round 19)      |
 | G4 / G5 canonical-Huffman bit-lengths          | OPEN — walker tree at `0x3df40` |
 | P-frame MV VLC + half-pel MC (default table)   | complete              |
 | P-frame MV VLC alternate table                 | unsupported (truncated dump) |
@@ -49,10 +49,12 @@ right decoder when a packet arrives.
 
 ### What's still spec-OPEN for real-content decode
 
-Round 18 (2026-04-26) wires the **G4 / G5 `pri_A` / `pri_B` byte
-arrays** straight from the cluster region `region_0569c0` (file
-`0x569c0..0x57898`, 3800 bytes — copied into
-`crates/oxideav-msmpeg4/tables/region_0569c0.hex`):
+Round 18 (2026-04-26) wired the **G4 / G5 `pri_A` / `pri_B` byte
+arrays** from the cluster region `region_0569c0` (file
+`0x569c0..0x57898`, 3800 bytes). **Round 19 (2026-04-30)** completes
+the pri_B set by extracting the 408-byte gap that immediately follows
+the cluster region into `tables/region_057898.hex` (102 × u32-LE at
+file `0x57898..0x57a30`, VMA `0x1c258498`):
 
 * **G4** (chroma + all-inter; default for v1/v2 streams; v3 selector
   `[esi+0xad0]=2`): `count_A=102, count_B=57`. `pri_A` (102 bytes
@@ -64,12 +66,14 @@ arrays** straight from the cluster region `region_0569c0` (file
   is 12 — matches MPEG-4 Part 2 Table 11-19 ESCL(b) LMAX exactly).
 * **G5** (intra-luma; v3 selector `[esi+0xad4]=2`):
   `count_A=102, count_B=66`. `pri_A` (102 bytes at file `0x57830`)
-  is extracted; `pri_B` lives in a 408-byte gap between
-  `region_0569c0`'s end (`0x57898` exclusive) and `region_057a30`'s
-  start. The gap is **not yet captured** in any `tables/*` file, so
-  [`g_descriptor::g5_decode`] returns `Some(Token)` for sub-class A
-  only (idx 0..=66, with run derived from the LMAX(intra) profile
-  per `audit/01 §4.1`) and `None` for sub-class B (idx 67..101).
+  was wired in r18; `pri_B` (102 × u32-LE at file `0x57898`) is now
+  wired in r19 from the dedicated `region_057898.hex` extraction.
+  [`g_descriptor::g5_decode`] now returns `Some(Token)` for the
+  full alphabet (idx 0..=101) plus ESC at idx 102 — sub-class A
+  (67 entries, last=0) and sub-class B (35 entries, last=1) both
+  decode through a single byte-array lookup. Run / level layouts
+  cross-checked against `audit/01 §4.1` to the entry: sub-B has
+  r0×8, r1×3, r2..6×2, r7..20×1 with max run 20.
 
 What's **still missing for runnable AC decode**:
 
@@ -85,11 +89,6 @@ What's **still missing for runnable AC decode**:
   source regions `0x1c259a38` / `0x1c259d78`) or (b) decoding the
   walker structure directly. Neither is in `docs/video/msmpeg4/`
   yet; both are next-round Specifier work.
-* The 408-byte **G5 `pri_B` gap** at file `0x57898..0x57a30`
-  (between `region_0569c0` and `region_057a30`). Once the
-  Extractor captures the gap as e.g. `region_057898.hex`, the
-  build script will straightforwardly slice it into `G5_PRI_B`
-  alongside the existing `G4_PRI_B`.
 
 The previously-shipped `region_05eed0.csv` candidate — a 64-entry
 canonical-Huffman block at VMA `0x1c25fad0` — remains wired as
@@ -100,9 +99,10 @@ so it is not the v3 intra-AC source.
 
 Net effect: real `.avi` v3 fixtures still decode at PSNR ≈ 5.30 dB
 Y on `testsrc2 32×32` (DC-only intra reconstruction, zero-residual
-inter), unchanged from r17. The G4 / G5 descriptor data is now
-runtime-accessible and audit-verified, ready for the bit-length
-plumbing in r19+.
+inter), unchanged from r17/r18. The G4 / G5 descriptor data is now
+fully runtime-accessible and audit-verified end-to-end; only the
+bit-length walker tree at `0x3df40` is between the current state
+and runnable AC decode.
 
 `send_packet` on a v3 stream defaults to the AC placeholder
 (DC-only reconstruction); callers that want to exercise the
@@ -110,9 +110,10 @@ candidate AC pipeline use [`picture::decode_picture_with_ac`] with
 [`picture::AcSelection::Candidate`]. Synthetic streams + Kraft +
 prefix-free + per-symbol round-trip + scan-order dispatch tests
 all pass against the candidate (see `tests/intra_ac_candidate.rs`).
-G4 / G5 descriptor coverage lives in `tests/g_descriptor_g4.rs` +
-`src/g_descriptor.rs::tests` (25 tests total, including the
-LMAX-per-run audit cross-check).
+G4 / G5 descriptor coverage lives in `tests/g_descriptor_g4.rs`,
+`tests/g_descriptor_g5.rs`, and `src/g_descriptor.rs::tests`
+(39 tests total, including the LMAX-per-run audit cross-check
+for both inter and intra alphabets).
 
 ## License
 
