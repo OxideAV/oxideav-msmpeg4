@@ -120,6 +120,42 @@ fn main() {
         &out_dir.join("g_descriptors.rs"),
     );
 
+    // G4 / G5 packed-Huffman PRIMARY VLC sources (round 26 — spec/11
+    // §3 / §4). Each source is `4 + 103 * 8` bytes:
+    //   * `count: u32-LE = 103` (alphabet size including ESC)
+    //   * 103 records of `(a:u32-LE, b:u32-LE)` where
+    //         a = code_value (state byte; not the canonical bit-pattern)
+    //         b = bit_length (0..12 for G4/G5)
+    //
+    // The canonical Huffman bit-pattern is reconstructed from the
+    // bit-length array alone (see `emit_packed_huffman_primary` below).
+    // Kraft sum over 103 bit-lengths = 1 - 2/1024 (one bl=9 codeword
+    // reserved for ESC); the ESC entry is at array index 102 with a
+    // valid bit_length, and decoders treat the recovered idx == 102 as
+    // ESC per spec/11 §7 item 4.
+    //
+    // FROM: docs/video/msmpeg4/spec/11-walker-format-resolved.md §3-§4
+    // FROM: reference/binaries/wmpcdcs8-2001/mpg4c32.dll @ file 0x58e38
+    //       / 0x59178; SHA-256 aedb4cf3...b3c099.
+    let g4_packed_hex = tables_dir.join("region_058e38_full.hex");
+    let g5_packed_hex = tables_dir.join("region_059178_full.hex");
+    println!("cargo:rerun-if-changed={}", g4_packed_hex.display());
+    println!("cargo:rerun-if-changed={}", g5_packed_hex.display());
+    emit_packed_huffman_primary(
+        &g4_packed_hex,
+        &out_dir.join("g4_primary.rs"),
+        "G4",
+        0x58e38,
+        0x1c258e38,
+    );
+    emit_packed_huffman_primary(
+        &g5_packed_hex,
+        &out_dir.join("g5_primary.rs"),
+        "G5",
+        0x59178,
+        0x1c259d78,
+    );
+
     println!("cargo:rerun-if-changed=build.rs");
 }
 
@@ -992,6 +1028,142 @@ fn emit_byte_array<W: Write>(out: &mut W, bytes: &[u8]) {
         }
         writeln!(out).unwrap();
     }
+}
+
+/// Parse a packed-Huffman primary-VLC source file (round 26 — spec/11
+/// §3 / §4) and emit a Rust constants file holding the per-symbol
+/// `(bit_length, code_value)` array plus the alphabet count and ESC
+/// index for downstream canonical-Huffman building.
+///
+/// Format (verbatim from spec/11 §4):
+///
+/// ```text
+/// +0x00 : count : u32-LE                    ; alphabet size (incl. ESC)
+/// +0x04 : records[0..count] : 8 B each      ; (a:u32-LE, b:u32-LE)
+///           a == 0xFFFFFFFF → "hole" sentinel: stored as (0,0); 8 B still consumed
+///           otherwise       → (a, b) where a = code_value (state byte)
+///                                    and  b = bit_length
+/// ```
+///
+/// Total source size in bytes = `4 + count * 8`. Both G4 (`region_058e38`)
+/// and G5 (`region_059178`) have `count = 103` ⇒ 828 bytes. One bl=9
+/// codeword in each is reserved for the ESC marker (Kraft sum 1 - 2/1024
+/// = 0.998047), giving the alphabet shape `count_A = 102 entries +
+/// 1 ESC sentinel at idx 102` quoted in spec/11 §5 / §7.
+///
+/// **Provenance:** verbatim slice from the binary; bytes were captured
+/// into `tables/region_<off>_full.hex` via Python at session start (no
+/// numeric typing). Build-time invariants enforce:
+///   * file length == 828
+///   * count == 103
+///   * each bl is in [0, 16] (the binary's max-bitlen budget)
+///   * Kraft sum over the 103 bls equals 1 - 2/1024 in 2^-bl arithmetic
+fn emit_packed_huffman_primary(
+    hex_path: &Path,
+    out_path: &Path,
+    label: &str,
+    file_off: u32,
+    vma: u32,
+) {
+    let bytes = parse_xxd(hex_path);
+    if bytes.len() != 828 {
+        panic!(
+            "{label}: expected 828 bytes in {} (4-byte count + 103 * 8 records), got {}",
+            hex_path.display(),
+            bytes.len()
+        );
+    }
+    let count = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    if count != 103 {
+        panic!(
+            "{label}: header count {count} != 103 (expected G-table alphabet shape per spec/11 §5)",
+        );
+    }
+    let mut records: Vec<(u32, u32)> = Vec::with_capacity(count as usize);
+    for i in 0..count as usize {
+        let off = 4 + i * 8;
+        let a = u32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]]);
+        let b = u32::from_le_bytes([
+            bytes[off + 4],
+            bytes[off + 5],
+            bytes[off + 6],
+            bytes[off + 7],
+        ]);
+        // Per spec/11 §4: a == 0xFFFFFFFF is a hole sentinel; helper A
+        // stores the record as (0, 0) but still advances 8 bytes. Mirror
+        // that here so a hole symbol drops out of the canonical-Huffman
+        // builder (bl == 0 ⇒ filtered).
+        let (a, b) = if a == 0xFFFF_FFFF {
+            (0u32, 0u32)
+        } else {
+            (a, b)
+        };
+        if b > 16 {
+            panic!(
+                "{label}: record {i} has bit_length {b} > 16 — exceeds the binary's max-bitlen \
+                 budget; extraction misalignment suspected"
+            );
+        }
+        records.push((b, a)); // store as (bit_length, code_value) for parity with INTRA_AC_V3_CANDIDATE_RAW
+    }
+
+    // Kraft sum check. Per spec/11 §5 both G4 and G5 saturate at
+    // `1 - 1/512 = 0.998047` (= "2/1024" in the spec wording, where the
+    // unit is 2^-10; equivalently one bl=9 codeword reserved for ESC).
+    // We verify the exact value so a future extraction drift (different
+    // binary version, wrong slice offsets) trips the build.
+    let max_bl_for_kraft: u32 = 32; // arithmetic header; not the table's max bl
+    let target: u64 = (1u64 << max_bl_for_kraft) - (1u64 << (max_bl_for_kraft - 9));
+    let sum: u64 = records
+        .iter()
+        .filter(|&&(bl, _)| bl > 0)
+        .map(|&(bl, _)| 1u64 << (max_bl_for_kraft - bl))
+        .sum();
+    if sum != target {
+        panic!(
+            "{label}: Kraft sum {sum} != expected {target} (= 1 - 2/1024 in 2^-bl fixed point) — \
+             primary VLC source is not the round-26 G-table shape; spec/11 §5 lists \
+             count=103 with one bl=9 ESC reservation"
+        );
+    }
+
+    let mut f = fs::File::create(out_path)
+        .unwrap_or_else(|e| panic!("failed to create {}: {e}", out_path.display()));
+    let label_lc = label.to_lowercase();
+    writeln!(
+        f,
+        "// Auto-generated by build.rs from \
+         crates/oxideav-msmpeg4/tables/region_{file_off:06x}_full.hex.\n\
+         // DO NOT EDIT.\n\
+         // Source binary: mpg4c32.dll SHA-256 \
+         aedb4cf3d33c8554ab8acf04afe2d936eaa7c49107c5fefe163bca2e94b3c099\n\
+         // Region: file offset 0x{file_off:06x}, VMA 0x{vma:08x}, 828 bytes (4 + 103 * 8).\n\
+         // Format (per docs/video/msmpeg4/spec/11-walker-format-resolved.md §4):\n\
+         //   u32-LE count = 103, then 103 * (a:u32-LE = code_value, b:u32-LE = bit_length).\n\
+         // Role: {label} primary VLC source for the DCT AC TCOEF (run, level, last) walk.\n\
+         // ESC index 102 is reserved (Kraft sum = 1 - 2/1024 over the 103 bit-lengths,\n\
+         // leaving exactly one bl=9 codeword for the ESC sentinel — spec/11 §5 / §7 item 4).\n\
+         \n\
+         pub const {label}_PRIMARY_ALPHABET: usize = 103;\n\
+         pub const {label}_PRIMARY_ESC_INDEX: usize = 102;\n\
+         \n\
+         /// 103 * (bit_length, code_value) pairs for the {label} primary VLC.\n\
+         /// Index in the array == symbol index passed to the post-VLC\n\
+         /// `(idx -> (last, run, level))` map (spec/04 §1.3 step 3 / spec/99 §5).\n\
+         /// Symbol 102 is ESC; the canonical-Huffman builder still emits it as\n\
+         /// a regular leaf (the bit_length is non-zero) and the consumer maps\n\
+         /// the decoded idx == 102 to the escape body via [`g_descriptor::g{label_lc_digit}_decode`].\n\
+         pub const {label}_PRIMARY_RAW: &[(u32, u32)] = &[",
+        label = label,
+        label_lc_digit = label_lc.trim_start_matches('g'),
+        file_off = file_off,
+        vma = vma,
+    )
+    .unwrap();
+    for &(bl, code) in &records {
+        writeln!(f, "    ({bl}, {code}),").unwrap();
+    }
+    writeln!(f, "];").unwrap();
 }
 
 /// Parse an xxd hex-dump file (format: `<offset>: <byte-pairs> <ascii>`)

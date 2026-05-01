@@ -134,6 +134,61 @@ impl AcVlcTable {
         esc_level_bits: Self::MPEG4_ESC_LEVEL_BITS,
     };
 
+    /// Build the **real v3 intra-AC primary VLC table** (the G5
+    /// descriptor) from the packed-Huffman source at file `0x59178` /
+    /// VMA `0x1c259d78`, per
+    /// `docs/video/msmpeg4/spec/11-walker-format-resolved.md` §3-§5.
+    ///
+    /// Round 26 unblocked this: helper `0x1c218cfa` (the per-slot
+    /// loader) consumes a flat `4 + count * 8`-byte source where each
+    /// 8-byte record is `(code_value:u32-LE, bit_length:u32-LE)` and
+    /// the symbol index is the record's array position. For G5 the
+    /// alphabet is 102 entries (sub-class A 0..=66 + sub-class B
+    /// 67..=101) plus one ESC at idx 102; the canonical-Huffman
+    /// bit-pattern is reconstructed from the bit_length array alone
+    /// (the `code_value` column is the runtime LUT/state byte that the
+    /// downstream walker consumes — not the Huffman code).
+    ///
+    /// The post-VLC `(idx → (last, run, |level|))` mapping is the
+    /// shared G-descriptor table from
+    /// [`crate::g_descriptor::g5_decode`] (round 18/19 wired the byte
+    /// arrays from `region_0569c0` + `region_057898`). The ESC index
+    /// (102) maps to [`Symbol::Escape`] and falls through to the
+    /// MPEG-4 Part 2 §7.4.1.3 fixed-length escape body.
+    ///
+    /// Kraft sum check: 103 bit-lengths sum to `1 - 1/512 = 0.998047`
+    /// in 2^-bl arithmetic (one bl=9 codeword reserved as the ESC
+    /// marker — spec/11 §7 item 4). The canonical builder accepts the
+    /// reserved leaf and assigns it to symbol 102.
+    ///
+    /// FROM: `docs/video/msmpeg4/spec/11-walker-format-resolved.md` §3-§5
+    /// FROM: `docs/video/msmpeg4/spec/99-current-understanding.md` §5 (G5 shape)
+    /// FROM: `docs/video/msmpeg4/spec/04-decoder-kernels.md` §1.3 step 3
+    ///       (sub-class partition test: `idx > count_B` ⇒ `last = 1`)
+    pub fn v3_intra_g5() -> AcVlcTable {
+        AcVlcTable {
+            entries: g5_primary_entries(),
+            esc_last_bits: Self::MPEG4_ESC_LAST_BITS,
+            esc_run_bits: Self::MPEG4_ESC_RUN_BITS,
+            esc_level_bits: Self::MPEG4_ESC_LEVEL_BITS,
+        }
+    }
+
+    /// Build the **G4 (chroma + all-inter) DCT AC TCOEF primary VLC**
+    /// table from the packed-Huffman source at file `0x58e38` / VMA
+    /// `0x1c259a38`, per spec/11 §3-§5. Same shape as G5 (103 records,
+    /// one ESC reserved) but with G4's symbol-index → (last, run, level)
+    /// mapping (`count_A=102, count_B=57` per spec/99 §5). Used by v3
+    /// inter blocks and v1/v2 inter+intra blocks.
+    pub fn g4_inter() -> AcVlcTable {
+        AcVlcTable {
+            entries: g4_primary_entries(),
+            esc_last_bits: Self::MPEG4_ESC_LAST_BITS,
+            esc_run_bits: Self::MPEG4_ESC_RUN_BITS,
+            esc_level_bits: Self::MPEG4_ESC_LEVEL_BITS,
+        }
+    }
+
     /// Build the candidate v3 intra-AC primary VLC table from the
     /// canonical-Huffman code-length array in
     /// `tables/region_05eed0.csv` (VMA `0x1c25fad0`, 64 payload entries,
@@ -274,6 +329,106 @@ fn candidate_index_to_symbol(idx: u8, partition: u8) -> Symbol {
         run,
         level: 1,
     }
+}
+
+// ====================================================================
+// G4 / G5 primary VLC tables — round 26 wiring per spec/11 §3-§7.
+// ====================================================================
+
+/// Lazily-built canonical-Huffman table for the G5 (intra-luma) DCT AC
+/// TCOEF primary VLC, sourced from `G5_PRIMARY_RAW`. See
+/// [`AcVlcTable::v3_intra_g5`] for the role + provenance.
+static G5_PRIMARY_TABLE: std::sync::OnceLock<Vec<VlcEntry<Symbol>>> = std::sync::OnceLock::new();
+
+/// Lazily-built canonical-Huffman table for the G4 (chroma + all-inter)
+/// DCT AC TCOEF primary VLC, sourced from `G4_PRIMARY_RAW`.
+static G4_PRIMARY_TABLE: std::sync::OnceLock<Vec<VlcEntry<Symbol>>> = std::sync::OnceLock::new();
+
+fn g5_primary_entries() -> &'static [VlcEntry<Symbol>] {
+    G5_PRIMARY_TABLE.get_or_init(|| {
+        use crate::tables_data::{G5_PRIMARY_ESC_INDEX, G5_PRIMARY_RAW};
+        build_g_primary(G5_PRIMARY_RAW, G5_PRIMARY_ESC_INDEX, GTable::G5)
+    })
+}
+
+fn g4_primary_entries() -> &'static [VlcEntry<Symbol>] {
+    G4_PRIMARY_TABLE.get_or_init(|| {
+        use crate::tables_data::{G4_PRIMARY_ESC_INDEX, G4_PRIMARY_RAW};
+        build_g_primary(G4_PRIMARY_RAW, G4_PRIMARY_ESC_INDEX, GTable::G4)
+    })
+}
+
+#[derive(Clone, Copy)]
+enum GTable {
+    G4,
+    G5,
+}
+
+/// Build a `Vec<VlcEntry<Symbol>>` for one G-descriptor primary VLC.
+///
+/// Critical observation (round 26): the `(a, b)` pairs in the binary's
+/// packed-Huffman source are **literal `(bit_pattern, bit_length)`**,
+/// not `(state_byte, bit_length)` as the spec/99 §8.1 wording suggests
+/// for the older MCBPCY extraction.
+///
+/// Verified by direct prefix-freedom + Kraft-sum check on G5
+/// (Kraft = 0.998047, every pair is unique among prefixes of
+/// equal-or-shorter length). So we must use the `code` field verbatim —
+/// NOT regenerate canonical codes via the `(code+1)<<(bl-prev_bl)`
+/// recurrence the way `mcbpcy::build_table` does for `region_05eac8`.
+///
+/// `region_05eac8` MCBPCY records carry `code_value` in the second
+/// column purely as a runtime LUT/state byte; the canonical-Huffman
+/// builder there correctly ignores them. The G-table sources at
+/// `0x58e38` / `0x59178` use the same record shape but the
+/// `code_value` field IS the bit-pattern. The two conventions coexist
+/// because helper A loads any `(a:u32, b:u32)` source — the caller
+/// decides whether `a` is a state byte or a bit-pattern.
+///
+/// Steps (per spec/11 §4):
+///
+/// 1. Filter out hole sentinels (records with `bit_length == 0` —
+///    helper A's "0xFFFFFFFF → (0, 0)" branch).
+/// 2. For each remaining (idx, bl, code), resolve the symbol:
+///    `idx == esc_index` → [`Symbol::Escape`]; else call the
+///    G-descriptor's `decode` to get `(last, run, level_mag)`, then
+///    wrap as [`Symbol::RunLevel`] with `level = level_mag as u16`.
+/// 3. Emit `VlcEntry::new(bl, code, symbol)` directly — the linear
+///    scanner in [`crate::vlc::decode`] matches by raw `(bits, code)`
+///    pair so any prefix-free assignment works.
+fn build_g_primary(raw: &[(u32, u32)], esc_index: usize, table: GTable) -> Vec<VlcEntry<Symbol>> {
+    use crate::g_descriptor::{g4_decode, g5_decode, GSymbol};
+
+    let mut entries: Vec<VlcEntry<Symbol>> = Vec::with_capacity(raw.len());
+    for (idx, &(bl, code)) in raw.iter().enumerate() {
+        if bl == 0 {
+            // Hole sentinel — skip; no codeword space consumed.
+            continue;
+        }
+        let symbol = if idx == esc_index {
+            Symbol::Escape
+        } else {
+            let g_symbol = match table {
+                GTable::G4 => g4_decode(idx),
+                GTable::G5 => g5_decode(idx),
+            };
+            match g_symbol {
+                Some(GSymbol::Token(t)) => Symbol::RunLevel {
+                    last: t.last,
+                    run: t.run,
+                    level: t.level_mag as u16,
+                },
+                Some(GSymbol::Esc) => Symbol::Escape,
+                None => panic!(
+                    "G-descriptor decode returned None for idx {idx} — \
+                     packed-Huffman source has a symbol index outside the \
+                     descriptor's count_A range"
+                ),
+            }
+        };
+        entries.push(VlcEntry::new(bl as u8, code, symbol));
+    }
+    entries
 }
 
 /// Scan-order selection for the AC walk. MS-MPEG4v3 picks this per-block

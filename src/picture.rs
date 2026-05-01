@@ -148,26 +148,29 @@ pub fn decode_picture(
 
 /// Selector for which intra-AC VLC table the picture decoder uses.
 ///
-/// The clean-room extraction has shipped one table candidate
-/// (`region_05eed0` / VMA `0x1c25fad0`) but its role is OPEN per
-/// `docs/video/msmpeg4/spec/99-current-understanding.md` §0.1 row 8 and
-/// §9 OPEN-O6 — the bytes are a complete 64-entry canonical-Huffman
-/// prefix code (Kraft sum = 1) but the `(last, run, level)` mapping is
-/// the Implementer's hypothesis. The default is therefore still the
-/// placeholder: callers that want to exercise the candidate plumb it
-/// in explicitly via [`AcSelection::Candidate`].
+/// Round 26 (2026-05-01) wires the **G5 (intra-luma) primary VLC** built
+/// from the packed-Huffman source at file `0x59178` per
+/// `docs/video/msmpeg4/spec/11-walker-format-resolved.md`. G5 is now the
+/// shipping default — the placeholder and 64-entry candidate are kept as
+/// alternative selectors for pipeline tests and historical compatibility.
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AcSelection {
-    /// Empty placeholder: when a coded block is encountered, the
-    /// decoder falls back to DC-only reconstruction. This is the
-    /// shipping default (no risk of producing garbage on real DIV3
-    /// content where the candidate's symbol mapping may be wrong).
+    /// Real G5 primary VLC built from the packed-Huffman source at file
+    /// `0x59178` / VMA `0x1c259d78` (102 + 1 ESC entries) wired through
+    /// [`AcVlcTable::v3_intra_g5`]. The post-VLC `(idx → (last, run,
+    /// |level|))` mapping is the G5 descriptor from
+    /// [`crate::g_descriptor::g5_decode`] (round 18/19). This is the
+    /// shipping default for v3 intra blocks.
     #[default]
+    G5,
+    /// Empty placeholder: when a coded block is encountered, the
+    /// decoder falls back to DC-only reconstruction. Retained as an
+    /// opt-in for diagnostic / regression-comparison runs.
     Placeholder,
     /// Candidate VLC built from `region_05eed0.csv` via
-    /// [`AcVlcTable::v3_intra_candidate`]. Useful for synthetic content
-    /// and pipeline integration tests where AC bits are present and
-    /// the bit-aligned VLC walk needs to actually advance.
+    /// [`AcVlcTable::v3_intra_candidate`]. Pre-round-26 plumbing for
+    /// synthetic-stream pipeline tests; superseded by [`AcSelection::G5`]
+    /// for real-content decode.
     Candidate,
 }
 
@@ -211,6 +214,7 @@ pub fn decode_picture_with_ac(
 /// candidate path.
 fn ac_table_for(selection: AcSelection) -> AcVlcTable {
     match selection {
+        AcSelection::G5 => AcVlcTable::v3_intra_g5(),
         AcSelection::Placeholder => AcVlcTable::V3_INTRA_PLACEHOLDER,
         AcSelection::Candidate => AcVlcTable::v3_intra_candidate(),
     }

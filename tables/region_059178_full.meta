@@ -1,0 +1,10 @@
+source: mpg4c32.dll
+source_sha256: aedb4cf3d33c8554ab8acf04afe2d936eaa7c49107c5fefe163bca2e94b3c099
+file_offset_start_hex: 0x059178
+file_offset_end_exclusive_hex: 0x0594b4
+vma_start_hex: 0x1c259d78
+byte_length: 828
+role: G5 (intra-luma) DCT AC TCOEF primary VLC packed-Huffman source
+format: packed-Huffman source per spec/11 §4 — 4-byte u32-LE count then count*(a:u32-LE, b:u32-LE) where a=code_value, b=bit_length
+count: 103
+alphabet: 102 + 1 ESC; one bl=9 codeword reserved (Kraft = 0.99805)

@@ -36,15 +36,16 @@ right decoder when a packet arrives.
 | Joint MCBPCY VLC (v3, 128-entry canonical)     | complete              |
 | DC spatial predictor + AC scan dispatcher      | complete              |
 | Intra MB pipeline (DC pred + IDCT + store)     | complete              |
-| Intra AC run/level VLC plumbing                | wired (candidate)     |
-| Intra AC `(last, run, level)` symbol mapping   | OPEN — hypothesis     |
+| Intra AC run/level VLC plumbing                | wired (G5)            |
+| Intra AC `(last, run, level)` symbol mapping   | wired (G5 desc + ESC) |
 | G4 (inter) `pri_A` + `pri_B` byte arrays       | wired (round 18)      |
 | G5 (intra-luma) `pri_A`                        | wired (round 18)      |
 | G5 (intra-luma) `pri_B`                        | wired (round 19)      |
-| G4 / G5 canonical-Huffman bit-lengths          | OPEN — walker tree at `0x3df40` |
+| G4 / G5 canonical-Huffman primary VLC          | wired (round 26)      |
+| MS-MPEG4v3 3-tier ESC body                     | OPEN — MPEG-4 fallback only |
 | P-frame MV VLC + half-pel MC (default table)   | complete              |
 | P-frame MV VLC alternate table                 | unsupported (truncated dump) |
-| Inter AC run/level VLC                         | pending — spec OPEN   |
+| Inter AC run/level VLC (G4 wired but unused)   | pending — needs P-frame plumbing |
 | V1 / V2 bitstream                              | header + MV + MCBPC done; AC OPEN |
 
 ### What's still spec-OPEN for real-content decode
@@ -75,53 +76,60 @@ file `0x57898..0x57a30`, VMA `0x1c258498`):
   cross-checked against `audit/01 §4.1` to the entry: sub-B has
   r0×8, r1×3, r2..6×2, r7..20×1 with max run 20.
 
-What's **still missing for runnable AC decode**:
+**Round 26 (2026-05-01)** wires the **G4 / G5 primary canonical-Huffman
+VLC** from the packed-Huffman sources at file offsets `0x58e38` and
+`0x59178` (828 bytes each — `4 + 103 * 8`). Per
+`docs/video/msmpeg4/spec/11-walker-format-resolved.md` §3-§5 the loader
+helper `0x1c218cfa` consumes a flat `(code:u32-LE, bit_length:u32-LE)`
+record stream — the `code` field IS the literal bit-pattern (verified by
+direct prefix-freedom + Kraft sum 0.998047 over both tables). The
+`code_value` column the spec/99 §8.1 wording attached to MCBPCY
+(`region_05eac8`) was a runtime LUT/state byte for that table only; the
+G-table sources use the same record shape but `code_value` is the actual
+canonical bit-pattern. With this in place [`AcVlcTable::v3_intra_g5`]
+returns a 103-entry [`Symbol::RunLevel`] / [`Symbol::Escape`] table that
+the existing [`ac::decode_intra_ac`] walker drives end-to-end.
 
-* The **canonical-Huffman bit-length array** for G4 / G5 — the
-  prefix-code shape that maps bitstream bits to alphabet `idx`. Per
-  `spec/99 §5.3` it lives inside the shared 68 KB walker tree at
-  file offset `0x3df40` / VMA `0x1c2780c8`, used by helper
-  `0x1c219351` for every VLC in the binary. The walker is tiered
-  (8-bit primary pre-expansion + up to 2 refill tiers, stride
-  `0x8000`); resolving it into a per-G-descriptor bit-length array
-  requires either (a) disassembling the constructor at
-  `0x1c210ee6` (which builds the runtime descriptor from the packed
-  source regions `0x1c259a38` / `0x1c259d78`) or (b) decoding the
-  walker structure directly.
-* **Round 25 (2026-05-01)** confirmed the byte layout: 8 544
-  records of `(symbol:u32-LE, bit_length:u32-LE)` partitioned as
-  4 096 (primary) + 4 096 (refill A) + 352 (refill B / tail), with
-  `(sym=11, bl=4)` as the dominant primary sentinel and `(sym=0, bl=8)`
-  as the dominant refill-A sentinel. **The bit-reader semantics that
-  navigate the walker (window width, MSB/LSB, refill index
-  derivation) cannot be derived from the data alone** — three
-  obvious indexing hypotheses (12-bit MSB-first, 12-bit LSB-first,
-  8-bit pre-expansion stacked 16×) were tested against the
-  observed entry distribution and all refuted. See
-  `docs/video/msmpeg4/spec/10-walker-investigation.md` for the
-  detailed write-up. Next round needs binary disassembly of
-  helper `0x1c219351` and/or constructor `0x1c210ee6`.
+[`picture::AcSelection::G5`] is now the shipping default for v3 intra
+blocks. The 68 KB walker tree at file `0x3df40` (the previous round-25
+investigation target) turned out to be **not** the G-table primary VLC
+input — per spec/11 §1, the walker is consumed by a separate helper
+(`0x1c219351`) for performance acceleration; the per-slot loader
+operates on the much smaller `4 + count * 8` packed sources directly,
+and the `(code, bl)` arrays produced by it are sufficient for an
+O(n)-per-symbol reference decoder.
 
-The previously-shipped `region_05eed0.csv` candidate — a 64-entry
-canonical-Huffman block at VMA `0x1c25fad0` — remains wired as
-[`AcVlcTable::v3_intra_candidate`] for the synthetic-stream
-pipeline tests, but its role is OPEN per `spec/99 §0.1 row 8` /
-`§9 OPEN-O6` and **the alphabet size mismatches G5** (64 vs 102),
-so it is not the v3 intra-AC source.
+What's **still missing for bit-exact real-content decode**:
 
-Net effect: real `.avi` v3 fixtures still decode at PSNR ≈ 5.30 dB
-Y on `testsrc2 32×32` (DC-only intra reconstruction, zero-residual
-inter), unchanged from r17/r18. The G4 / G5 descriptor data is now
-fully runtime-accessible and audit-verified end-to-end; only the
-bit-length walker tree at `0x3df40` is between the current state
-and runnable AC decode.
+* **MS-MPEG4v3 intra 3-tier ESC body** (spec/04 §2.3 /
+  `0x1c216d97`). The current `decode_escape_body` implements only the
+  MPEG-4 Part 2 fixed-length fallback (1 + 6 + 8 = 15 bits); the v3
+  intra path uses (a) a level-extension VLC tier, (b) a run-extension
+  VLC tier with a symbol-indexed run offset, then (c) the verbatim
+  6/8 fallback. ESC is rare on low-bitrate intra content but causes
+  bit-stream desync whenever it fires, which produces the
+  `scan position ≥ 64` overflow currently seen on `testsrc2 32×32`
+  past the first MB or two. Wiring this is the next round's work.
+* **Inter AC** — G4 primary VLC is also wired (`AcVlcTable::g4_inter`)
+  but the P-frame block-decode path doesn't yet consume it. Round
+  26 leaves the G4 hookup as plumbing for the next inter round.
 
-`send_packet` on a v3 stream defaults to the AC placeholder
-(DC-only reconstruction); callers that want to exercise the
-candidate AC pipeline use [`picture::decode_picture_with_ac`] with
-[`picture::AcSelection::Candidate`]. Synthetic streams + Kraft +
-prefix-free + per-symbol round-trip + scan-order dispatch tests
-all pass against the candidate (see `tests/intra_ac_candidate.rs`).
+Net effect: `testsrc2 32×32` real DIV3 decode now reaches per-block
+AC walks (errors at `scan position 64 exceeds block` past the first
+intra block, indicating bitstream desync at the first ESC); the G5
+canonical-Huffman walker itself is exercised end-to-end by 7 dedicated
+synthetic-stream tests (`tests/g5_primary.rs`) covering shortest code,
+3-bit code, every-non-ESC round-trip, ESC body, prefix-freedom, and
+alphabet partition.
+
+`send_packet` on a v3 stream now uses the G5 path by default; the
+placeholder and 64-entry candidate are still selectable via
+[`picture::decode_picture_with_ac`] with the matching
+[`picture::AcSelection`] variant for diagnostic / regression runs.
+Synthetic streams + Kraft + prefix-free + per-symbol round-trip +
+scan-order dispatch tests all pass against G5
+(`tests/g5_primary.rs`, 7 tests) and the candidate
+(`tests/intra_ac_candidate.rs`, 6 tests).
 G4 / G5 descriptor coverage lives in `tests/g_descriptor_g4.rs`,
 `tests/g_descriptor_g5.rs`, and `src/g_descriptor.rs::tests`
 (39 tests total, including the LMAX-per-run audit cross-check

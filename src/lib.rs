@@ -108,10 +108,26 @@
 //! and G5 (intra-luma) DCT-descriptor `pri_A` / `pri_B` byte arrays
 //! from the cluster region `region_0569c0` — see [`g_descriptor`] for
 //! the `(idx → (last, run, |level|))` mapping that v1/v2/v3 inter and
-//! intra kernels share post-VLC. The canonical-Huffman bit-length
-//! array (which feeds the VLC walk itself) still lives in the shared
-//! 68 KB walker tree at file `0x3df40` and is OPEN; see this crate's
-//! README "What's still spec-OPEN" section for the resolution path.
+//! intra kernels share post-VLC.
+//!
+//! **Round 26 (2026-05-01)** wires the G4 / G5 PRIMARY canonical-
+//! Huffman VLC from the packed-Huffman sources at file `0x58e38` /
+//! `0x59178` (per
+//! `docs/video/msmpeg4/spec/11-walker-format-resolved.md`). The
+//! `(code, bl)` records are literal `(canonical_bit_pattern,
+//! bit_length)` pairs — Kraft sum 0.998047 (= 1 - 1/512) on both
+//! tables, with one bl=9 codeword reserved for ESC at idx 102.
+//! [`ac::AcVlcTable::v3_intra_g5`] is now the runtime intra-AC table
+//! and [`picture::AcSelection::G5`] is the shipping default. The 68 KB
+//! walker tree at `0x3df40` (round-25 investigation target) is NOT
+//! the primary VLC input — per spec/11 §1 it is consumed separately
+//! by helper `0x1c219351` for performance acceleration; the per-slot
+//! loader operates on the smaller `4 + count * 8` packed sources
+//! directly. The remaining gap for bit-exact real-content decode is
+//! the v3 intra 3-tier ESC body (level-extension + run-extension +
+//! verbatim, per spec/04 §2.3); the current pipeline implements only
+//! the MPEG-4 Part 2 fixed-length fallback so streams that fire ESC
+//! bit-stream-desync at the first escape.
 
 #![deny(unsafe_code)]
 

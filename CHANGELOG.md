@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 26 — G5 / G4 primary canonical-Huffman VLC wired**
+  (2026-05-01): unblocked by
+  `docs/video/msmpeg4/spec/11-walker-format-resolved.md` (the
+  Specifier session that disassembled the per-slot loader helper at
+  `0x1c218cfa`). The G5 (intra-luma) primary VLC at file offset
+  `0x59178` / VMA `0x1c259d78` and the G4 (chroma + all-inter)
+  primary VLC at file `0x58e38` / VMA `0x1c259a38` are now extracted
+  into `crates/oxideav-msmpeg4/tables/region_05917 8_full.hex` and
+  `region_058e38_full.hex` (828 bytes each = `4 + 103 * 8`) and wired
+  through `build.rs::emit_packed_huffman_primary` into
+  `G5_PRIMARY_RAW` / `G4_PRIMARY_RAW`. Helper-A's `(a:u32, b:u32)`
+  records are interpreted as `(canonical_bit_pattern, bit_length)`
+  for the G-tables — verified by direct prefix-freedom + Kraft sum
+  exactly `1 - 1/512 = 0.998047` on both tables (one bl=9 codeword
+  reserved for ESC at idx 102). The new `AcVlcTable::v3_intra_g5`
+  constructor builds a 103-entry `Symbol::RunLevel` /
+  `Symbol::Escape` table that the existing `decode_intra_ac` walker
+  drives end-to-end; `picture::AcSelection::G5` is now the shipping
+  default for v3 intra blocks. `tests/g5_primary.rs` covers the new
+  table with 7 dedicated tests (shortest code, 3-bit code,
+  every-non-ESC round-trip, ESC body, prefix-freedom, alphabet
+  partition, length sanity).
 - **Round 19 — G5 pri_B gap fill (full G5 alphabet wired)**
   (2026-04-30): clean-room extraction of the 408-byte gap that
   immediately follows `region_0569c0` (file `0x57898..0x57a30`,

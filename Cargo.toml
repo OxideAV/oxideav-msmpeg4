@@ -23,4 +23,4 @@ include = [
 ]
 
 [dependencies]
-oxideav-core = "0.1"
+oxideav-core = "0.2"
