@@ -702,6 +702,14 @@ fn decode_escape_body(br: &mut BitReader<'_>, table: &AcVlcTable) -> Result<Toke
 /// prediction has already consumed a few leading coefficients.
 ///
 /// Returns the number of non-zero AC coefficients decoded.
+///
+/// **Diagnostics:** when env var `OXIDEAV_MSMPEG4_AC_TRACE` is set, every
+/// decoded `(run, level, last)` token is dumped to stderr along with the
+/// pre/post scan positions and the bit-stream position. This is the
+/// primary instrument for debugging the "scan position exceeds block"
+/// runtime error against a real fixture: the trace shows whether the
+/// overflow is reached via a chain of plausible tokens or via one
+/// outlier that points at a walker / table bug.
 pub fn decode_intra_ac(
     br: &mut BitReader<'_>,
     block: &mut [i32; 64],
@@ -714,14 +722,30 @@ pub fn decode_intra_ac(
             "msmpeg4 ac: start_pos {start_pos} out of range [1, 64]"
         )));
     }
+    let trace = std::env::var_os("OXIDEAV_MSMPEG4_AC_TRACE").is_some();
     let order = scan.table();
     let mut pos = start_pos;
     let mut written = 0u32;
+    let mut tok_idx = 0u32;
     loop {
         if pos > 64 {
             return Err(Error::invalid("msmpeg4 ac: block overflow (>64 coeffs)"));
         }
+        let bit_pos_before = br.bit_position();
         let tok = decode_token(br, table)?;
+        if trace {
+            let bit_pos_after = br.bit_position();
+            eprintln!(
+                "[ac trace] tok {tok_idx}: pos={pos} -> pos+run={} run={} level={} last={} \
+                 bits=[{bit_pos_before}..{bit_pos_after}] scan={:?}",
+                pos + tok.run as usize,
+                tok.run,
+                tok.level,
+                tok.last,
+                scan,
+            );
+        }
+        tok_idx += 1;
         pos += tok.run as usize;
         if pos > 63 {
             return Err(Error::invalid(format!(

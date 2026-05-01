@@ -16,13 +16,20 @@
 //! walk currently returns [`Error::Unsupported`] pending the run/level
 //! tables.
 
+use std::sync::OnceLock;
+
 use oxideav_core::bits::BitReader;
 use oxideav_core::{Error, Result};
 
 use crate::ac::{decode_intra_ac, AcVlcTable, Scan};
 use crate::iq::{dc_scaler, dequantise_h263};
 use crate::tables::{CBPY_INTRA_TABLE, DC_SIZE_CHROMA_TABLE, DC_SIZE_LUMA_TABLE};
-use crate::vlc;
+use crate::tables_data::{
+    INTRA_DC_CHROMA_SEL0_ESC_INDEX, INTRA_DC_CHROMA_SEL0_RAW, INTRA_DC_CHROMA_SEL1_ESC_INDEX,
+    INTRA_DC_CHROMA_SEL1_RAW, INTRA_DC_LUMA_SEL0_ESC_INDEX, INTRA_DC_LUMA_SEL0_RAW,
+    INTRA_DC_LUMA_SEL1_ESC_INDEX, INTRA_DC_LUMA_SEL1_RAW,
+};
+use crate::vlc::{self, VlcEntry};
 
 /// Per-block prediction-cache entry. Stores the reconstructed DC
 /// coefficient (in pel/post-scaler domain) so the next MB's DC
@@ -98,6 +105,11 @@ impl IntraMbHeader {
 /// caller does that multiplication).
 ///
 /// `block_idx` 0..=3 selects the luma table, 4..=5 selects chroma.
+///
+/// Uses the legacy MPEG-4 Part 2 §6.3.8 size-category VLC.
+/// **NOT bit-exact for MS-MPEG4v3** — the v3 binary uses a custom
+/// 120-entry direct-value VLC (see [`decode_intra_dc_diff_v3`]). Kept
+/// for backwards compatibility with the existing v1/v2-style tests.
 pub fn decode_intra_dc_diff(br: &mut BitReader<'_>, block_idx: usize) -> Result<i32> {
     let table = if block_idx < 4 {
         DC_SIZE_LUMA_TABLE
@@ -110,7 +122,6 @@ pub fn decode_intra_dc_diff(br: &mut BitReader<'_>, block_idx: usize) -> Result<
     }
     // `size` unsigned bits of DC value. The MSB is the sign — MPEG-4
     // Part 2 §6.3.8: value = raw if MSB set, else raw - (2^size - 1).
-    // MS-MPEG4v3 uses the same sign encoding.
     let raw = br.read_u32(size)? as i32;
     let msb_set = raw & (1 << (size - 1)) != 0;
     let value = if msb_set {
@@ -118,11 +129,127 @@ pub fn decode_intra_dc_diff(br: &mut BitReader<'_>, block_idx: usize) -> Result<
     } else {
         raw - ((1 << size) - 1)
     };
-    // Marker bit for sizes >= 8 — MS-MPEG4v3 retains this from MPEG-4.
-    if size > 8 {
-        let _marker = br.read_u1()?;
-    }
+    // MPEG-4 Part 2 §6.3.8 calls for a single-bit marker after the
+    // magnitude when `size > 8` to prevent start-code emulation. MS-MPEG4v3
+    // streams **do not** carry a start-code layer, so the binary
+    // `1c216cf8` intra-DC kernel does not consume any extra bit. The
+    // marker read is intentionally omitted here.
     Ok(value)
+}
+
+// ====================================================================
+// MS-MPEG4 v3 custom intra-DC differential VLC (round 28 / task #113).
+// ====================================================================
+//
+// Per `docs/video/msmpeg4/spec/07-remaining-opens.md` §5.4 the v3 intra
+// DC kernel `0x1c216cf8` does NOT use the MPEG-4 Part 2 size-category
+// scheme: it reads a 120-entry canonical-Huffman VLC where the decoded
+// `idx` is the differential magnitude directly (idx == 0 → diff=0 with
+// no sign bit; idx ∈ [1, 118] → ±idx with a sign bit; idx == 119 → ESC
+// sentinel which reads an 8-bit raw + sign bit).
+//
+// There are FOUR tables, picked by (luma vs chroma) × (`dc_size_sel`
+// 0 vs 1). The picture-level `dc_size_sel` bit lives in the v3 picture
+// header (`crate::header::MsV3PictureHeader::dc_size_sel`).
+
+/// One canonical-Huffman entry for the intra-DC VLC: the decoded value
+/// is the alphabet index (0..=119), where 0..=118 are direct DC
+/// magnitudes and 119 is the ESC sentinel. Wrapped in `u16` for safety
+/// even though `u8` would fit.
+type DcVlcEntry = VlcEntry<u16>;
+
+static INTRA_DC_LUMA_SEL0_TABLE: OnceLock<Vec<DcVlcEntry>> = OnceLock::new();
+static INTRA_DC_CHROMA_SEL0_TABLE: OnceLock<Vec<DcVlcEntry>> = OnceLock::new();
+static INTRA_DC_LUMA_SEL1_TABLE: OnceLock<Vec<DcVlcEntry>> = OnceLock::new();
+static INTRA_DC_CHROMA_SEL1_TABLE: OnceLock<Vec<DcVlcEntry>> = OnceLock::new();
+
+fn build_dc_table(raw: &[(u32, u32)]) -> Vec<DcVlcEntry> {
+    // The packed source already carries `(bit_length, code_value)`
+    // pairs for each symbol; the canonical bit-pattern is `code_value`
+    // verbatim (Kraft sum = 1 across the 120 entries, verified at build
+    // time). Hole sentinels (bl == 0) drop out of the entry list — they
+    // never produce a matchable codeword for the linear-scan walker.
+    raw.iter()
+        .enumerate()
+        .filter_map(|(idx, &(bl, code))| {
+            if bl == 0 {
+                None
+            } else {
+                Some(VlcEntry::new(bl as u8, code, idx as u16))
+            }
+        })
+        .collect()
+}
+
+fn dc_table(block_idx: usize, dc_size_sel: u8) -> &'static [DcVlcEntry] {
+    let is_luma = block_idx < 4;
+    match (is_luma, dc_size_sel) {
+        (true, 0) => INTRA_DC_LUMA_SEL0_TABLE
+            .get_or_init(|| build_dc_table(INTRA_DC_LUMA_SEL0_RAW))
+            .as_slice(),
+        (false, 0) => INTRA_DC_CHROMA_SEL0_TABLE
+            .get_or_init(|| build_dc_table(INTRA_DC_CHROMA_SEL0_RAW))
+            .as_slice(),
+        (true, _) => INTRA_DC_LUMA_SEL1_TABLE
+            .get_or_init(|| build_dc_table(INTRA_DC_LUMA_SEL1_RAW))
+            .as_slice(),
+        (false, _) => INTRA_DC_CHROMA_SEL1_TABLE
+            .get_or_init(|| build_dc_table(INTRA_DC_CHROMA_SEL1_RAW))
+            .as_slice(),
+    }
+}
+
+fn dc_esc_index(block_idx: usize, dc_size_sel: u8) -> usize {
+    let is_luma = block_idx < 4;
+    match (is_luma, dc_size_sel) {
+        (true, 0) => INTRA_DC_LUMA_SEL0_ESC_INDEX,
+        (false, 0) => INTRA_DC_CHROMA_SEL0_ESC_INDEX,
+        (true, _) => INTRA_DC_LUMA_SEL1_ESC_INDEX,
+        (false, _) => INTRA_DC_CHROMA_SEL1_ESC_INDEX,
+    }
+}
+
+/// Decode the v3 intra-DC differential using the custom direct-value
+/// VLC (per spec/07 §5.4).
+///
+/// Output is the signed DC differential MAGNITUDE (NOT yet multiplied
+/// by the `dc_scaler` — the caller handles that). Range is `[-119, 119]`
+/// for non-ESC paths and `[-255, 255]` for the ESC tier.
+///
+/// `dc_size_sel` is the picture-header bit (0 or 1) selecting between
+/// the two pairs of tables (per spec/99 §4.5).
+pub fn decode_intra_dc_diff_v3(
+    br: &mut BitReader<'_>,
+    block_idx: usize,
+    dc_size_sel: u8,
+) -> Result<i32> {
+    let table = dc_table(block_idx, dc_size_sel);
+    let esc = dc_esc_index(block_idx, dc_size_sel);
+    let idx = vlc::decode(br, table)? as usize;
+    if idx == 0 {
+        // idx == 0 ⇒ DC differential = 0, no sign bit consumed
+        // (`1c216d2a: test al, al; je 0x1c216d47` per spec/07 §5.2).
+        return Ok(0);
+    }
+    if idx == esc {
+        // ESC tier: read an 8-bit raw value then a sign bit, mapping
+        // 0xff → -255 / 0x00 → +0 etc. Per spec/07 §5.2:
+        //   `push 0x8; call 0x1c211e39` reads 8 raw bits → al
+        //   `bl = al; call 0x1c215c9b` reads sign → al
+        //   `eax = movzx bl; if sign==0 neg eax`.
+        // So sign==0 means level is NEGATIVE (`neg eax`), sign==1 means
+        // level is positive — opposite of the typical sign-bit
+        // convention. The raw byte itself is unsigned magnitude.
+        let raw = br.read_u32(8)? as i32;
+        let sign = br.read_bit()?;
+        return Ok(if sign { raw } else { -raw });
+    }
+    // Normal path: idx is the differential magnitude; sign bit follows.
+    let mag = idx as i32;
+    let sign = br.read_bit()?;
+    // Same MS-MPEG4 sign convention as ESC tier per spec/07 §5.2:
+    // sign bit unset ⇒ negate the magnitude.
+    Ok(if sign { mag } else { -mag })
 }
 
 /// Reconstruct the DC coefficient value for one intra block, combining
@@ -176,7 +303,42 @@ pub fn decode_intra_block_full(
     scan: Scan,
     ac_table: &AcVlcTable,
 ) -> Result<DecodedIntraBlock> {
+    // Legacy path: use the MPEG-4 Part 2 size-category DC VLC (matches
+    // the existing v1/v2 tests and synthetic-stream callers). For v3
+    // streams the picture decoder uses [`decode_intra_block_full_v3`]
+    // directly with the picture-header `dc_size_sel` bit.
     let dc_diff = decode_intra_dc_diff(br, block_idx)?;
+    let dc = reconstruct_intra_dc(dc_diff, pred_dc, block_idx, quant);
+
+    let mut out = DecodedIntraBlock::default();
+    out.coeffs[0] = dc;
+
+    if cbp_set {
+        out.ac_nonzero = decode_intra_ac(br, &mut out.coeffs, scan, ac_table, 1)?;
+        dequantise_h263(&mut out.coeffs, quant, 1)?;
+    }
+
+    Ok(out)
+}
+
+/// Variant of [`decode_intra_block_full`] that takes the picture-level
+/// `dc_size_sel` bit and routes the DC-differential decode through the
+/// MS-MPEG4v3 custom 120-entry direct-value VLC (per spec/07 §5.4 +
+/// spec/99 §4.5). Used by the v3 picture decoder; v1/v2 paths and tests
+/// continue to call [`decode_intra_block_full`] which defaults to
+/// `dc_size_sel = 0` and the legacy MPEG-4-P2-style decoder.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_intra_block_full_v3(
+    br: &mut BitReader<'_>,
+    block_idx: usize,
+    pred_dc: i32,
+    quant: u32,
+    cbp_set: bool,
+    scan: Scan,
+    ac_table: &AcVlcTable,
+    dc_size_sel: u8,
+) -> Result<DecodedIntraBlock> {
+    let dc_diff = decode_intra_dc_diff_v3(br, block_idx, dc_size_sel)?;
     let dc = reconstruct_intra_dc(dc_diff, pred_dc, block_idx, quant);
 
     let mut out = DecodedIntraBlock::default();

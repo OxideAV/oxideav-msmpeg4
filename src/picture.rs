@@ -183,6 +183,18 @@ pub fn decode_picture_with_ac(
     ac_selection: AcSelection,
 ) -> Result<Picture> {
     let hdr = MsV3PictureHeader::parse(br)?;
+    // Diagnostic trace gated on `OXIDEAV_MSMPEG4_AC_TRACE`. Shows the
+    // picture-header field values (so the implementer can tell when a
+    // fixture is using the alternate intra-DC VLC `dc_size_sel=1` for
+    // example, which our standard-MPEG-4-P2 DC-size tables cannot decode
+    // bit-exactly — see task #113 and `crate::mb::decode_intra_dc_diff`).
+    if std::env::var_os("OXIDEAV_MSMPEG4_AC_TRACE").is_some() {
+        eprintln!(
+            "[hdr trace] type={:?} q={} ac_chroma_sel={} ac_luma_sel={} dc_size_sel={} mv_table_sel={} bit_pos={}",
+            hdr.picture_type, hdr.quant, hdr.ac_chroma_sel, hdr.ac_luma_sel,
+            hdr.dc_size_sel, hdr.mv_table_sel, br.bit_position(),
+        );
+    }
     match hdr.picture_type {
         PictureType::I => decode_iframe(br, dims, &hdr, ac_selection),
         PictureType::P => {
@@ -578,7 +590,15 @@ fn decode_intra_mb_to_picture(
     luma_ac: &AcVlcTable,
     chroma_ac: &AcVlcTable,
 ) -> Result<()> {
+    let trace = std::env::var_os("OXIDEAV_MSMPEG4_AC_TRACE").is_some();
+    let mb_start = br.bit_position();
     let header = IntraMbHeader::parse_v3_mcbpcy(br)?;
+    if trace {
+        eprintln!(
+            "[mb trace] mb=({mb_x},{mb_y}) start_bit={mb_start} cbpy=0x{:x} cbp_cb={} cbp_cr={} ac_pred={} after_hdr={}",
+            header.cbpy, header.cbp_cb, header.cbp_cr, header.ac_pred, br.bit_position(),
+        );
+    }
 
     for block_idx in 0..6usize {
         let cbp_set = match block_idx {
@@ -618,6 +638,7 @@ fn decode_intra_mb_to_picture(
         // content but the decoder continues for synthetic DC-only
         // streams. When a real (or candidate) AC VLC table is plugged
         // in, the regular `decode_intra_block_full` path runs.
+        let bit_before = br.bit_position();
         let block_result = if cbp_set && ac_table.entries.is_empty() {
             let dc_diff = crate::mb::decode_intra_dc_diff(br, block_idx)?;
             let dc = crate::mb::reconstruct_intra_dc(dc_diff, pred.predictor, block_idx, quant);
@@ -640,6 +661,15 @@ fn decode_intra_mb_to_picture(
                 ac_table,
             )?
         };
+        if trace {
+            eprintln!(
+                "[blk trace] mb=({mb_x},{mb_y}) blk={block_idx} cbp={cbp_set} scan={:?} bits=[{bit_before}..{}] dc={} nz={}",
+                scan,
+                br.bit_position(),
+                block_result.coeffs[0],
+                block_result.ac_nonzero,
+            );
+        }
 
         // Update the DC cache with the reconstructed DC for this block.
         let reconstructed_dc = block_result.coeffs[0];

@@ -156,6 +156,68 @@ fn main() {
         0x1c259d78,
     );
 
+    // Intra-DC custom direct-value VLCs (round 28 — spec/07 §5.4 +
+    // spec/11 §3 / §4). MS-MPEG4v3 does NOT use the MPEG-4 Part 2
+    // §6.3.8 (size category VLC + magnitude bits) intra-DC scheme.
+    // Instead, each intra-DC differential is read through a 120-entry
+    // canonical-Huffman VLC where the decoded `idx` is the differential
+    // magnitude (idx == 0 → DC diff = 0, idx ∈ [1, 0x76] → ±idx with a
+    // separately-read sign bit, idx == 0x77 == 119 → ESC: read 8-bit raw
+    // + sign bit) per spec/07 §5.4. There are FOUR such tables — one per
+    // (luma, chroma) × (dc_size_sel = 0, 1) — selected per picture by
+    // the `dc_size_sel` bit decoded in the picture header (spec/99 §4.5).
+    //
+    // Binary format: identical `4 + 120 * 8` packed-Huffman source
+    // (spec/11 §3 / §4) BUT the `(a, b)` byte pair is the OPPOSITE
+    // convention from G4/G5: here `a = bit_length, b = code_value`, NOT
+    // `(code_value, bit_length)`. That's confirmed by the Kraft sum:
+    // summing 2^-a over the 120 entries gives exactly 1 (a complete
+    // prefix code at the bit-length given by `a`), whereas summing
+    // 2^-b would give garbage. The candidate-VLC region_05eed0 uses
+    // the same `(bl, code)` convention; G4/G5 use the opposite (because
+    // the helper that walks the source treats them differently — the
+    // (bl, code) form is the LUT-style reverse-mapping the bit-reader
+    // helper `0x1c219351` consumes directly).
+    //
+    // FROM: docs/video/msmpeg4/spec/07-remaining-opens.md §5.4
+    // FROM: docs/video/msmpeg4/spec/99-current-understanding.md §4.5
+    let dc_luma_sel0 = tables_dir.join("region_05f0d8.hex");
+    let dc_chroma_sel0 = tables_dir.join("region_05f4a0.hex");
+    let dc_luma_sel1 = tables_dir.join("region_05f868.hex");
+    let dc_chroma_sel1 = tables_dir.join("region_05fc30.hex");
+    println!("cargo:rerun-if-changed={}", dc_luma_sel0.display());
+    println!("cargo:rerun-if-changed={}", dc_chroma_sel0.display());
+    println!("cargo:rerun-if-changed={}", dc_luma_sel1.display());
+    println!("cargo:rerun-if-changed={}", dc_chroma_sel1.display());
+    emit_intra_dc_vlc(
+        &dc_luma_sel0,
+        &out_dir.join("intra_dc_luma_sel0.rs"),
+        "INTRA_DC_LUMA_SEL0",
+        0x5f0d8,
+        0x1c25fcd8,
+    );
+    emit_intra_dc_vlc(
+        &dc_chroma_sel0,
+        &out_dir.join("intra_dc_chroma_sel0.rs"),
+        "INTRA_DC_CHROMA_SEL0",
+        0x5f4a0,
+        0x1c2600a0,
+    );
+    emit_intra_dc_vlc(
+        &dc_luma_sel1,
+        &out_dir.join("intra_dc_luma_sel1.rs"),
+        "INTRA_DC_LUMA_SEL1",
+        0x5f868,
+        0x1c260468,
+    );
+    emit_intra_dc_vlc(
+        &dc_chroma_sel1,
+        &out_dir.join("intra_dc_chroma_sel1.rs"),
+        "INTRA_DC_CHROMA_SEL1",
+        0x5fc30,
+        0x1c260830,
+    );
+
     println!("cargo:rerun-if-changed=build.rs");
 }
 
@@ -1158,6 +1220,130 @@ fn emit_packed_huffman_primary(
         label_lc_digit = label_lc.trim_start_matches('g'),
         file_off = file_off,
         vma = vma,
+    )
+    .unwrap();
+    for &(bl, code) in &records {
+        writeln!(f, "    ({bl}, {code}),").unwrap();
+    }
+    writeln!(f, "];").unwrap();
+}
+
+/// Parse an MS-MPEG4 intra-DC packed-Huffman source.
+///
+/// Same `4 + 120 * 8`-byte container as the G4/G5 primary VLC sources
+/// (per `docs/video/msmpeg4/spec/11-walker-format-resolved.md` §3-§4):
+/// header `(count: u32, partition_or_other: u32)` followed by 120
+/// records of `(a: u32, b: u32)`. **Critical convention difference:**
+/// for the intra-DC tables the convention is `(a, b) = (bit_length,
+/// code_value)`, the *opposite* of G4/G5 which uses
+/// `(code_value, bit_length)`. The Kraft sum check below proves it —
+/// summing `2^-a` over all entries gives exactly 1, while summing
+/// `2^-b` would diverge wildly.
+///
+/// We emit a `&[(u32, u32)]` of `(bit_length, code_value)` records
+/// (matching the runtime convention of G4/G5 and the candidate
+/// region_05eed0 emitter), so the consumer can build a
+/// canonical-Huffman table with the existing
+/// `crate::ac::build_g_primary`-style walker.
+fn emit_intra_dc_vlc(hex_path: &Path, out_path: &Path, label: &str, file_off: u32, vma: u32) {
+    let bytes = parse_xxd(hex_path);
+    // MS-MPEG4 intra-DC sources use a different container layout from
+    // G4/G5: 121 × 8-byte records with no separate `count: u32` prefix.
+    // Record 0 is the header `(count=120, partition=1)` and records
+    // 1..120 are the payload entries. (G4/G5 use `4 + count*8` with an
+    // explicit u32-LE prefix.) Total file size = 121 * 8 = 968 bytes.
+    if bytes.len() < 121 * 8 {
+        panic!(
+            "{label}: expected at least {} bytes in {} (121 × 8 records, no separate count prefix), got {}",
+            121 * 8,
+            hex_path.display(),
+            bytes.len()
+        );
+    }
+    // Header record (index 0): (count, partition).
+    let header_count = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    if header_count != 120 {
+        panic!(
+            "{label}: header count {header_count} != 120 (expected MS-MPEG4 intra-DC alphabet shape per spec/07 §5.4)",
+        );
+    }
+    let mut records: Vec<(u32, u32)> = Vec::with_capacity(header_count as usize);
+    for i in 0..header_count as usize {
+        // Payload starts after the 8-byte header record.
+        let off = 8 + i * 8;
+        let a = u32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]]);
+        let b = u32::from_le_bytes([
+            bytes[off + 4],
+            bytes[off + 5],
+            bytes[off + 6],
+            bytes[off + 7],
+        ]);
+        // Hole sentinel handling — same as G4/G5 (spec/11 §4): a record
+        // whose first u32 is 0xFFFFFFFF is an empty slot (consume 8
+        // bytes, store as (0, 0)). For DC tables we haven't seen any in
+        // the four 120-entry sources, but the helper-A path supports it
+        // structurally so we keep the check.
+        let (bl, code) = if a == 0xFFFF_FFFF {
+            (0u32, 0u32)
+        } else {
+            // OPPOSITE convention from G4/G5: a = bit_length, b = code_value.
+            (a, b)
+        };
+        if bl > 26 {
+            panic!(
+                "{label}: record {i} has bit_length {bl} > 26 — exceeds the binary's max-bitlen \
+                 budget for these tables (largest bl is 26 across all 4 dc tables); extraction \
+                 misalignment suspected"
+            );
+        }
+        records.push((bl, code));
+    }
+
+    // Kraft sum check — must equal exactly 1 in 2^-bl arithmetic. The
+    // `max_bl` for our DC tables can be up to 26 across the four
+    // sources; carry the arithmetic in 2^-32 fixed-point to keep margin.
+    let max_bl_for_kraft: u32 = 32;
+    let target: u64 = 1u64 << max_bl_for_kraft;
+    let sum: u64 = records
+        .iter()
+        .filter(|&&(bl, _)| bl > 0)
+        .map(|&(bl, _)| 1u64 << (max_bl_for_kraft - bl))
+        .sum();
+    if sum != target {
+        panic!(
+            "{label}: Kraft sum {sum} != expected {target} (= 1 in 2^-32 fixed point) — \
+             intra-DC VLC source is not a complete prefix code with the (bl, code) convention. \
+             Check that the binary's (a, b) record order is `(bit_length, code_value)` and not \
+             the opposite G4/G5 convention."
+        );
+    }
+
+    let mut f = fs::File::create(out_path)
+        .unwrap_or_else(|e| panic!("failed to create {}: {e}", out_path.display()));
+    writeln!(
+        f,
+        "// Auto-generated by build.rs from \
+         crates/oxideav-msmpeg4/tables/region_{file_off:06x}.hex.\n\
+         // DO NOT EDIT.\n\
+         // Source binary: mpg4c32.dll SHA-256 \
+         aedb4cf3d33c8554ab8acf04afe2d936eaa7c49107c5fefe163bca2e94b3c099\n\
+         // Region: file offset 0x{file_off:06x}, VMA 0x{vma:08x}, 964 bytes (4 + 120 * 8).\n\
+         // Format (per docs/video/msmpeg4/spec/11-walker-format-resolved.md §4 +\n\
+         // docs/video/msmpeg4/spec/07-remaining-opens.md §5.4):\n\
+         //   u32-LE count = 120, then 120 * (a:u32-LE = bit_length, b:u32-LE = code_value).\n\
+         //   NOTE the (a, b) order is OPPOSITE to G4/G5 primary VLC sources.\n\
+         // Role: {label} intra-DC differential VLC source.\n\
+         // Symbol idx 0..118 = direct DC differential magnitude (±idx with separate sign bit).\n\
+         // Symbol idx 119 = ESC sentinel (decoder reads 8-bit raw + sign).\n\
+         // Kraft sum over the 120 bit-lengths = 1 exactly (complete prefix code).\n\
+         \n\
+         pub const {label}_ALPHABET: usize = 120;\n\
+         pub const {label}_ESC_INDEX: usize = 119;\n\
+         \n\
+         /// 120 * (bit_length, code_value) pairs for the {label} intra-DC VLC.\n\
+         /// Index in the array == decoded symbol = differential magnitude\n\
+         /// (with sign bit read separately) for idx 0..118; idx == 119 is ESC.\n\
+         pub const {label}_RAW: &[(u32, u32)] = &[",
     )
     .unwrap();
     for &(bl, code) in &records {
