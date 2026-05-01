@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 27 — v3 intra 3-tier ESC body wired** (2026-05-01):
+  unblocks the `decode_escape_body` path past the verbatim-only
+  fallback per `docs/video/msmpeg4/spec/04-decoder-kernels.md`
+  §2.3 (intra kernel `0x1c216d97` 3-tier escape: level-extension at
+  `0x1c216e7b`, run-extension at `0x1c216f02`, verbatim at
+  `0x1c216f5f`). The chained-ESC walker runs:
+  tier 1 (re-decode primary VLC, apply `level_actual = base + LMAX[last][run]`)
+  → tier 2 if ESC re-fires (re-decode primary VLC, apply
+  `run_actual = base + RMAX[last][|level|] + 1`) → tier 3 if ESC
+  re-fires again (verbatim 1+6+8 FLC triple). LMAX / RMAX are
+  derived from the G5 descriptor's pri_A/pri_B alphabet at first
+  use (lazy `OnceLock`); `AcVlcTable` carries them as
+  `Option<&'static LevelLimitTable>` /
+  `Option<&'static RunLimitTable>` so the inter G4 path skips the
+  walk and goes straight to verbatim (matching spec/04 §1.3 step 10's
+  reduced 1-tier inter ESC). `picture::decode_iframe` /
+  `decode_pframe` now also route luma blocks through G5 and chroma
+  blocks through G4 per spec/99 §5.2 (slot `[esi+0xab4]` for luma,
+  `[esi+0xab0]` for chroma + all-inter), unblocking per-block VLC
+  alphabet alignment for real-content decode.
+  `tests/ffmpeg_roundtrip::testsrc2_32x32_ffmpeg_parity` now decodes
+  end-to-end (where round-26 errored) at Y PSNR 6.4 dB Y vs the
+  spec/11 §9 placeholder baseline of 5.30 dB. The 176×144 testsrc
+  fixture still errors before reaching ESC due to a primary-VLC /
+  per-MB scan-order issue out of scope for the ESC body work.
 - **Round 26 — G5 / G4 primary canonical-Huffman VLC wired**
   (2026-05-01): unblocked by
   `docs/video/msmpeg4/spec/11-walker-format-resolved.md` (the

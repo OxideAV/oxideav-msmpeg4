@@ -459,6 +459,8 @@ mod tests {
             esc_last_bits: AcVlcTable::MPEG4_ESC_LAST_BITS,
             esc_run_bits: AcVlcTable::MPEG4_ESC_RUN_BITS,
             esc_level_bits: AcVlcTable::MPEG4_ESC_LEVEL_BITS,
+            lmax: None,
+            rmax: None,
         };
 
         // ac_pred=0, CBPY=15 (all 4 luma blocks coded; code `11`),

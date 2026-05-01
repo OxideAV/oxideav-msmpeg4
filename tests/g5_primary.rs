@@ -117,12 +117,14 @@ fn g5_every_non_esc_entry_round_trips() {
 }
 
 #[test]
-fn g5_esc_codeword_decodes_via_escape_body() {
-    // The ESC entry occupies one bl=9 codeword. We can't easily compute
-    // which bit-pattern the binary placed there without scanning, so we
-    // walk the table to find the entry whose value is Symbol::Escape and
-    // pack its (code, bl). The MPEG-4 fallback escape body then reads
-    // 1 + 6 + 8 = 15 bits: last=1, run=5, level=-3.
+fn g5_esc_codeword_decodes_via_3_tier_escape_body() {
+    // Round 27 wired the v3 intra 3-tier escape body per
+    // `docs/video/msmpeg4/spec/04-decoder-kernels.md` §2.3. The G5
+    // ESC sentinel (a single bl=9 codeword) selects tier 1; a second
+    // ESC re-fire selects tier 2; a third selects the verbatim
+    // fixed-length triple (1 bit last + 6 bits run + 8 bits signed
+    // level). This test exercises the verbatim tier (the only path
+    // the inter kernel uses, per spec/04 §1.3 step 10).
     let table = AcVlcTable::v3_intra_g5();
     let esc_entry = table
         .entries
@@ -131,13 +133,15 @@ fn g5_esc_codeword_decodes_via_escape_body() {
         .expect("G5 must have a Symbol::Escape entry");
     let bytes = pack(&[
         (esc_entry.code, esc_entry.bits as u32),
+        (esc_entry.code, esc_entry.bits as u32),
+        (esc_entry.code, esc_entry.bits as u32),
         (1, 1),    // last = 1
         (5, 6),    // run = 5
         (0xfd, 8), // level = -3 as 8-bit signed
     ]);
     let mut br = BitReader::new(&bytes);
-    let tok = decode_token(&mut br, &table).expect("decode ESC");
-    assert!(tok.last, "ESC body should set last=1");
+    let tok = decode_token(&mut br, &table).expect("decode ESC verbatim tier");
+    assert!(tok.last, "verbatim tier should set last=1");
     assert_eq!(tok.run, 5);
     assert_eq!(tok.level, -3);
 }

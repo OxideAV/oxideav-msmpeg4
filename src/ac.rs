@@ -87,6 +87,16 @@ pub enum Symbol {
 /// spec-defined (MPEG-4 §7.4.1.3) and do NOT vary between the two
 /// MS-MPEG4 intra-AC variants; only the primary VLC (the `entries`
 /// slice) differs.
+///
+/// The optional `lmax` / `rmax` tables drive the v3 intra 3-tier
+/// escape body (per `docs/video/msmpeg4/spec/04-decoder-kernels.md`
+/// §2.3). When both are present, [`decode_escape_body`] walks
+/// tier 1 (level-extension at `0x1c216e7b`) → tier 2 (run-extension
+/// at `0x1c216f02`) → tier 3 (verbatim FLC at `0x1c216f5f`) by
+/// re-invoking the primary VLC after the ESC marker; each successive
+/// ESC re-fire promotes the decoder to the next tier. A `None`
+/// `lmax` / `rmax` collapses the walk to the verbatim tier
+/// (the inter kernel's reduced 1-tier ESC per spec/04 §1.3 step 10).
 #[derive(Clone, Copy)]
 pub struct AcVlcTable {
     pub entries: &'static [VlcEntry<Symbol>],
@@ -98,7 +108,32 @@ pub struct AcVlcTable {
     /// Width of the `level` field in escape mode 2 (= 8 bits signed
     /// for MPEG-4 Part 2; MS-MPEG4v3 uses the same width).
     pub esc_level_bits: u8,
+    /// LMAX[last_idx][run] — max `|level|` over all primary alphabet
+    /// symbols with the given `(last, run)` pair. `last_idx = 0` for
+    /// last=0, `last_idx = 1` for last=1. The tier-1 escape decodes a
+    /// `level_base` from a re-VLC and emits
+    /// `level_actual = level_base + LMAX[last][run]` per spec/04 §2.3.
+    /// `None` disables the tier-1 walk (inter kernel uses verbatim
+    /// only).
+    pub lmax: Option<&'static LevelLimitTable>,
+    /// RMAX[last_idx][level] — max `run` over all primary alphabet
+    /// symbols with the given `(last, |level|)` pair. The tier-2 escape
+    /// decodes a `run_base` from a re-VLC and emits
+    /// `run_actual = run_base + RMAX[last][level] + 1` per spec/04
+    /// §2.3. `None` disables the tier-2 walk.
+    pub rmax: Option<&'static RunLimitTable>,
 }
+
+/// LMAX storage: `lmax[last][run]` indexed by `last ∈ {0,1}`, `run ∈
+/// 0..64`. A run with no representable symbol holds 0 (interpreted as
+/// "no extension possible — the encoder would have used tier 2 or 3").
+pub type LevelLimitTable = [[u8; 64]; 2];
+
+/// RMAX storage: `rmax[last][level]` indexed by `last ∈ {0,1}`,
+/// `level ∈ 0..32` (covers every `|level|` representable in the G4/G5
+/// alphabets — G5 LMAX is 27, G4 LMAX is 12). A level with no
+/// representable symbol holds 0.
+pub type RunLimitTable = [[u8; 32]; 2];
 
 impl AcVlcTable {
     /// Inherited MPEG-4 Part 2 §7.4.1.3 escape-mode widths.
@@ -132,6 +167,8 @@ impl AcVlcTable {
         esc_last_bits: Self::MPEG4_ESC_LAST_BITS,
         esc_run_bits: Self::MPEG4_ESC_RUN_BITS,
         esc_level_bits: Self::MPEG4_ESC_LEVEL_BITS,
+        lmax: None,
+        rmax: None,
     };
 
     /// Build the **real v3 intra-AC primary VLC table** (the G5
@@ -171,6 +208,8 @@ impl AcVlcTable {
             esc_last_bits: Self::MPEG4_ESC_LAST_BITS,
             esc_run_bits: Self::MPEG4_ESC_RUN_BITS,
             esc_level_bits: Self::MPEG4_ESC_LEVEL_BITS,
+            lmax: Some(g5_lmax()),
+            rmax: Some(g5_rmax()),
         }
     }
 
@@ -186,6 +225,13 @@ impl AcVlcTable {
             esc_last_bits: Self::MPEG4_ESC_LAST_BITS,
             esc_run_bits: Self::MPEG4_ESC_RUN_BITS,
             esc_level_bits: Self::MPEG4_ESC_LEVEL_BITS,
+            // The inter kernel at `0x1c215d2c` has a 1-tier ESC body
+            // only (spec/04 §1.3 step 10). G4 is also used in v3 inter
+            // blocks via the per-MB inter driver `1c2147d2`, so we
+            // leave LMAX/RMAX unset and let `decode_escape_body` fall
+            // straight through to the verbatim FLC tier.
+            lmax: None,
+            rmax: None,
         }
     }
 
@@ -257,6 +303,12 @@ impl AcVlcTable {
             esc_last_bits: Self::MPEG4_ESC_LAST_BITS,
             esc_run_bits: Self::MPEG4_ESC_RUN_BITS,
             esc_level_bits: Self::MPEG4_ESC_LEVEL_BITS,
+            // The candidate hypothesis maps every primary symbol to
+            // |level|=1, so LMAX/RMAX would degenerate to 1 / 0
+            // respectively. Synthetic-stream pipeline tests never need
+            // the multi-tier walk; keep the verbatim-only fallback.
+            lmax: None,
+            rmax: None,
         }
     }
 }
@@ -431,6 +483,78 @@ fn build_g_primary(raw: &[(u32, u32)], esc_index: usize, table: GTable) -> Vec<V
     entries
 }
 
+// ====================================================================
+// LMAX / RMAX builders for the v3 intra 3-tier ESC body.
+// ====================================================================
+
+/// Lazily-built LMAX table for the G5 (intra-luma) descriptor. See
+/// [`AcVlcTable::v3_intra_g5`] and [`decode_escape_body`] for the
+/// usage.
+static G5_LMAX: std::sync::OnceLock<LevelLimitTable> = std::sync::OnceLock::new();
+/// Lazily-built RMAX table for the G5 descriptor.
+static G5_RMAX: std::sync::OnceLock<RunLimitTable> = std::sync::OnceLock::new();
+
+fn g5_lmax() -> &'static LevelLimitTable {
+    G5_LMAX.get_or_init(build_g5_lmax)
+}
+
+fn g5_rmax() -> &'static RunLimitTable {
+    G5_RMAX.get_or_init(build_g5_rmax)
+}
+
+/// Build the LMAX table from the G5 descriptor's pri_A/pri_B alphabet.
+///
+/// `LMAX[last][run]` = max `|level|` over all `(idx, last, run, level)`
+/// in the G5 alphabet with the given `(last, run)`. The intra v3
+/// kernel's tier-1 escape body uses this offset to extend the level
+/// magnitude beyond the LMAX-clipped primary alphabet (per
+/// `docs/video/msmpeg4/spec/04-decoder-kernels.md` §2.3 and
+/// `docs/video/msmpeg4/audit/01-report.md` §4.1, which audited the G5
+/// per-run LMAX profile and confirmed exact match to MPEG-4 Part 2
+/// Table 11-15 ESCL(a) Intra TCOEF).
+fn build_g5_lmax() -> LevelLimitTable {
+    use crate::g_descriptor::{g5_iter, GSymbol};
+    let mut lmax: LevelLimitTable = [[0u8; 64]; 2];
+    for (_idx, sym) in g5_iter() {
+        if let GSymbol::Token(t) = sym {
+            let last_idx = if t.last { 1 } else { 0 };
+            let run_idx = t.run as usize;
+            if run_idx < 64 {
+                let prev = lmax[last_idx][run_idx];
+                if t.level_mag > prev {
+                    lmax[last_idx][run_idx] = t.level_mag;
+                }
+            }
+        }
+    }
+    lmax
+}
+
+/// Build the RMAX table from the G5 descriptor's pri_A/pri_B alphabet.
+///
+/// `RMAX[last][|level|]` = max `run` over all `(idx, last, run, level)`
+/// in the G5 alphabet with the given `(last, |level|)`. The intra v3
+/// kernel's tier-2 escape body uses this offset to extend the run
+/// count beyond the RMAX-clipped primary alphabet (per spec/04 §2.3:
+/// "adds a symbol-indexed offset to the run").
+fn build_g5_rmax() -> RunLimitTable {
+    use crate::g_descriptor::{g5_iter, GSymbol};
+    let mut rmax: RunLimitTable = [[0u8; 32]; 2];
+    for (_idx, sym) in g5_iter() {
+        if let GSymbol::Token(t) = sym {
+            let last_idx = if t.last { 1 } else { 0 };
+            let level_idx = t.level_mag as usize;
+            if level_idx < 32 {
+                let prev = rmax[last_idx][level_idx];
+                if t.run > prev {
+                    rmax[last_idx][level_idx] = t.run;
+                }
+            }
+        }
+    }
+    rmax
+}
+
 /// Scan-order selection for the AC walk. MS-MPEG4v3 picks this per-block
 /// from the DC-predictor gradient (`docs/video/msmpeg4/spec/03-corrections.md`
 /// §1.3) — not from a bitstream field. The default scan (zig-zag) is
@@ -471,14 +595,96 @@ pub fn decode_token(br: &mut BitReader<'_>, table: &AcVlcTable) -> Result<Token>
     }
 }
 
-/// Decode the escape-mode body. In the inherited MPEG-4 Part 2 mode
-/// the escape is a plain fixed-length `(last, run, level_signed)`
-/// triple. MS-MPEG4v3 adds a 2-bit mode selector for extended-level and
-/// extended-run variants, but the table-plug-in direction we leave for
-/// a subsequent commit — right now the pipeline supports the MPEG-4
-/// fixed-length fallback (mode `11` in MS-MPEG4v3 lingo) which is the
-/// conservative path used when the other modes have been exhausted.
+/// Decode the escape-mode body using the v3 intra 3-tier walk per
+/// `docs/video/msmpeg4/spec/04-decoder-kernels.md` §2.3.
+///
+/// MS-MPEG4v3's binary structure (different from MPEG-4 Part 2's
+/// §7.4.1.3 selector bits) chains the escape tiers via **successive
+/// ESC re-fires of the primary VLC**: there is no separate selector.
+/// Per spec/04 §2.3:
+///
+/// * **First escape (`0x1c216e7b`) — level extension**: after the
+///   primary VLC fires ESC, re-decode the primary VLC. If it returns
+///   a normal `(last, run, |level|_base)`, emit
+///   `(last, run, sign·(|level|_base + LMAX[last][run]))`. The LMAX
+///   table is derived from the descriptor's pri_A/pri_B alphabet
+///   (G5-only — see `g5_lmax`). If the re-VLC also returns ESC →
+///   tier 2.
+/// * **Second escape (`0x1c216f02`) — run extension**: re-decode the
+///   primary VLC again. If it returns a normal `(last, run_base,
+///   |level|)`, emit `(last, run_base + RMAX[last][|level|] + 1,
+///   sign·|level|)`. If ESC re-fires again → tier 3.
+/// * **Third escape (`0x1c216f5f`) — verbatim**: a flat fixed-length
+///   triple (`esc_last_bits` + `esc_run_bits` + `esc_level_bits`-bit
+///   signed level). This is also the only tier the inter kernel uses
+///   (spec/04 §1.3 step 10) and is the fallback when LMAX/RMAX are
+///   not provided (`lmax = None` / `rmax = None`).
+///
+/// Note that this differs from MPEG-4 Part 2 §7.4.1.3, which uses a
+/// 1-or-2-bit selector after each ESC marker. The MS-MPEG4 binary
+/// chains the tiers via the much-simpler successive-ESC mechanism per
+/// the addresses called out in spec/04 §2.3.
 fn decode_escape_body(br: &mut BitReader<'_>, table: &AcVlcTable) -> Result<Token> {
+    // Tier 1 — level extension.
+    if let (Some(lmax), Some(_)) = (table.lmax, table.rmax) {
+        match vlc::decode(br, table.entries)? {
+            Symbol::RunLevel { last, run, level } => {
+                let last_idx = if last { 1 } else { 0 };
+                let run_idx = run as usize;
+                let lmax_value = if run_idx < 64 {
+                    lmax[last_idx][run_idx] as u16
+                } else {
+                    0
+                };
+                let level_actual = level.saturating_add(lmax_value);
+                let sign = br.read_bit()?;
+                let signed = if sign {
+                    -(level_actual as i32)
+                } else {
+                    level_actual as i32
+                };
+                let signed = signed.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+                return Ok(Token {
+                    last,
+                    run,
+                    level: signed,
+                });
+            }
+            Symbol::Escape => {
+                // Tier 1 ESC re-fired → fall through to tier 2.
+            }
+        }
+    }
+
+    // Tier 2 — run extension.
+    if let (Some(_), Some(rmax)) = (table.lmax, table.rmax) {
+        match vlc::decode(br, table.entries)? {
+            Symbol::RunLevel { last, run, level } => {
+                let last_idx = if last { 1 } else { 0 };
+                let level_idx = level as usize;
+                let rmax_value = if level_idx < 32 {
+                    rmax[last_idx][level_idx] as u16
+                } else {
+                    0
+                };
+                let run_actual_u16 = (run as u16).saturating_add(rmax_value).saturating_add(1);
+                let run_actual = run_actual_u16.min(u8::MAX as u16) as u8;
+                let sign = br.read_bit()?;
+                let signed_level = if sign { -(level as i32) } else { level as i32 };
+                let signed_level = signed_level.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+                return Ok(Token {
+                    last,
+                    run: run_actual,
+                    level: signed_level,
+                });
+            }
+            Symbol::Escape => {
+                // Tier 2 ESC re-fired → fall through to tier 3.
+            }
+        }
+    }
+
+    // Tier 3 — verbatim FLC triple.
     let last = br.read_u32(table.esc_last_bits as u32)? != 0;
     let run = br.read_u32(table.esc_run_bits as u32)? as u8;
     let level_raw = br.read_i32(table.esc_level_bits as u32)?;
@@ -599,6 +805,10 @@ mod tests {
             esc_last_bits: AcVlcTable::MPEG4_ESC_LAST_BITS,
             esc_run_bits: AcVlcTable::MPEG4_ESC_RUN_BITS,
             esc_level_bits: AcVlcTable::MPEG4_ESC_LEVEL_BITS,
+            // Toy table exercises the verbatim-only path; the 3-tier
+            // walk is covered by the dedicated G5 escape tests.
+            lmax: None,
+            rmax: None,
         }
     }
 
@@ -859,5 +1069,185 @@ mod tests {
         assert_eq!(n, 1);
         assert_eq!(block[0], 512, "DC untouched");
         assert_eq!(block[ZIGZAG[1]], 14, "AC dequantised");
+    }
+
+    // ----- 3-tier ESC body tests (round 27) -----
+
+    #[test]
+    fn g5_lmax_table_matches_audit() {
+        // Per audit/01 §4.1 sub-A LMAX:
+        //   r0:27, r1:10, r2:5, r3:4, r4..7:3, r8..9:2, r10..14:1.
+        let lmax = g5_lmax();
+        assert_eq!(lmax[0][0], 27);
+        assert_eq!(lmax[0][1], 10);
+        assert_eq!(lmax[0][2], 5);
+        assert_eq!(lmax[0][3], 4);
+        for r in 4..=7 {
+            assert_eq!(lmax[0][r], 3, "sub-A LMAX[0][{r}]");
+        }
+        for r in 8..=9 {
+            assert_eq!(lmax[0][r], 2, "sub-A LMAX[0][{r}]");
+        }
+        for r in 10..=14 {
+            assert_eq!(lmax[0][r], 1, "sub-A LMAX[0][{r}]");
+        }
+        // Sub-B LMAX (audit/01 §4.1):
+        //   r0:8, r1:3, r2..6:2, r7..20:1.
+        assert_eq!(lmax[1][0], 8);
+        assert_eq!(lmax[1][1], 3);
+        for r in 2..=6 {
+            assert_eq!(lmax[1][r], 2, "sub-B LMAX[1][{r}]");
+        }
+        for r in 7..=20 {
+            assert_eq!(lmax[1][r], 1, "sub-B LMAX[1][{r}]");
+        }
+    }
+
+    #[test]
+    fn g5_rmax_table_is_max_run_per_level() {
+        // Per audit/01 §4.1 G5 sub-A:
+        //   level 1 has runs 0..14 → RMAX[0][1] = 14
+        //   level 2 has runs 0..9 → RMAX[0][2] = 9
+        //   level 3 has runs 0..7 → RMAX[0][3] = 7
+        //   level 4 has runs 0..3 → RMAX[0][4] = 3
+        //   level 5 has runs 0..2 → RMAX[0][5] = 2
+        //   level 6..10 have run 0..1 → RMAX[0][6..10] = 1
+        //   level 11..27 have run 0 only → RMAX[0][11..27] = 0
+        let rmax = g5_rmax();
+        assert_eq!(rmax[0][1], 14, "sub-A level 1 max run");
+        assert_eq!(rmax[0][2], 9, "sub-A level 2 max run");
+        assert_eq!(rmax[0][3], 7, "sub-A level 3 max run");
+        assert_eq!(rmax[0][4], 3, "sub-A level 4 max run");
+        assert_eq!(rmax[0][5], 2, "sub-A level 5 max run");
+        for l in 6..=10 {
+            assert_eq!(rmax[0][l], 1, "sub-A level {l} max run");
+        }
+        // Sub-B (last=1):
+        //   level 1 has runs 0..20 → RMAX[1][1] = 20
+        //   level 2 has runs 0..6 → RMAX[1][2] = 6
+        //   level 3 has runs 0..1 → RMAX[1][3] = 1
+        //   level 4..8 have run 0 only → RMAX[1][4..8] = 0
+        assert_eq!(rmax[1][1], 20, "sub-B level 1 max run");
+        assert_eq!(rmax[1][2], 6, "sub-B level 2 max run");
+        assert_eq!(rmax[1][3], 1, "sub-B level 3 max run");
+    }
+
+    #[test]
+    fn esc_tier1_extends_level_via_lmax() {
+        // Tier 1 = level extension: ESC marker, then a regular VLC for
+        // (last=false, run=0, level_base=1), then sign bit. The G5
+        // primary VLC for (idx 0 = run=0, level=1) is `10` (2-bit).
+        // LMAX[0][0] = 27, so actual level = 1 + 27 = 28.
+        let t = AcVlcTable::v3_intra_g5();
+        let esc_entry = t
+            .entries
+            .iter()
+            .find(|e| matches!(e.value, Symbol::Escape))
+            .expect("G5 ESC entry");
+        let bytes = pack(&[(esc_entry.code, esc_entry.bits as u32), (0b10, 2), (0, 1)]);
+        let mut br = BitReader::new(&bytes);
+        let tok = decode_token(&mut br, &t).expect("decode tier-1 ESC body");
+        assert_eq!(tok.last, false, "tier 1: last preserved from re-VLC");
+        assert_eq!(tok.run, 0, "tier 1: run preserved from re-VLC");
+        assert_eq!(
+            tok.level, 28,
+            "tier 1: level = base(1) + LMAX[0][0](27) = 28"
+        );
+    }
+
+    #[test]
+    fn esc_tier1_extends_level_with_negative_sign() {
+        // Same as above but sign=1 → level = -28.
+        let t = AcVlcTable::v3_intra_g5();
+        let esc_entry = t
+            .entries
+            .iter()
+            .find(|e| matches!(e.value, Symbol::Escape))
+            .expect("G5 ESC entry");
+        let bytes = pack(&[
+            (esc_entry.code, esc_entry.bits as u32),
+            (0b10, 2),
+            (1, 1), // sign = 1 → negative
+        ]);
+        let mut br = BitReader::new(&bytes);
+        let tok = decode_token(&mut br, &t).expect("decode tier-1 ESC body");
+        assert_eq!(tok.level, -28, "tier 1 with negative sign");
+    }
+
+    #[test]
+    fn esc_tier2_extends_run_via_rmax() {
+        // Tier 2 = run extension: ESC marker → ESC again (re-fire) →
+        // re-VLC (= idx 0 (run=0, level=1, last=0)) → sign. RMAX[0][1]
+        // = 14 (max run for sub-A level 1). So run_actual =
+        // 0 + 14 + 1 = 15.
+        let t = AcVlcTable::v3_intra_g5();
+        let esc_entry = t
+            .entries
+            .iter()
+            .find(|e| matches!(e.value, Symbol::Escape))
+            .expect("G5 ESC entry");
+        let bytes = pack(&[
+            (esc_entry.code, esc_entry.bits as u32),
+            (esc_entry.code, esc_entry.bits as u32), // tier-1 fires again → tier 2
+            (0b10, 2),                               // (run=0, level=1, last=0)
+            (0, 1),                                  // sign = 0 → positive
+        ]);
+        let mut br = BitReader::new(&bytes);
+        let tok = decode_token(&mut br, &t).expect("decode tier-2 ESC body");
+        assert_eq!(tok.last, false);
+        assert_eq!(tok.level, 1, "tier 2: level untouched (= re-VLC value)");
+        assert_eq!(
+            tok.run, 15,
+            "tier 2: run = base(0) + RMAX[0][1](14) + 1 = 15"
+        );
+    }
+
+    #[test]
+    fn esc_tier3_falls_through_when_both_extensions_escape() {
+        // Tier 3 = verbatim: three ESCs in a row, then the verbatim
+        // (last, run, level) FLC triple.
+        let t = AcVlcTable::v3_intra_g5();
+        let esc_entry = t
+            .entries
+            .iter()
+            .find(|e| matches!(e.value, Symbol::Escape))
+            .expect("G5 ESC entry");
+        let bytes = pack(&[
+            (esc_entry.code, esc_entry.bits as u32),
+            (esc_entry.code, esc_entry.bits as u32),
+            (esc_entry.code, esc_entry.bits as u32),
+            (1, 1),    // last = 1
+            (5, 6),    // run = 5
+            (0xfd, 8), // level = -3 as 8-bit signed (0xfd = -3)
+        ]);
+        let mut br = BitReader::new(&bytes);
+        let tok = decode_token(&mut br, &t).expect("decode tier-3 ESC body");
+        assert!(tok.last);
+        assert_eq!(tok.run, 5);
+        assert_eq!(tok.level, -3);
+    }
+
+    #[test]
+    fn esc_body_inter_table_is_verbatim_only() {
+        // The G4 (inter) table has lmax/rmax = None per spec/04 §1.3
+        // step 10 (1-tier ESC for inter). One ESC marker followed by
+        // the verbatim FLC triple.
+        let t = AcVlcTable::g4_inter();
+        let esc_entry = t
+            .entries
+            .iter()
+            .find(|e| matches!(e.value, Symbol::Escape))
+            .expect("G4 ESC entry");
+        let bytes = pack(&[
+            (esc_entry.code, esc_entry.bits as u32),
+            (0, 1),
+            (3, 6),
+            (4, 8),
+        ]);
+        let mut br = BitReader::new(&bytes);
+        let tok = decode_token(&mut br, &t).expect("decode inter ESC");
+        assert!(!tok.last);
+        assert_eq!(tok.run, 3);
+        assert_eq!(tok.level, 4);
     }
 }

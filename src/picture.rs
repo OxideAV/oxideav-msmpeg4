@@ -207,14 +207,29 @@ pub fn decode_picture_with_ac(
     }
 }
 
-/// Resolve the picture decoder's [`AcSelection`] into a concrete
-/// [`AcVlcTable`] value. Centralising this lets the per-block code
-/// branch on `entries.is_empty()` for the placeholder DC-only fallback
-/// path while still composing into [`decode_intra_block_full`] for the
-/// candidate path.
-fn ac_table_for(selection: AcSelection) -> AcVlcTable {
+/// Resolve the picture decoder's [`AcSelection`] into the **luma**
+/// intra-AC table (blocks 0..=3 of an MB). Per
+/// `docs/video/msmpeg4/spec/99-current-understanding.md` §5 / §5.2,
+/// luma uses slot `[esi+0xab4]` (G3/G1/G5 selected by `[esi+0xad4]`);
+/// G5 is the v1/v2 default and the production-ready choice for v3.
+fn luma_ac_table_for(selection: AcSelection) -> AcVlcTable {
     match selection {
         AcSelection::G5 => AcVlcTable::v3_intra_g5(),
+        AcSelection::Placeholder => AcVlcTable::V3_INTRA_PLACEHOLDER,
+        AcSelection::Candidate => AcVlcTable::v3_intra_candidate(),
+    }
+}
+
+/// Resolve the picture decoder's [`AcSelection`] into the **chroma**
+/// intra-AC table (blocks 4 = Cb, 5 = Cr). Per spec/99 §5 / §5.2 the
+/// chroma path lives in slot `[esi+0xab0]` and uses a G2/G0/G4 variant
+/// (selected by `[esi+0xad0]`); G4 is the v1/v2 default and the
+/// production-ready choice for v3 round-27 wiring. Placeholder /
+/// candidate selectors fall through to the same as luma so the
+/// diagnostic test paths still bisect cleanly.
+fn chroma_ac_table_for(selection: AcSelection) -> AcVlcTable {
+    match selection {
+        AcSelection::G5 => AcVlcTable::g4_inter(),
         AcSelection::Placeholder => AcVlcTable::V3_INTRA_PLACEHOLDER,
         AcSelection::Candidate => AcVlcTable::v3_intra_candidate(),
     }
@@ -252,11 +267,21 @@ fn decode_iframe(
     let mut dc_cache = DcCache::new(mb_w, mb_h);
 
     let quant = hdr.quant as u32;
-    let ac_table = ac_table_for(ac_selection);
+    let luma_ac = luma_ac_table_for(ac_selection);
+    let chroma_ac = chroma_ac_table_for(ac_selection);
 
     for my in 0..mb_h {
         for mx in 0..mb_w {
-            decode_intra_mb_to_picture(br, &mut pic, &mut dc_cache, mx, my, quant, &ac_table)?;
+            decode_intra_mb_to_picture(
+                br,
+                &mut pic,
+                &mut dc_cache,
+                mx,
+                my,
+                quant,
+                &luma_ac,
+                &chroma_ac,
+            )?;
         }
     }
 
@@ -302,7 +327,8 @@ fn decode_pframe(
     let mut pic = Picture::alloc(dims, PictureType::P);
     let mut dc_cache = DcCache::new(mb_w, mb_h);
     let quant = hdr.quant as u32;
-    let ac_table = ac_table_for(ac_selection);
+    let luma_ac = luma_ac_table_for(ac_selection);
+    let chroma_ac = chroma_ac_table_for(ac_selection);
 
     // MV grid: one (MVx, MVy) entry per MB. Skipped / intra MBs use
     // (0, 0) so the predictor's zero-substitution semantics match
@@ -321,7 +347,8 @@ fn decode_pframe(
                 my,
                 mb_w,
                 quant,
-                &ac_table,
+                &luma_ac,
+                &chroma_ac,
             )?;
         }
     }
@@ -342,7 +369,8 @@ fn decode_pframe_mb(
     mb_y: usize,
     mb_w: usize,
     quant: u32,
-    ac_table: &AcVlcTable,
+    luma_ac: &AcVlcTable,
+    chroma_ac: &AcVlcTable,
 ) -> Result<()> {
     use crate::mcbpcy::{decode_mcbpcy_pframe, PFrameMcbpcy};
 
@@ -391,7 +419,9 @@ fn decode_pframe_mb(
             cbp_cb: decode.cbp_cb,
             cbp_cr: decode.cbp_cr,
         };
-        decode_intra_mb_with_header(br, pic, dc_cache, &header, mb_x, mb_y, quant, ac_table)?;
+        decode_intra_mb_with_header(
+            br, pic, dc_cache, &header, mb_x, mb_y, quant, luma_ac, chroma_ac,
+        )?;
         // Intra MBs clear the MV predictor chain: the per-row mv_grid
         // entry stays `None` so downstream neighbours treat this
         // column as zero.
@@ -464,7 +494,8 @@ fn decode_intra_mb_with_header(
     mb_x: usize,
     mb_y: usize,
     quant: u32,
-    ac_table: &AcVlcTable,
+    luma_ac: &AcVlcTable,
+    chroma_ac: &AcVlcTable,
 ) -> Result<()> {
     for block_idx in 0..6usize {
         let cbp_set = match block_idx {
@@ -485,6 +516,7 @@ fn decode_intra_mb_with_header(
         } else {
             Scan::Zigzag
         };
+        let ac_table = if block_idx <= 3 { luma_ac } else { chroma_ac };
         let block_result = if cbp_set && ac_table.entries.is_empty() {
             let dc_diff = crate::mb::decode_intra_dc_diff(br, block_idx)?;
             let dc = crate::mb::reconstruct_intra_dc(dc_diff, pred.predictor, block_idx, quant);
@@ -535,6 +567,7 @@ fn block_grid_pos(block_idx: usize, mb_x: usize, mb_y: usize) -> (usize, usize) 
 /// Decode one intra macroblock's 6 blocks into the corresponding slot
 /// of `pic`, using MPEG-4 §7.4.3 spatial DC prediction and per-block
 /// AC-scan dispatch.
+#[allow(clippy::too_many_arguments)]
 fn decode_intra_mb_to_picture(
     br: &mut BitReader<'_>,
     pic: &mut Picture,
@@ -542,7 +575,8 @@ fn decode_intra_mb_to_picture(
     mb_x: usize,
     mb_y: usize,
     quant: u32,
-    ac_table: &AcVlcTable,
+    luma_ac: &AcVlcTable,
+    chroma_ac: &AcVlcTable,
 ) -> Result<()> {
     let header = IntraMbHeader::parse_v3_mcbpcy(br)?;
 
@@ -571,6 +605,12 @@ fn decode_intra_mb_to_picture(
         } else {
             Scan::Zigzag
         };
+
+        // Per-block AC VLC routing: luma blocks (0..=3) use the
+        // intra-luma table (G5 by default); chroma blocks (4, 5) use
+        // the chroma + all-inter table (G4 by default), per spec/99
+        // §5.2.
+        let ac_table = if block_idx <= 3 { luma_ac } else { chroma_ac };
 
         // AC path: when the placeholder table is in use (entries empty)
         // fall back to DC-only — the bitstream's AC bits are skipped,
