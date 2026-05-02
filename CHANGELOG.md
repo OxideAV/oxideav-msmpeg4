@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Round 28 — DC predictor + AC-scan dispatch corrected per spec/03 §1**
+  (2026-05-01, task #125): the gradient test in `dc_pred::predict_dc`
+  compared `|A - D|` vs `|A - B|` (left-vs-top distance), but the
+  MPEG-4 §7.4.3 / spec/03 §1.3 rule compares `|A - D|` (left-column
+  gradient) vs `|D - B|` (top-row gradient). The smaller-gradient axis
+  wins. Likewise, `PredDir::ac_scan` mapped `FromLeft → AlternateHorizontal`
+  and `FromTop → AlternateVertical`, but the binary's dispatch helper
+  at `1c20de2e` (per spec/03 §1.1) returns:
+    * `[mb+0x2c] = 1` (vertical pred wins, predict from TOP) → alt-horizontal
+      scan (VMA `0x1c261140`)
+    * `[mb+0x2c] = 0` (horizontal pred wins, predict from LEFT) → alt-vertical
+      scan (VMA `0x1c261240`)
+  Both fixes lift testsrc 176×144 DC-only PSNR from 10.69 dB Y →
+  10.93 dB Y; testsrc2 32×32 (G5 path) from 9.73 dB Y → 9.76 dB Y.
+  The AC walker still trips on a non-terminating sub-A token chain in
+  the failing 176×144 fixture (`scan position 70 exceeds block`); the
+  encoder appears to emit valid sub-A `(run=14, level=1)` at scan pos
+  56 — likely a deeper issue with table interpretation at the sub-A/
+  sub-B boundary that needs further binary disassembly.
+
 ### Added
 
 - **Round 27 — v3 intra 3-tier ESC body wired** (2026-05-01):

@@ -54,16 +54,28 @@ pub enum PredDir {
 
 impl PredDir {
     /// Map the DC prediction direction to the AC-scan selection per
-    /// spec/04 §4.4 when AC prediction is enabled for the MB:
-    ///   * left-predicted  → alternate-horizontal (MPEG-4 §7.4.1.2 "row scan")
-    ///   * top-predicted   → alternate-vertical   (MPEG-4 §7.4.1.2 "column scan")
+    /// `docs/video/msmpeg4/spec/03-corrections.md` §1.1 / §1.2:
+    ///   * top-predicted  (vertical predictor wins)  → **alternate-horizontal**
+    ///     scan (binary VMA `0x1c261140`)
+    ///   * left-predicted (horizontal predictor wins) → **alternate-vertical**
+    ///     scan (binary VMA `0x1c261240`)
+    ///
+    /// This matches the dispatch helper at `1c20de2e`:
+    ///   * `[mb+0x2c] = 1` (vertical pred wins, predict from TOP) → alt-horz
+    ///   * `[mb+0x2c] = 0` (horizontal pred wins, predict from LEFT) → alt-vert
+    ///
+    /// (This is the standard MPEG-4 Part 2 §7.4.5.4 mapping: when AC
+    /// coefficients in the first ROW are predicted from top, the energy
+    /// concentrates along the row, so the alternate-horizontal scan —
+    /// which traverses rows first — packs non-zero coefficients toward
+    /// the start of the scan. Symmetrically for the column case.)
     ///
     /// When AC prediction is disabled at the MB level, the caller must
     /// use [`Scan::Zigzag`] instead — this function never returns zigzag.
     pub fn ac_scan(self) -> Scan {
         match self {
-            PredDir::FromLeft => Scan::AlternateHorizontal,
-            PredDir::FromTop => Scan::AlternateVertical,
+            PredDir::FromLeft => Scan::AlternateVertical,
+            PredDir::FromTop => Scan::AlternateHorizontal,
         }
     }
 }
@@ -83,8 +95,17 @@ pub fn predict_dc(a_left: Option<i32>, b_top: Option<i32>, d_tl: Option<i32>) ->
     let a = a_left.unwrap_or(NEUTRAL_DC);
     let b = b_top.unwrap_or(NEUTRAL_DC);
     let d = d_tl.unwrap_or(NEUTRAL_DC);
-    // MPEG-4 §7.4.3 gradient rule.
-    if (a - d).abs() < (a - b).abs() {
+    // MPEG-4 §7.4.3 gradient rule (and `docs/video/msmpeg4/spec/03-corrections.md`
+    // §1.3): compare `|A - D|` (gradient down the left column) with
+    // `|D - B|` (gradient along the top row). The smaller gradient wins
+    // — i.e. a flatter direction means the neighbour on that axis is
+    // more representative.
+    //
+    //   |A - D| < |D - B| → left-column gradient is smaller → predict
+    //                       from LEFT (horizontal predictor wins).
+    //   else            → top-row gradient is smaller → predict from
+    //                       TOP (vertical predictor wins).
+    if (a - d).abs() < (d - b).abs() {
         DcPrediction {
             predictor: a,
             direction: PredDir::FromLeft,
@@ -215,7 +236,7 @@ mod tests {
 
     #[test]
     fn all_neutral_predicts_from_top() {
-        // Tie: |A-D| == |A-B| == 0 → else-branch → top.
+        // Tie: |A-D| == |D-B| == 0 → else-branch → top.
         let p = predict_dc(None, None, None);
         assert_eq!(p.predictor, NEUTRAL_DC);
         assert_eq!(p.direction, PredDir::FromTop);
@@ -223,20 +244,24 @@ mod tests {
 
     #[test]
     fn strong_horizontal_gradient_picks_left() {
-        // D=100, A=200, B=500 → |A-D|=100, |A-B|=300 → left.
+        // D=100, A=200, B=500 → |A-D|=100, |D-B|=400 → left wins.
+        // Per spec/03 §1.1, predict-from-LEFT (horizontal pred wins) ⇒
+        // alt-vertical scan (binary VMA 0x1c261240).
         let p = predict_dc(Some(200), Some(500), Some(100));
         assert_eq!(p.predictor, 200);
         assert_eq!(p.direction, PredDir::FromLeft);
-        assert_eq!(p.direction.ac_scan(), Scan::AlternateHorizontal);
+        assert_eq!(p.direction.ac_scan(), Scan::AlternateVertical);
     }
 
     #[test]
     fn strong_vertical_gradient_picks_top() {
-        // D=100, A=500, B=200 → |A-D|=400, |A-B|=300 → top.
+        // D=100, A=500, B=200 → |A-D|=400, |D-B|=100 → top wins.
+        // Per spec/03 §1.1, predict-from-TOP (vertical pred wins) ⇒
+        // alt-horizontal scan (binary VMA 0x1c261140).
         let p = predict_dc(Some(500), Some(200), Some(100));
         assert_eq!(p.predictor, 200);
         assert_eq!(p.direction, PredDir::FromTop);
-        assert_eq!(p.direction.ac_scan(), Scan::AlternateVertical);
+        assert_eq!(p.direction.ac_scan(), Scan::AlternateHorizontal);
     }
 
     #[test]
@@ -247,7 +272,7 @@ mod tests {
         c.luma_set(0, 1, 512);
         // predict block (1, 1): A = (0,1) = 512, B = (1,0) = 2048, D = (0,0) = 1024.
         let p = c.predict_luma(1, 1);
-        // |A-D| = |512 - 1024| = 512, |A-B| = |512 - 2048| = 1536. left wins.
+        // |A-D| = |512 - 1024| = 512, |D-B| = |1024 - 2048| = 1024. Left wins.
         assert_eq!(p.predictor, 512);
         assert_eq!(p.direction, PredDir::FromLeft);
     }
@@ -260,9 +285,9 @@ mod tests {
         let pcb = c.predict_chroma(false, 1, 1);
         let pcr = c.predict_chroma(true, 1, 1);
         // Only (0,0) is set; (0,1), (1,0), (1,1) are None → neutrals.
-        // D=800, A=neutral(1024), B=neutral(1024). |A-D|=224, |A-B|=0 → top.
+        // D=800, A=neutral(1024), B=neutral(1024). |A-D|=224, |D-B|=224 → tie → top.
         assert_eq!(pcb.direction, PredDir::FromTop);
-        // For Cr: D=200, neutrals otherwise. |1024-200|=824, |1024-1024|=0 → top.
+        // For Cr: D=200, neutrals otherwise. |1024-200|=824, |200-1024|=824 → tie → top.
         assert_eq!(pcr.direction, PredDir::FromTop);
     }
 

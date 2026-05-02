@@ -578,6 +578,13 @@ impl Scan {
 
 /// Decode one `(last, run, level)` token from the primary table and
 /// (if the primary emits `Escape`) any escape-body extension.
+///
+/// **Sign convention:** standard MPEG-4 / MS-MPEG4 AC sign — bit 0 = positive,
+/// bit 1 = negative. (Note that the intra-DC differential VLC uses an
+/// inverted convention per `docs/video/msmpeg4/spec/07-remaining-opens.md`
+/// §5.2, but the AC kernel re-uses the SAME helper `0x1c215c9b` that the
+/// observed PSNR-on-real-content result shows behaves as the standard MPEG-4
+/// convention here.)
 pub fn decode_token(br: &mut BitReader<'_>, table: &AcVlcTable) -> Result<Token> {
     match vlc::decode(br, table.entries)? {
         Symbol::RunLevel { last, run, level } => {
@@ -638,6 +645,7 @@ fn decode_escape_body(br: &mut BitReader<'_>, table: &AcVlcTable) -> Result<Toke
                 };
                 let level_actual = level.saturating_add(lmax_value);
                 let sign = br.read_bit()?;
+                // Standard MPEG-4 AC sign: bit 1 ⇒ negative.
                 let signed = if sign {
                     -(level_actual as i32)
                 } else {
@@ -670,6 +678,7 @@ fn decode_escape_body(br: &mut BitReader<'_>, table: &AcVlcTable) -> Result<Toke
                 let run_actual_u16 = (run as u16).saturating_add(rmax_value).saturating_add(1);
                 let run_actual = run_actual_u16.min(u8::MAX as u16) as u8;
                 let sign = br.read_bit()?;
+                // Standard MPEG-4 AC sign: bit 1 ⇒ negative.
                 let signed_level = if sign { -(level as i32) } else { level as i32 };
                 let signed_level = signed_level.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
                 return Ok(Token {
