@@ -1316,7 +1316,7 @@ mod tests {
         // first).  The build_g_primary loop preserves the symbol-index
         // order, so we can identify them by their (run, level, last)
         // triple.
-        let entry_subA0 = table
+        let entry_sub_a0 = table
             .entries
             .iter()
             .find(|e| {
@@ -1330,7 +1330,7 @@ mod tests {
                 )
             })
             .expect("G5 sub-A idx 0 entry");
-        let entry_subB0 = table
+        let entry_sub_b0 = table
             .entries
             .iter()
             .find(|e| {
@@ -1348,9 +1348,9 @@ mod tests {
         // Sub-A token + sub-B terminator pair, with positive sign for
         // both.
         let bytes = pack(&[
-            (entry_subA0.code, entry_subA0.bits as u32),
+            (entry_sub_a0.code, entry_sub_a0.bits as u32),
             (0, 1), // sign for sub-A
-            (entry_subB0.code, entry_subB0.bits as u32),
+            (entry_sub_b0.code, entry_sub_b0.bits as u32),
             (0, 1), // sign for sub-B
         ]);
         let mut br = BitReader::new(&bytes);
