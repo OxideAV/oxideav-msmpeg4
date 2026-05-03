@@ -1430,13 +1430,9 @@ fn emit_g_enum(
                 csv_path.display()
             );
         }
-        let idx: usize = parts[0].parse().unwrap_or_else(|_| {
-            panic!(
-                "{label}: bad idx at line {}: {}",
-                line_no + 1,
-                parts[0]
-            )
-        });
+        let idx: usize = parts[0]
+            .parse()
+            .unwrap_or_else(|_| panic!("{label}: bad idx at line {}: {}", line_no + 1, parts[0]));
         let sub_class = parts[1];
         if sub_class == "ESC" {
             entries.push((idx, 'E', 0, 0, 0));
@@ -1463,9 +1459,9 @@ fn emit_g_enum(
     }
 
     // Validate header — last row must be ESC at index count_A.
-    let esc_row = entries.last().unwrap_or_else(|| {
-        panic!("{label}: empty CSV {}", csv_path.display())
-    });
+    let esc_row = entries
+        .last()
+        .unwrap_or_else(|| panic!("{label}: empty CSV {}", csv_path.display()));
     if esc_row.1 != 'E' {
         panic!(
             "{label}: last row is not ESC sentinel: {esc_row:?} ({})",
@@ -1474,9 +1470,7 @@ fn emit_g_enum(
     }
     let count_a = esc_row.0;
     if count_a != expected_count_a {
-        panic!(
-            "{label}: count_A from CSV ({count_a}) != expected ({expected_count_a})"
-        );
+        panic!("{label}: count_A from CSV ({count_a}) != expected ({expected_count_a})");
     }
     if entries.len() != expected_count_a + 1 {
         panic!(

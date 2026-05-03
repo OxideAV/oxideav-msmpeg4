@@ -221,8 +221,7 @@ mod tests {
     fn g0_sub_a_lmax_matches_spec_09() {
         // spec/09 §3 sub-class A (last = 0): r0 LMAX=23, r1=11, r2=8,
         // r3=7, r4..5=5, r6..7=4, r8..11=3, r12..16=2, r17..26=1.
-        let mut max_per_run: std::collections::BTreeMap<u8, u8> =
-            std::collections::BTreeMap::new();
+        let mut max_per_run: std::collections::BTreeMap<u8, u8> = std::collections::BTreeMap::new();
         for idx in 0..=GExtended::G0.count_b() {
             let GSymbol::Token(t) = GExtended::G0.decode(idx).unwrap() else {
                 unreachable!()
@@ -254,8 +253,7 @@ mod tests {
     fn g1_sub_a_lmax_matches_spec_09() {
         // spec/09 §4 sub-class A: r0=19, r1=15, r2=12, r3=11, r4=6,
         // r5=5, r6..9=4, r10..15=3, r16..17=2, r18..30=1.
-        let mut max_per_run: std::collections::BTreeMap<u8, u8> =
-            std::collections::BTreeMap::new();
+        let mut max_per_run: std::collections::BTreeMap<u8, u8> = std::collections::BTreeMap::new();
         for idx in 0..=GExtended::G1.count_b() {
             let GSymbol::Token(t) = GExtended::G1.decode(idx).unwrap() else {
                 unreachable!()
