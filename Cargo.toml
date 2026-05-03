@@ -19,7 +19,13 @@ include = [
     "LICENSE",
     "README.md",
     "CHANGELOG.md",
+    # build.rs reads xxd-format `.hex` extracts and CSV alphabets at
+    # publish-time compile, plus `.meta` provenance sidecars carried for
+    # audit reproducibility.  Missing any of these breaks `cargo publish`
+    # / release-plz packaging.
     "tables/*.csv",
+    "tables/*.hex",
+    "tables/*.meta",
 ]
 
 [dependencies]
