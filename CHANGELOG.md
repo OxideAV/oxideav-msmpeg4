@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.4](https://github.com/OxideAV/oxideav-msmpeg4/compare/v0.0.3...v0.0.4) - 2026-05-03
+
+### Other
+
+- rename G5-test locals to snake_case
+- cargo fmt rustfmt 1.95 chain/closure wraps
+
 ### Fixed
 
 - **Round 28 — DC predictor + AC-scan dispatch corrected per spec/03 §1**
