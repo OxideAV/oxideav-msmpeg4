@@ -155,6 +155,7 @@ pub mod scan;
 pub mod tables;
 pub mod tables_data;
 pub mod vlc;
+pub mod walker;
 
 pub const CODEC_ID_V1: &str = "msmpeg4v1";
 pub const CODEC_ID_V2: &str = "msmpeg4v2";
