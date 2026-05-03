@@ -24,3 +24,12 @@ include = [
 
 [dependencies]
 oxideav-core = "0.1"
+
+[dev-dependencies]
+# `ureq` powers the URL-backed `microsoft_fixtures` integration test
+# (`tests/microsoft_fixtures.rs`), which fetches real Microsoft-encoded
+# MS-MPEG4 v3 streams from samples.oxideav.org for the cleanroom-side
+# `pri_A`/`pri_B` runtime-binding triangulation. The fixtures are cached
+# on disk under `target/test-fixtures/` after the first fetch and the
+# test gracefully skips when offline / no cache.
+ureq = "3"
