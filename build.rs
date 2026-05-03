@@ -229,6 +229,26 @@ fn main() {
         0x1c260830,
     );
 
+    // G0..G3 (run, level, last) enumeration CSVs (round 29 — spec/09).
+    // Each CSV maps a primary-VLC symbol index to its (last, run, |level|)
+    // triple plus the alphabet-size ESC sentinel at the final row.
+    //
+    // FROM: docs/video/msmpeg4/spec/09-g0-g3-enumeration.md
+    // FROM: docs/video/msmpeg4/tables/region_<addr>_g<N>_enum.csv
+    //       (extracted by extract-06.sh)
+    let g0_enum = tables_dir.join("region_056c60_g0_enum.csv");
+    let g1_enum = tables_dir.join("region_056ff0_g1_enum.csv");
+    let g2_enum = tables_dir.join("region_057300_g2_enum.csv");
+    let g3_enum = tables_dir.join("region_0575a8_g3_enum.csv");
+    println!("cargo:rerun-if-changed={}", g0_enum.display());
+    println!("cargo:rerun-if-changed={}", g1_enum.display());
+    println!("cargo:rerun-if-changed={}", g2_enum.display());
+    println!("cargo:rerun-if-changed={}", g3_enum.display());
+    emit_g_enum(&g0_enum, &out_dir.join("g0_enum.rs"), "G0", 168, 98);
+    emit_g_enum(&g1_enum, &out_dir.join("g1_enum.rs"), "G1", 185, 118);
+    emit_g_enum(&g2_enum, &out_dir.join("g2_enum.rs"), "G2", 148, 80);
+    emit_g_enum(&g3_enum, &out_dir.join("g3_enum.rs"), "G3", 132, 84);
+
     println!("cargo:rerun-if-changed=build.rs");
 }
 
@@ -1357,6 +1377,201 @@ fn emit_intra_dc_vlc(hex_path: &Path, out_path: &Path, label: &str, file_off: u3
     .unwrap();
     for &(bl, code) in &records {
         writeln!(f, "    ({bl}, {code}),").unwrap();
+    }
+    writeln!(f, "];").unwrap();
+}
+
+/// Parse one of the G0..G3 enumeration CSVs and emit a static Rust
+/// constant of `(run, level_mag, last)` triples plus the count_A /
+/// count_B header constants.
+///
+/// CSV format (per docs/video/msmpeg4/tables/region_<addr>_g<N>_enum.csv,
+/// produced by extract-06.sh):
+///
+///   `idx,sub_class,last,run,level,pri_A_byte,pri_B_u32_hex,...`
+///
+/// Rows 0..count_A-1 hold the alphabet (sub-A 0..count_B then sub-B
+/// count_B+1..count_A-1). Row `count_A` is the ESC sentinel
+/// (`idx,ESC,-,-,-,-,-,...`).
+///
+/// The emitted table has length `count_A` (no ESC entry — callers test
+/// `idx == count_A` separately, matching `g_descriptor::g4_decode` /
+/// `g5_decode` semantics).
+///
+/// Per spec/09 §3-§7 / §11 there are no holes: every (last, run) class
+/// enumerates `1, 2, ..., LMAX[last][run]` with no gaps. This function
+/// asserts that property at build time.
+fn emit_g_enum(
+    csv_path: &Path,
+    out_path: &Path,
+    label: &str,
+    expected_count_a: usize,
+    expected_count_b: usize,
+) {
+    let text = fs::read_to_string(csv_path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", csv_path.display()));
+
+    // Each entry: (idx, sub_class_char, last_flag, run, level_mag).
+    let mut entries: Vec<(usize, char, u8, u8, u8)> = Vec::with_capacity(expected_count_a + 1);
+    for (line_no, line) in text.lines().enumerate() {
+        if line_no == 0 {
+            // CSV column header.
+            continue;
+        }
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = line.split(',').collect();
+        if parts.len() < 5 {
+            panic!(
+                "{label}: malformed row at line {} in {}: {line}",
+                line_no + 1,
+                csv_path.display()
+            );
+        }
+        let idx: usize = parts[0].parse().unwrap_or_else(|_| {
+            panic!(
+                "{label}: bad idx at line {}: {}",
+                line_no + 1,
+                parts[0]
+            )
+        });
+        let sub_class = parts[1];
+        if sub_class == "ESC" {
+            entries.push((idx, 'E', 0, 0, 0));
+            continue;
+        }
+        let class_char = match sub_class {
+            "A" => 'A',
+            "B" => 'B',
+            other => panic!(
+                "{label}: unknown sub_class '{other}' at line {}",
+                line_no + 1
+            ),
+        };
+        let last_flag: u8 = parts[2]
+            .parse()
+            .unwrap_or_else(|_| panic!("{label}: bad last at line {}: {}", line_no + 1, parts[2]));
+        let run: u8 = parts[3]
+            .parse()
+            .unwrap_or_else(|_| panic!("{label}: bad run at line {}: {}", line_no + 1, parts[3]));
+        let level: u8 = parts[4]
+            .parse()
+            .unwrap_or_else(|_| panic!("{label}: bad level at line {}: {}", line_no + 1, parts[4]));
+        entries.push((idx, class_char, last_flag, run, level));
+    }
+
+    // Validate header — last row must be ESC at index count_A.
+    let esc_row = entries.last().unwrap_or_else(|| {
+        panic!("{label}: empty CSV {}", csv_path.display())
+    });
+    if esc_row.1 != 'E' {
+        panic!(
+            "{label}: last row is not ESC sentinel: {esc_row:?} ({})",
+            csv_path.display()
+        );
+    }
+    let count_a = esc_row.0;
+    if count_a != expected_count_a {
+        panic!(
+            "{label}: count_A from CSV ({count_a}) != expected ({expected_count_a})"
+        );
+    }
+    if entries.len() != expected_count_a + 1 {
+        panic!(
+            "{label}: expected {} rows (count_A + ESC), got {}",
+            expected_count_a + 1,
+            entries.len()
+        );
+    }
+
+    // Validate sub-class partition + emit the (run, level, last) tuples
+    // in symbol-index order.
+    let mut payload: Vec<(u8, u8, u8)> = Vec::with_capacity(expected_count_a);
+    for (i, e) in entries[..expected_count_a].iter().enumerate() {
+        if e.0 != i {
+            panic!(
+                "{label}: row {i} has idx field {} (table not contiguous)",
+                e.0
+            );
+        }
+        let expected_class = if i <= expected_count_b { 'A' } else { 'B' };
+        if e.1 != expected_class {
+            panic!(
+                "{label}: idx {i} has sub_class '{}' but expected '{expected_class}' \
+                 (count_B={expected_count_b})",
+                e.1
+            );
+        }
+        let expected_last = if i <= expected_count_b { 0 } else { 1 };
+        if e.2 != expected_last {
+            panic!(
+                "{label}: idx {i} has last={} but expected {expected_last}",
+                e.2
+            );
+        }
+        payload.push((e.3, e.4, e.2));
+    }
+
+    // Cross-check the gap-free property (spec/09 §9): for every observed
+    // (last, run) class, levels enumerate 1..=LMAX with no holes.
+    let mut max_level_per_class: std::collections::BTreeMap<(u8, u8), u8> =
+        std::collections::BTreeMap::new();
+    let mut levels_seen_per_class: std::collections::BTreeMap<(u8, u8), Vec<u8>> =
+        std::collections::BTreeMap::new();
+    for &(run, level, last) in &payload {
+        let key = (last, run);
+        let lev_list = levels_seen_per_class.entry(key).or_default();
+        lev_list.push(level);
+        let cur = max_level_per_class.entry(key).or_insert(0);
+        if level > *cur {
+            *cur = level;
+        }
+    }
+    for (key, levels) in &levels_seen_per_class {
+        let lmax = max_level_per_class[key];
+        let mut sorted = levels.clone();
+        sorted.sort_unstable();
+        let expected: Vec<u8> = (1..=lmax).collect();
+        if sorted != expected {
+            panic!(
+                "{label}: gap-free violation at (last={}, run={}) — observed {sorted:?}, \
+                 expected {expected:?}. spec/09 §9 asserts levels enumerate 1..=LMAX.",
+                key.0, key.1
+            );
+        }
+    }
+
+    let mut f = fs::File::create(out_path)
+        .unwrap_or_else(|e| panic!("failed to create {}: {e}", out_path.display()));
+    writeln!(
+        f,
+        "// Auto-generated by build.rs from \
+         crates/oxideav-msmpeg4/tables/{csv_name}.\n\
+         // DO NOT EDIT.\n\
+         // Source: docs/video/msmpeg4/tables/{csv_name} (extract-06.sh,\n\
+         // round 29). Cleanroom narrative: docs/video/msmpeg4/spec/09-g0-g3-enumeration.md.\n\
+         // Source binary: mpg4c32.dll SHA-256 \
+         aedb4cf3d33c8554ab8acf04afe2d936eaa7c49107c5fefe163bca2e94b3c099\n\
+         // Format: each entry is (run:u8, level_mag:u8, last:u8) per\n\
+         // primary-VLC symbol index. Index range: [0, {label}_COUNT_A).\n\
+         // ESC sentinel lives at idx == {label}_COUNT_A and is NOT in the\n\
+         // array (callers test the boundary explicitly per spec/04 §1.3 step 3).\n\
+         // Sub-class partition (spec/13 §2): idx <= {label}_COUNT_B is sub-A\n\
+         // (last=0, continues block); idx > {label}_COUNT_B is sub-B (last=1,\n\
+         // terminates block).\n\
+         \n\
+         pub const {label}_COUNT_A: usize = {expected_count_a};\n\
+         pub const {label}_COUNT_B: usize = {expected_count_b};\n\
+         \n\
+         /// (run, level_mag, last) for each primary-VLC symbol index.\n\
+         pub const {label}_ENUM: &[(u8, u8, u8); {expected_count_a}] = &[",
+        csv_name = csv_path.file_name().unwrap().to_string_lossy(),
+    )
+    .unwrap();
+    for &(run, level, last) in &payload {
+        writeln!(f, "    ({run}, {level}, {last}),").unwrap();
     }
     writeln!(f, "];").unwrap();
 }
