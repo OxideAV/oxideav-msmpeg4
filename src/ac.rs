@@ -235,6 +235,119 @@ impl AcVlcTable {
         }
     }
 
+    /// Build the **G0 (chroma + all-inter, class 1) DCT AC TCOEF
+    /// primary VLC** table — placeholder until the packed-Huffman
+    /// bit-length source is extracted.
+    ///
+    /// Per spec/14 §3.1, G0 is selected when the picture-header
+    /// `ac_chroma_sel` field equals 1. Per spec/15 §7 G0's alphabet
+    /// shape is `(count_A=168, count_B=98)` and its `(idx → (run,
+    /// level, last))` enumeration is wired through
+    /// [`crate::g_enum::g0_decode`] / [`crate::g_enum::GExtended::G0`]
+    /// (round 29). What's missing is the canonical-Huffman bit-length
+    /// array — the per-symbol bit-length source.
+    ///
+    /// **Extraction blocker.** Per spec/99 §10 row 1058 the candidate
+    /// packed-Huffman input for G0 lives at file offset `0x57a30` /
+    /// VMA `0x1c258630`. The Extractor's structural sanity check on
+    /// that region (`docs/video/msmpeg4/tables/region_057a30.meta`)
+    /// flags it as `verdict: suspect` because the bit_length histogram
+    /// has values out of the canonical 1..32 range. The constructor
+    /// algorithm at `0x1c210dab..0x1c210f0a` that turns the packed
+    /// input into a runtime decoder object has not been disassembled
+    /// either, so the per-G0 packed-Huffman record format is
+    /// unconfirmed. Until both land we cannot wire G0's primary VLC.
+    ///
+    /// **What this constructor does today.** Returns the same empty-
+    /// `entries` placeholder as [`AcVlcTable::V3_INTRA_PLACEHOLDER`]
+    /// so the per-block AC walker bails to DC-only reconstruction
+    /// when [`crate::picture::AcSelection::FromHeader`] dispatches a
+    /// chroma block to G0. The named constructor is the future
+    /// drop-in for when the packed-Huffman source lands.
+    ///
+    /// FROM: `docs/video/msmpeg4/spec/14-pri-ab-runtime-binding.md` §3 (selector → G mapping)
+    /// FROM: `docs/video/msmpeg4/spec/15-count-ab-per-g-family.md` §7 (count_A=168, count_B=98)
+    /// FROM: `docs/video/msmpeg4/spec/99-current-understanding.md` §10 row 1058 (G0 source VMA)
+    pub fn v3_intra_g0() -> AcVlcTable {
+        Self::V3_INTRA_PLACEHOLDER
+    }
+
+    /// Build the **G1 (intra-luma, class 1) DCT AC TCOEF primary
+    /// VLC** table — placeholder until the packed-Huffman bit-length
+    /// source is extracted.
+    ///
+    /// Per spec/14 §3.1, G1 is selected when the picture-header
+    /// `ac_luma_sel` field equals 1. Alphabet shape per spec/15 §7
+    /// is `(count_A=185, count_B=118)`; the `(idx → (run, level,
+    /// last))` enumeration is wired through
+    /// [`crate::g_enum::g1_decode`] (round 29).
+    ///
+    /// **Extraction blocker** identical to [`v3_intra_g0`]: candidate
+    /// packed-Huffman input at file `0x57f80` / VMA `0x1c258b80`
+    /// (spec/99 §10 row 1059) is flagged `suspect` in
+    /// `region_057f80.meta`. Until that region is resolved into a
+    /// canonical bit-length array, this returns the empty-`entries`
+    /// placeholder.
+    ///
+    /// FROM: `docs/video/msmpeg4/spec/14-pri-ab-runtime-binding.md` §3
+    /// FROM: `docs/video/msmpeg4/spec/15-count-ab-per-g-family.md` §7
+    /// FROM: `docs/video/msmpeg4/spec/99-current-understanding.md` §10 row 1059
+    pub fn v3_intra_g1() -> AcVlcTable {
+        Self::V3_INTRA_PLACEHOLDER
+    }
+
+    /// Build the **G2 (chroma + all-inter, class 0) DCT AC TCOEF
+    /// primary VLC** table — placeholder until the packed-Huffman
+    /// bit-length source is extracted.
+    ///
+    /// Per spec/14 §3.1, G2 is selected when the picture-header
+    /// `ac_chroma_sel` field equals 0 (the default for v3 chroma when
+    /// the per-frame selector reads as the unary single-zero bit).
+    /// Alphabet shape per spec/15 §7 is `(count_A=148, count_B=80)`;
+    /// the `(idx → (run, level, last))` enumeration is wired through
+    /// [`crate::g_enum::g2_decode`] (round 29).
+    ///
+    /// **Extraction blocker** identical to [`v3_intra_g0`]: candidate
+    /// packed-Huffman input at file `0x58558` / VMA `0x1c259158`
+    /// (spec/99 §10 row 1060) is flagged `suspect` in
+    /// `region_058558.meta`. Until that region is resolved this
+    /// returns the empty-`entries` placeholder.
+    ///
+    /// FROM: `docs/video/msmpeg4/spec/14-pri-ab-runtime-binding.md` §3
+    /// FROM: `docs/video/msmpeg4/spec/15-count-ab-per-g-family.md` §7
+    /// FROM: `docs/video/msmpeg4/spec/99-current-understanding.md` §10 row 1060
+    pub fn v3_intra_g2() -> AcVlcTable {
+        Self::V3_INTRA_PLACEHOLDER
+    }
+
+    /// Build the **G3 (intra-luma, class 0) DCT AC TCOEF primary
+    /// VLC** table — placeholder until the packed-Huffman bit-length
+    /// source is extracted.
+    ///
+    /// Per spec/14 §3.1, G3 is selected when the picture-header
+    /// `ac_luma_sel` field equals 0 (the default for v3 luma when the
+    /// per-frame selector reads as the unary single-zero bit). This
+    /// is the table mp43.wmv I-frames need per the round-5
+    /// implementer's static analysis (memory note
+    /// `project_msmpeg4_runtime_binding_clues.md` §1). Alphabet shape
+    /// per spec/15 §7 is `(count_A=132, count_B=84)`; the `(idx →
+    /// (run, level, last))` enumeration is wired through
+    /// [`crate::g_enum::g3_decode`] (round 29).
+    ///
+    /// **Extraction blocker** identical to [`v3_intra_g0`]: candidate
+    /// packed-Huffman input at file `0x58a08` / VMA `0x1c259608`
+    /// (spec/99 §10 row 1061) is flagged `suspect` in
+    /// `region_058a08.meta`. Until that region is resolved this
+    /// returns the empty-`entries` placeholder, and mp43.wmv I-frame
+    /// luma blocks fall back to DC-only reconstruction.
+    ///
+    /// FROM: `docs/video/msmpeg4/spec/14-pri-ab-runtime-binding.md` §3
+    /// FROM: `docs/video/msmpeg4/spec/15-count-ab-per-g-family.md` §7
+    /// FROM: `docs/video/msmpeg4/spec/99-current-understanding.md` §10 row 1061
+    pub fn v3_intra_g3() -> AcVlcTable {
+        Self::V3_INTRA_PLACEHOLDER
+    }
+
     /// Build the candidate v3 intra-AC primary VLC table from the
     /// canonical-Huffman code-length array in
     /// `tables/region_05eed0.csv` (VMA `0x1c25fad0`, 64 payload entries,
@@ -1384,5 +1497,33 @@ mod tests {
         assert!(!tok.last);
         assert_eq!(tok.run, 3);
         assert_eq!(tok.level, 4);
+    }
+
+    /// G0..G3 named constructors return the empty placeholder until
+    /// their packed-Huffman bit-length sources are extracted (see the
+    /// per-constructor doc-comments for the file-offset blocker).
+    /// This test pins the placeholder behaviour so that when the
+    /// extraction lands and the constructors switch to a real VLC, the
+    /// test breaks loudly and forces a deliberate update — a safety
+    /// net against silent attribution drift.
+    #[test]
+    fn g0_g3_placeholder_constructors_return_empty_entries() {
+        for (name, table) in [
+            ("G0", AcVlcTable::v3_intra_g0()),
+            ("G1", AcVlcTable::v3_intra_g1()),
+            ("G2", AcVlcTable::v3_intra_g2()),
+            ("G3", AcVlcTable::v3_intra_g3()),
+        ] {
+            assert!(
+                table.entries.is_empty(),
+                "{name} constructor should be a placeholder until packed-\
+                 Huffman bit-length extraction lands; got {} entries",
+                table.entries.len(),
+            );
+            assert!(
+                table.lmax.is_none() && table.rmax.is_none(),
+                "{name} placeholder must not carry LMAX/RMAX",
+            );
+        }
     }
 }
