@@ -712,6 +712,37 @@ fn decode_escape_body(br: &mut BitReader<'_>, table: &AcVlcTable) -> Result<Toke
 ///
 /// Returns the number of non-zero AC coefficients decoded.
 ///
+/// # Block termination semantics (spec/13)
+///
+/// Per `docs/video/msmpeg4/spec/13-kernel-block-termination.md` §2-§3
+/// the binary's intra/inter kernels terminate the per-block loop on
+/// the **sub-class flag** of the decoded symbol — i.e. `sym > count_B`
+/// (the partition that distinguishes sub-A `last=0` from sub-B
+/// `last=1`). The `Symbol::RunLevel { last, .. }` returned by
+/// [`decode_token`] already carries this flag because
+/// [`crate::ac::build_g_primary`] derives it from the partition test
+/// when wrapping each `g_descriptor::G{4,5}_decode` symbol.
+///
+/// The kernel returns `-100` (its hard-error sentinel) on
+/// `scan_pos >= 64` overflow per `spec/13` §3 (label `0x1c21700c`).
+/// We mirror that here as `Err(Error::invalid(...))`. There is **no
+/// implicit EOB** on overflow — the original spec/04 hypothesis was
+/// refuted by spec/13 §3, so any overflow is a bug (either upstream
+/// in the bitstream or in our walker).
+///
+/// # Outstanding caveat (spec/13 §6 / audit/04 §2.5)
+///
+/// The runtime `desc+0x1c` / `desc+0x20` (live `pri_A` / `pri_B`
+/// pointer) assignment is still OPEN per the audit-04 recommendation
+/// for the next cleanroom session. If the live pointers diverge from
+/// our static G-table choice for a given (selector, frame_version)
+/// tuple, individual blocks will see wrong `(run, level, last)` tuples
+/// and may overflow. spec/13 §7 lists this as the prime suspect for
+/// the testsrc 176×144 G5-path overflow — our enabling work
+/// (Phase 1 of round 31) doesn't fix it; the G0..G3 enumeration is
+/// available, but selecting which of {G0, G1, G2, G3, G4, G5} to use
+/// from the per-frame selector field is left to a future round.
+///
 /// **Diagnostics:** when env var `OXIDEAV_MSMPEG4_AC_TRACE` is set, every
 /// decoded `(run, level, last)` token is dumped to stderr along with the
 /// pre/post scan positions and the bit-stream position. This is the
@@ -737,8 +768,13 @@ pub fn decode_intra_ac(
     let mut written = 0u32;
     let mut tok_idx = 0u32;
     loop {
+        // spec/13 §3: kernel returns -100 (hard error) when scan_pos
+        // exceeds 63. There is no implicit EOB on overflow.
         if pos > 64 {
-            return Err(Error::invalid("msmpeg4 ac: block overflow (>64 coeffs)"));
+            return Err(Error::invalid(format!(
+                "msmpeg4 ac: scan_pos overflow (=={pos}); kernel `0x1c21700c` returns -100 \
+                 per docs/video/msmpeg4/spec/13-kernel-block-termination.md §3"
+            )));
         }
         let bit_pos_before = br.bit_position();
         let tok = decode_token(br, table)?;
@@ -758,7 +794,9 @@ pub fn decode_intra_ac(
         pos += tok.run as usize;
         if pos > 63 {
             return Err(Error::invalid(format!(
-                "msmpeg4 ac: scan position {pos} exceeds block (run={}, last={})",
+                "msmpeg4 ac: scan_pos {pos} exceeds 63 after run={} (sub-class flag last={}); \
+                 kernel `0x1c21700c` returns -100 per spec/13 §3 — bug is upstream of the \
+                 kernel (either bitstream malformed or wrong G-table selected per spec/13 §6)",
                 tok.run, tok.last
             )));
         }
@@ -766,6 +804,9 @@ pub fn decode_intra_ac(
             block[order[pos]] = tok.level as i32;
             written += 1;
         }
+        // spec/13 §2: termination IS the sub-class flag. `tok.last`
+        // here is the partition-derived flag from build_g_primary
+        // (i.e. `idx > count_B`), not a separate bitstream field.
         if tok.last {
             return Ok(written);
         }
@@ -1259,6 +1300,66 @@ mod tests {
         assert!(tok.last);
         assert_eq!(tok.run, 5);
         assert_eq!(tok.level, -3);
+    }
+
+    #[test]
+    fn block_terminator_is_subclass_flag_not_bitstream_field() {
+        // spec/13 §2: the block terminator IS the sub-class partition
+        // (`sym > count_B`) of the decoded symbol — there is no
+        // separate `last` bit in the bitstream.
+        //
+        // Verify against the real G5 alphabet: idx=0 (sub-A, run=0,
+        // level=1) must NOT terminate the loop, but idx=count_B+1=67
+        // (the first sub-B entry, run=0, level=1, last=1) MUST.
+        let table = AcVlcTable::v3_intra_g5();
+        // Find the entry for sym idx 0 (sub-A first) and idx 67 (sub-B
+        // first).  The build_g_primary loop preserves the symbol-index
+        // order, so we can identify them by their (run, level, last)
+        // triple.
+        let entry_subA0 = table
+            .entries
+            .iter()
+            .find(|e| {
+                matches!(
+                    e.value,
+                    Symbol::RunLevel {
+                        last: false,
+                        run: 0,
+                        level: 1,
+                    }
+                )
+            })
+            .expect("G5 sub-A idx 0 entry");
+        let entry_subB0 = table
+            .entries
+            .iter()
+            .find(|e| {
+                matches!(
+                    e.value,
+                    Symbol::RunLevel {
+                        last: true,
+                        run: 0,
+                        level: 1,
+                    }
+                )
+            })
+            .expect("G5 sub-B idx 67 entry");
+
+        // Sub-A token + sub-B terminator pair, with positive sign for
+        // both.
+        let bytes = pack(&[
+            (entry_subA0.code, entry_subA0.bits as u32),
+            (0, 1), // sign for sub-A
+            (entry_subB0.code, entry_subB0.bits as u32),
+            (0, 1), // sign for sub-B
+        ]);
+        let mut br = BitReader::new(&bytes);
+        let mut block = [0i32; 64];
+        let n = decode_intra_ac(&mut br, &mut block, Scan::Zigzag, &table, 1).unwrap();
+        // Two non-zero coefficients written: at scan pos 1 and 2.
+        assert_eq!(n, 2);
+        assert_eq!(block[ZIGZAG[1]], 1, "sub-A coefficient");
+        assert_eq!(block[ZIGZAG[2]], 1, "sub-B coefficient (terminator)");
     }
 
     #[test]
