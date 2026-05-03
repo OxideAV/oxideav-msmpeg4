@@ -7,29 +7,44 @@
 //! source is loaded by the per-slot constructor at `0x1c218cfa` and
 //! walked at decode time by the helper at `0x1c219351`.  Per
 //! `docs/video/msmpeg4/spec/12-walker-decoder-and-builder.md` §2-§5
-//! the walker is a **two-or-three-tier prefix LUT**:
+//! the walker is a **two-or-three-tier prefix LUT** with a
+//! **dynamically-allocated set of sub-tables per tier**:
 //!
-//! * Default tier widths `(10, 11, max_bl - 21)` — spec/12 §2 trace at
-//!   `1c218e8d..1c218ea4`.
-//! * Tier 0 holds a `2^10 = 1024` entry table.  Each entry is either:
+//! * Default per-tier peek widths `(10, 11, max_bl - 21)` — spec/12 §2
+//!   trace at `1c218e8d..1c218ea4`.
+//! * Tier 0 always holds exactly one `2^10 = 1024` entry table.  Each
+//!   entry is either:
 //!   * **Terminal**: `(sym, bl)` with `bl != 0` — consume `bl` bits from
 //!     the bitstream and emit `sym`.
-//!   * **Refill**: `bl == 0` and the entry value points to the next
-//!     tier's entry table.  Consume the tier's full peek_width bits
-//!     and descend.
-//! * Tier 1 holds a `2^11` entry table for codewords with
-//!   `10 < bl <= 21`.
-//! * Tier 2 holds a `2^(max_bl - 21)` entry table for codewords with
-//!   `bl > 21`.  Tiers with width `<= 0` are never allocated.
+//!   * **Refill**: `bl == 0` and `sym` is the **index of the next
+//!     sub-table** (within the walker's sub-table pool).  Consume the
+//!     current tier's `peek_width` bits and descend.
+//! * Tier 1 is a *family* of `2^11` entry tables — one per unique
+//!   tier-0 prefix that needs refill (per spec/12 §6 step 3:
+//!   *"allocate a new tier 1 if not seen before"*).  Each refill in
+//!   tier 0 points to its own tier-1 sub-table.
+//! * Tier 2 is similarly a family of `2^(max_bl - 21)` entry tables, one
+//!   per unique tier-1 sub-table prefix that needs refill (only when
+//!   `max_bl > 21`).
+//!
+//! This per-prefix sub-table model mirrors the binary's
+//! `tier_descriptor` array at `[this+0x18]` (spec/12 §3 / §5): each
+//! refill's `sym_or_subidx` is a *separate* descriptor index into a
+//! dynamically-grown list of `(peek_width, entry_table_ptr)` records.
+//! A single shared tier-1 table cannot work because two codewords with
+//! different tier-0 prefixes but identical tier-1 sub-prefixes would
+//! collide (e.g. G5 sym 21 `code=0x6/bl=11` and sym 22 `code=0x20/bl=11`
+//! both have `sub_code=0` after dropping their respective top-10 bits).
 //!
 //! The bit ordering is **MSB-first big-endian**: per spec/12 §4.1 the
 //! peek helper at `0x1c21923f` merges fresh bytes into the accumulator
 //! via `shl reg, 8; or reg, byte`, so the first byte read becomes the
 //! high byte.  A byte `0b1011_0000` peeked at width 4 returns `0xB`.
 //!
-//! For G4 / G5 (`max_bl = 12`) only tier 0 + a tiny tier 1 are used.
-//! For the 1100-entry MV slots (`max_bl ≈ 21`) tier 2 is never allocated
-//! because `max_bl - 21 == 0` — only tiers 0 and 1 fire.
+//! For G4 / G5 (`max_bl = 12`) only tier 0 + a small set of tier-1
+//! sub-tables are used.  For the 1100-entry MV slots (`max_bl ≈ 21`)
+//! tier 2 is never allocated because `max_bl - 21 == 0` — only tiers
+//! 0 and 1 fire.
 //!
 //! This module exposes:
 //!
@@ -54,29 +69,34 @@
 use oxideav_core::bits::BitReader;
 use oxideav_core::{Error, Result};
 
-/// One entry in a tier's lookup table.
+/// One entry in a sub-table's lookup vector.
 ///
-/// `bl != 0` ⇒ terminal: consume `bl` bits **within this tier** (the
-/// remaining bit-length below the prefix already consumed by upstream
-/// refills) and emit `sym`.
-/// `bl == 0` ⇒ refill: consume the **tier's** `peek_width` bits and
-/// descend to `next_tier` (stored in `sym` for refill entries).
+/// `bl != 0` ⇒ terminal: consume `bl` bits **within this sub-table**
+/// (the remaining bit-length below whatever prefix bits were consumed
+/// by upstream refills) and emit `sym`.
+/// `bl == 0` ⇒ refill: consume the sub-table's `peek_width` bits and
+/// descend to the sub-table indexed by `sym`.
 #[derive(Clone, Copy, Debug)]
 struct Entry {
-    /// Terminal: symbol index.  Refill: index of the next tier in
-    /// [`Walker::tiers`].
+    /// Terminal: symbol index.  Refill: index of the next sub-table in
+    /// [`Walker::sub_tables`].
     sym: u32,
-    /// Terminal: per-tier bit length to consume.  For a code of total
-    /// length `bl` placed in tier `i` after upstream refills consumed
-    /// `consumed_above` bits, this field is `bl - consumed_above`.
+    /// Terminal: per-sub-table bit length to consume.  For a code of
+    /// total length `bl` placed at depth `d` after upstream refills
+    /// consumed `consumed_above` bits, this field is `bl -
+    /// consumed_above`.
     /// Refill: zero (sentinel).
     bl: u32,
 }
 
-/// One tier of the walker — its peek width (the number of fresh bits
-/// to look at to address `entries`) and the entry table.
+/// One sub-table of the walker — its peek width (the number of fresh
+/// bits to look at to address `entries`) and the entry vector.  This
+/// mirrors one record in the binary's `tier_descriptor` array at
+/// `[this+0x18]` (spec/12 §3): an `(peek_width:u32, entry_table_ptr:u32)`
+/// pair, where the entry table holds `2^peek_width` 8-byte
+/// `(sym, bl)` records.
 #[derive(Debug)]
-struct Tier {
+struct SubTable {
     peek_width: u32,
     entries: Vec<Entry>,
 }
@@ -86,9 +106,15 @@ struct Tier {
 /// Construct via [`Walker::build`] from the source's `(code, bl)`
 /// records and the alphabet's `max_bl`.  Decode with [`Walker::decode`]
 /// against a [`BitReader`].
+///
+/// Internally the walker holds a flat pool of [`SubTable`]s.  Sub-table
+/// 0 is always tier 0 (peek width 10).  Sub-tables for tier 1 and tier
+/// 2 are appended on demand — one per unique upstream prefix that needs
+/// refill, exactly as helper B builds them in the binary
+/// (spec/12 §3 / §5: dynamic `tier_descriptor` array).
 #[derive(Debug)]
 pub struct Walker {
-    tiers: Vec<Tier>,
+    sub_tables: Vec<SubTable>,
     /// Maximum bit-length over all records — kept for diagnostics.
     pub max_bl: u32,
     /// Alphabet size (== `records.len()`) — kept so callers can
@@ -123,28 +149,33 @@ impl Walker {
         // Compute tier widths per spec/12 §2 default config.
         let tier_widths = compute_tier_widths(max_bl);
 
-        // Allocate tier entry tables; every entry starts as a refill
-        // sentinel pointing nowhere (caught later if hit).
-        let mut tiers: Vec<Tier> = tier_widths
-            .iter()
-            .map(|&w| Tier {
-                peek_width: w,
-                entries: vec![Entry { sym: 0, bl: 0 }; 1usize << w],
-            })
-            .collect();
+        // Seed sub-table 0 = tier 0.  Its `peek_width` is the tier-0
+        // width (10).  Every entry starts as `(sym=0, bl=0)`, which
+        // is the "uninitialised" sentinel — both fields zero.  A
+        // genuine refill into sub-table 0 is impossible so this can't
+        // be confused with a valid refill (refill `sym` is always
+        // ≥ 1).  A genuine bl=0 terminal is also impossible (the
+        // record would have been filtered as a hole).
+        let mut sub_tables: Vec<SubTable> = Vec::with_capacity(1);
+        sub_tables.push(SubTable {
+            peek_width: tier_widths[0],
+            entries: vec![Entry { sym: 0, bl: 0 }; 1usize << tier_widths[0]],
+        });
 
-        // Place each record into its terminal tier.  Mark the tier-0
-        // (and tier-1, if needed) prefix slot as a refill.
+        // Place each record.  Refills allocate fresh sub-tables on
+        // demand and store the new sub-table's index in the parent's
+        // refill `sym` field — mirroring spec/12 §6 step 3 "(or
+        // allocate a new tier 1 if not seen before)".
         for (sym_idx, &(code, bl)) in records.iter().enumerate() {
             if bl == 0 {
                 // Hole sentinel — never decoded, no codeword space.
                 continue;
             }
-            place_code(&mut tiers, code, bl, sym_idx as u32, &tier_widths)?;
+            place_code(&mut sub_tables, code, bl, sym_idx as u32, &tier_widths)?;
         }
 
         Ok(Self {
-            tiers,
+            sub_tables,
             max_bl,
             count: records.len(),
         })
@@ -153,25 +184,29 @@ impl Walker {
     /// Decode one symbol from `br`.  Returns the symbol index in
     /// `0..count`.
     pub fn decode(&self, br: &mut BitReader<'_>) -> Result<u32> {
-        let mut tier = 0usize;
+        // Always start at sub-table 0 (= tier 0).
+        let mut sub_idx = 0usize;
         loop {
-            let tier_ref = self.tiers.get(tier).ok_or_else(|| {
-                Error::invalid(format!("msmpeg4 walker: refill into missing tier {tier}"))
+            let sub = self.sub_tables.get(sub_idx).ok_or_else(|| {
+                Error::invalid(format!(
+                    "msmpeg4 walker: refill into missing sub-table {sub_idx}"
+                ))
             })?;
-            let w = tier_ref.peek_width;
+            let w = sub.peek_width;
             let remaining = br.bits_remaining() as u32;
-            // Peek up to w bits.  When fewer than w bits remain, pad with
-            // zeros on the right (the binary's peek helper does the same
-            // via `eof_flag`); the canonical Huffman matcher will still
-            // resolve the correct prefix because the placed entries
-            // already cover every w-bit suffix of any valid codeword.
+            // Peek up to w bits.  When fewer than w bits remain, pad
+            // with zeros on the right (the binary's peek helper does
+            // the same via `eof_flag`); the canonical Huffman matcher
+            // will still resolve the correct prefix because the placed
+            // entries already cover every w-bit suffix of any valid
+            // codeword.
             let peek_bits = w.min(remaining);
             let raw = if peek_bits == 0 {
                 0u32
             } else {
                 br.peek_u32(peek_bits)? << (w - peek_bits)
             };
-            let entry = &tier_ref.entries[raw as usize];
+            let entry = &sub.entries[raw as usize];
             if entry.bl != 0 {
                 // Terminal: consume bl bits and return.
                 br.consume(entry.bl)?;
@@ -184,7 +219,7 @@ impl Walker {
                 ));
             }
             br.consume(w)?;
-            tier = entry.sym as usize;
+            sub_idx = entry.sym as usize;
         }
     }
 }
@@ -201,21 +236,24 @@ fn compute_tier_widths(max_bl: u32) -> Vec<u32> {
     widths
 }
 
-/// Place one codeword into the appropriate tier.  Mirrors the algorithm
-/// described in spec/12 §6 "to build the walker for a slot":
+/// Place one codeword into the walker's sub-table tree.  Mirrors the
+/// algorithm described in spec/12 §6 "to build the walker for a slot",
+/// with sub-tables allocated on demand:
 ///
 /// * If `bl <= tier0_width` (= 10): place a terminal at every tier-0
 ///   slot whose top `bl` bits equal `code`.  Stored `entry.bl = bl`
 ///   (the full code length — tier 0 hasn't consumed anything else).
-/// * Else if `bl <= tier0_width + tier1_width` (= 21): mark tier 0's
-///   prefix as a refill into tier 1; place the terminal in tier 1 for
-///   the matching tier-1 sub-prefix with `entry.bl = bl - tier0_width`
-///   (per spec/12 §3 the terminal consumes the *remaining* bits — the
-///   tier-0 refill already consumed `tier0_width` bits).
-/// * Else (only when max_bl > 21): two refills then a terminal in
-///   tier 2 with `entry.bl = bl - tier0_width - tier1_width`.
+/// * Else if `bl <= tier0_width + tier1_width` (= 21): if the matching
+///   tier-0 slot is not yet a refill, allocate a fresh tier-1 sub-table
+///   and store its index in the tier-0 entry's `sym` field.  Then
+///   place the terminal in that tier-1 sub-table at the address given
+///   by the next `t1` bits of the code, with `entry.bl = bl - tier0_width`.
+/// * Else (only when `max_bl > 21`): cascade — if the matching tier-0
+///   slot has no tier-1 sub-table yet, allocate one; if that tier-1
+///   sub-table's matching slot has no tier-2 sub-table yet, allocate
+///   one; place the terminal in the tier-2 sub-table.
 fn place_code(
-    tiers: &mut [Tier],
+    sub_tables: &mut Vec<SubTable>,
     code: u32,
     bl: u32,
     sym: u32,
@@ -228,19 +266,19 @@ fn place_code(
         let span = 1u32 << (t0 - bl);
         for i in 0..span {
             let idx = (prefix | i) as usize;
-            if tiers[0].entries[idx].bl != 0 {
+            let existing = sub_tables[0].entries[idx];
+            if existing.bl != 0 {
                 return Err(Error::invalid(format!(
                     "msmpeg4 walker: tier-0 slot {idx} double-terminal (sym {sym}, code 0x{code:x}/{bl}b)"
                 )));
             }
-            // Refill marker (bl=0, sym=1) at the same slot is also bad
-            // because a terminal placement here would overwrite it.
-            if tiers[0].entries[idx].sym != 0 {
+            // Refill marker has `bl == 0` and `sym != 0`.
+            if existing.sym != 0 {
                 return Err(Error::invalid(format!(
                     "msmpeg4 walker: tier-0 slot {idx} already a refill, can't place terminal sym {sym}"
                 )));
             }
-            tiers[0].entries[idx] = Entry { sym, bl };
+            sub_tables[0].entries[idx] = Entry { sym, bl };
         }
         return Ok(());
     }
@@ -255,32 +293,32 @@ fn place_code(
     let tier0_prefix = (code >> (bl - t0)) as usize;
 
     if bl <= t0 + t1 {
-        // Mark tier-0 entry as refill into tier 1.  Multiple long codes
-        // can share the same tier-0 prefix; the refill is idempotent.
-        let existing = tiers[0].entries[tier0_prefix];
-        if existing.bl != 0 {
-            return Err(Error::invalid(format!(
-                "msmpeg4 walker: tier-0 prefix {tier0_prefix} already terminal but bl {bl} code wants to refill"
-            )));
-        }
-        tiers[0].entries[tier0_prefix] = Entry { sym: 1, bl: 0 };
+        // Locate (or allocate) the tier-1 sub-table for this tier-0
+        // prefix.
+        let tier1_idx = ensure_child_subtable(sub_tables, 0, tier0_prefix, t1, code, bl)?;
 
-        // Place terminal in tier 1.  Address: next `t1` bits of the
-        // code below the tier-0 prefix.  The terminal consumes
-        // `bl - t0` bits at this tier (per spec/12 §3 — the per-tier
-        // remaining length).
+        // Place terminal in the tier-1 sub-table.  Address: next `t1`
+        // bits of the code below the tier-0 prefix.  The terminal
+        // consumes `bl - t0` bits at this tier (per spec/12 §3 — the
+        // per-tier remaining length).
         let bits_under_t0 = bl - t0;
         let sub_code = code & ((1u32 << bits_under_t0) - 1);
-        let tier1_prefix = sub_code << (t1 - bits_under_t0);
+        let slot_prefix = sub_code << (t1 - bits_under_t0);
         let span = 1u32 << (t1 - bits_under_t0);
         for i in 0..span {
-            let idx = (tier1_prefix | i) as usize;
-            if tiers[1].entries[idx].bl != 0 {
+            let idx = (slot_prefix | i) as usize;
+            let existing = sub_tables[tier1_idx].entries[idx];
+            if existing.bl != 0 {
                 return Err(Error::invalid(format!(
                     "msmpeg4 walker: tier-1 slot {idx} double-terminal (sym {sym}, code 0x{code:x}/{bl}b)"
                 )));
             }
-            tiers[1].entries[idx] = Entry {
+            if existing.sym != 0 {
+                return Err(Error::invalid(format!(
+                    "msmpeg4 walker: tier-1 slot {idx} already a refill, can't place terminal sym {sym}"
+                )));
+            }
+            sub_tables[tier1_idx].entries[idx] = Entry {
                 sym,
                 bl: bits_under_t0,
             };
@@ -297,48 +335,80 @@ fn place_code(
     }
     let t2 = tier_widths[2];
 
-    // Tier 0 → refill into tier 1.
-    {
-        let existing = tiers[0].entries[tier0_prefix];
-        if existing.bl != 0 {
-            return Err(Error::invalid(format!(
-                "msmpeg4 walker: tier-0 prefix {tier0_prefix} clash for bl {bl}"
-            )));
-        }
-        tiers[0].entries[tier0_prefix] = Entry { sym: 1, bl: 0 };
-    }
+    // Allocate tier-1 sub-table for this tier-0 prefix if needed.
+    let tier1_idx = ensure_child_subtable(sub_tables, 0, tier0_prefix, t1, code, bl)?;
 
-    // Tier 1 → refill into tier 2.  The tier-1 address is the next t1
-    // bits of the code below the tier-0 prefix.
+    // Tier-1 address is the next t1 bits of the code below the tier-0
+    // prefix.
     let tier1_prefix = ((code >> (bl - t0 - t1)) & ((1u32 << t1) - 1)) as usize;
-    {
-        let existing = tiers[1].entries[tier1_prefix];
-        if existing.bl != 0 {
-            return Err(Error::invalid(format!(
-                "msmpeg4 walker: tier-1 prefix {tier1_prefix} clash for bl {bl}"
-            )));
-        }
-        tiers[1].entries[tier1_prefix] = Entry { sym: 2, bl: 0 };
-    }
+
+    // Allocate tier-2 sub-table for this tier-1 prefix if needed.
+    let tier2_idx = ensure_child_subtable(sub_tables, tier1_idx, tier1_prefix, t2, code, bl)?;
 
     // Tier 2 terminal — per-tier remaining bit length is bl - t0 - t1.
     let bits_under_t01 = bl - t0 - t1;
     let sub_code = code & ((1u32 << bits_under_t01) - 1);
-    let tier2_prefix = sub_code << (t2 - bits_under_t01);
+    let slot_prefix = sub_code << (t2 - bits_under_t01);
     let span = 1u32 << (t2 - bits_under_t01);
     for i in 0..span {
-        let idx = (tier2_prefix | i) as usize;
-        if tiers[2].entries[idx].bl != 0 {
+        let idx = (slot_prefix | i) as usize;
+        let existing = sub_tables[tier2_idx].entries[idx];
+        if existing.bl != 0 {
             return Err(Error::invalid(format!(
                 "msmpeg4 walker: tier-2 slot {idx} double-terminal (sym {sym}, code 0x{code:x}/{bl}b)"
             )));
         }
-        tiers[2].entries[idx] = Entry {
+        if existing.sym != 0 {
+            return Err(Error::invalid(format!(
+                "msmpeg4 walker: tier-2 slot {idx} already a refill, can't place terminal sym {sym}"
+            )));
+        }
+        sub_tables[tier2_idx].entries[idx] = Entry {
             sym,
             bl: bits_under_t01,
         };
     }
     Ok(())
+}
+
+/// Look up the parent's slot at `parent_slot` and either return the
+/// already-allocated child sub-table index (if the slot is already a
+/// refill) or allocate a fresh child sub-table with `child_width` and
+/// wire the parent slot to it.
+///
+/// Per spec/12 §6 step 3: *"or allocate a new tier 1 if not seen
+/// before"*.  This is the dynamic-allocation step that matches the
+/// binary's `tier_descriptor` growth at `[this+0x18]` (spec/12 §3 / §5).
+fn ensure_child_subtable(
+    sub_tables: &mut Vec<SubTable>,
+    parent_idx: usize,
+    parent_slot: usize,
+    child_width: u32,
+    code: u32,
+    bl: u32,
+) -> Result<usize> {
+    let existing = sub_tables[parent_idx].entries[parent_slot];
+    if existing.bl != 0 {
+        // Slot is already a terminal — can't refill through it.
+        return Err(Error::invalid(format!(
+            "msmpeg4 walker: parent sub-table {parent_idx} slot {parent_slot} already terminal but bl {bl} code 0x{code:x} wants to refill"
+        )));
+    }
+    if existing.sym != 0 {
+        // Slot is already a refill into a previously-allocated child.
+        return Ok(existing.sym as usize);
+    }
+    // Allocate a fresh child sub-table.
+    let new_idx = sub_tables.len();
+    sub_tables.push(SubTable {
+        peek_width: child_width,
+        entries: vec![Entry { sym: 0, bl: 0 }; 1usize << child_width],
+    });
+    sub_tables[parent_idx].entries[parent_slot] = Entry {
+        sym: new_idx as u32,
+        bl: 0,
+    };
+    Ok(new_idx)
 }
 
 #[cfg(test)]
@@ -454,6 +524,30 @@ mod tests {
     /// G4/G5 tables directly.
     fn swap_to_code_bl(raw: &[(u32, u32)]) -> Vec<(u32, u32)> {
         raw.iter().map(|&(bl, code)| (code, bl)).collect()
+    }
+
+    #[test]
+    fn distinct_tier0_prefixes_get_separate_tier1_subtables() {
+        // Regression for the round-31 phase-2 bug: two bl=11 codewords
+        // with different tier-0 prefixes but identical tier-1
+        // sub-prefixes must NOT collide.  In the broken single-shared-
+        // tier-1 model, codewords like G5 sym 21 (`code=0x6/bl=11`,
+        // tier-0 prefix `0x3`) and sym 22 (`code=0x20/bl=11`, tier-0
+        // prefix `0x10`) — both with `sub_code = 0` after dropping
+        // their respective top 10 bits — would clash on tier-1 slot 0.
+        // Per spec/12 §6 step 3 ("allocate a new tier 1 if not seen
+        // before") each unique tier-0 prefix must own its own tier-1
+        // sub-table.
+        let records = [
+            (0b00000000110u32, 11u32), // sym 0: tier-0 prefix 0x3, sub_code=0
+            (0b10000000000u32, 11u32), // sym 1: tier-0 prefix 0x10, sub_code=0
+        ];
+        let walker = Walker::build(&records).expect("two-prefix walker");
+        for (sym, &(code, bl)) in records.iter().enumerate() {
+            let bytes = pack(&[(code, bl)]);
+            let mut br = BitReader::new(&bytes);
+            assert_eq!(walker.decode(&mut br).unwrap(), sym as u32);
+        }
     }
 
     #[test]
