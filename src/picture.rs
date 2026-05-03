@@ -236,15 +236,17 @@ pub fn decode_picture_with_ac(
                      to feed packets in decode order starting with an I-frame.",
                 )
             })?;
-            if hdr.mv_table_sel != 0 {
-                return Err(Error::unsupported(
-                    "msmpeg4v3: P-frame mv_table_sel = 1 (alternate MV VLC \
-                     at VMA 0x1c25a0b8) not supported — only a 256-byte \
-                     extraction dump is available. See \
-                     docs/video/msmpeg4/tables/region_0594b8.meta for the \
-                     truncation note.",
-                ));
-            }
+            // Round 32 piece 3: per-frame `mv_table_sel` bit is now
+            // threaded through `decode_pframe` → `decode_pframe_mb`
+            // → `decode_mv_with_table`. The alternate variant (sel=1)
+            // is still a placeholder (extraction blocker — see
+            // [`crate::mv::MvTable::Alternate`] doc), but the
+            // unsupported error now fires from the MV decode site
+            // with full diagnostic instead of the early picture-
+            // header reject. This makes the failure observable per
+            // P-frame instead of per-packet, and lets all the
+            // mv_table_sel=0 P-frames between two sel=1 ones still
+            // decode normally.
             decode_pframe(br, dims, &hdr, reference, ac_selection)
         }
     }
@@ -418,6 +420,16 @@ fn decode_pframe(
     // spec/06 §3.4 (boundary zero-out).
     let mut mv_grid: Vec<Option<crate::mv::Mv>> = vec![None; mb_w * mb_h];
 
+    // Spec/06 §2.1: per-frame `mv_table_sel` ∈ {0, 1} picks between
+    // the default and alternate v3 MV VLC sources. Default is fully
+    // wired; alternate is a placeholder until the extraction lands
+    // (see [`crate::mv::MvTable::Alternate`] doc).
+    let mv_table = if hdr.mv_table_sel == 0 {
+        crate::mv::MvTable::Default
+    } else {
+        crate::mv::MvTable::Alternate
+    };
+
     for my in 0..mb_h {
         for mx in 0..mb_w {
             decode_pframe_mb(
@@ -433,6 +445,7 @@ fn decode_pframe(
                 hdr.dc_size_sel,
                 &luma_ac,
                 &chroma_ac,
+                mv_table,
             )?;
         }
     }
@@ -456,6 +469,7 @@ fn decode_pframe_mb(
     dc_size_sel: u8,
     luma_ac: &AcVlcTable,
     chroma_ac: &AcVlcTable,
+    mv_table: crate::mv::MvTable,
 ) -> Result<()> {
     use crate::mcbpcy::{decode_mcbpcy_pframe, PFrameMcbpcy};
 
@@ -523,8 +537,13 @@ fn decode_pframe_mb(
     }
 
     // Inter MB: decode the joint MV VLC using the median predictor.
+    // The `mv_table` selector threads the picture-header
+    // `mv_table_sel` bit through to the MV decoder; sel=1 currently
+    // routes to a placeholder that returns Error::Unsupported with
+    // the extractor-blocker diagnostic (see
+    // `crate::mv::MvTable::Alternate`).
     let predictor = crate::mv::median_predictor(left, top, top_right);
-    let mv = crate::mv::decode_mv(br, predictor)?;
+    let mv = crate::mv::decode_mv_with_table(br, predictor, mv_table)?;
     mv_grid[mb_idx] = Some(mv);
 
     apply_mc_to_mb(pic, reference, mb_x, mb_y, (mv.x as i32, mv.y as i32));
@@ -1235,8 +1254,14 @@ mod tests {
         assert_eq!(pic.cr, reference.cr, "Cr plane should equal reference");
     }
 
+    /// Round 32 piece 3: an all-skip P-frame with `mv_table_sel = 1`
+    /// must NOT error at the picture-header dispatch (the previous
+    /// behaviour) — every MB is skipped so the alternate-MV path is
+    /// never reached and the picture decodes normally. This pins the
+    /// "fail at first inter MB, not at picture entry" semantic that
+    /// piece 3 wires.
     #[test]
-    fn pframe_rejects_alternate_mv_table() {
+    fn pframe_alternate_mv_table_with_all_skip_decodes() {
         use oxideav_core::bits::BitReader;
 
         fn pack(fields: &[(u32, u32)]) -> Vec<u8> {
@@ -1262,23 +1287,108 @@ mod tests {
 
         let dims = PictureDims::new(16, 16).unwrap();
         let reference = Picture::alloc(dims, PictureType::I);
-        // P-frame with mv_table_sel = 1 (alternate) — should be rejected.
+        // P-frame with mv_table_sel = 1, single MB skipped.
         let fields: Vec<(u32, u32)> = vec![
             (1, 2), // P
             (8, 5), // quant
             (0, 1), // ac_chroma_sel
             (0, 1), // dc_size_sel
-            (1, 1), // mv_table_sel = 1
+            (1, 1), // mv_table_sel = 1 (alternate)
+            (1, 1), // skip = 1 → no MV decode for this MB
+            (0, 16),
+        ];
+        let bytes = pack(&fields);
+        let mut br = BitReader::new(&bytes);
+        // Should succeed: alternate-MV path is never reached.
+        decode_picture(&mut br, dims, Some(&reference))
+            .expect("all-skip P-frame with mv_table_sel=1 must decode (alt MV not exercised)");
+    }
+
+    /// Round 32 piece 3: when `mv_table_sel = 1` AND the P-frame has
+    /// at least one inter (non-skipped) MB, the MV decoder fires the
+    /// extractor-blocker diagnostic from `crate::mv::MvTable::Alternate`.
+    /// Verifies the full diagnostic content so callers can grep for
+    /// the actionable extraction file path.
+    #[test]
+    fn pframe_alternate_mv_table_inter_mb_errors_with_diagnostic() {
+        use oxideav_core::bits::BitReader;
+
+        fn pack(fields: &[(u32, u32)]) -> Vec<u8> {
+            let mut out: Vec<u8> = Vec::new();
+            let mut acc: u64 = 0;
+            let mut bits: u32 = 0;
+            for (v, w) in fields {
+                let mask = if *w == 32 { u32::MAX } else { (1u32 << w) - 1 };
+                acc = (acc << w) | ((*v & mask) as u64);
+                bits += w;
+                while bits >= 8 {
+                    let shift = bits - 8;
+                    out.push(((acc >> shift) & 0xff) as u8);
+                    acc &= (1u64 << shift) - 1;
+                    bits -= 8;
+                }
+            }
+            if bits > 0 {
+                out.push(((acc << (8 - bits)) & 0xff) as u8);
+            }
+            out
+        }
+
+        // Reuse the inter-MB MCBPCY symbol-0 build from
+        // `handcrafted_inter_mb_copies_reference` — the canonical
+        // MCBPCY bit-length / code for sym 0 (CBP=0, inter).
+        let t_mcbpcy = {
+            let mut syms: Vec<(u32, u8)> = crate::tables_data::MCBPCY_V3_RAW
+                .iter()
+                .enumerate()
+                .filter_map(|(i, &(bl, _))| if bl == 0 { None } else { Some((bl, i as u8)) })
+                .collect();
+            syms.sort_by_key(|&(bl, idx)| (bl, idx));
+            let mut entries: Vec<(u8, u32, u8)> = Vec::new();
+            let mut code: u32 = 0;
+            let mut prev_bl: u32 = 0;
+            for (i, &(bl, idx)) in syms.iter().enumerate() {
+                if i == 0 {
+                    code = 0;
+                } else {
+                    code = (code + 1) << (bl - prev_bl);
+                }
+                entries.push((bl as u8, code, idx));
+                prev_bl = bl;
+            }
+            entries
+        };
+        let (bl_sym0, code_sym0) = t_mcbpcy
+            .iter()
+            .find(|(_, _, sym)| *sym == 0)
+            .map(|(bl, code, _)| (*bl as u32, *code))
+            .expect("symbol 0 in canonical MCBPCY");
+
+        let dims = PictureDims::new(16, 16).unwrap();
+        let reference = Picture::alloc(dims, PictureType::I);
+        // P-frame: mv_table_sel = 1, single inter MB (no skip).
+        let fields: Vec<(u32, u32)> = vec![
+            (1, 2),               // P
+            (8, 5),               // quant
+            (0, 1),               // ac_chroma_sel
+            (0, 1),               // dc_size_sel
+            (1, 1),               // mv_table_sel = 1 (alternate)
+            (0, 1),               // skip = 0 (will reach MV decode)
+            (code_sym0, bl_sym0), // MCBPCY sym 0 (inter, CBP=0)
+            (0, 1),               // ac_pred (ignored for inter)
+            (0, 32),              // padding for the MV decoder to read
         ];
         let bytes = pack(&fields);
         let mut br = BitReader::new(&bytes);
         let err = decode_picture(&mut br, dims, Some(&reference)).unwrap_err();
         let msg = format!("{err}");
         assert!(
-            msg.contains("mv_table_sel")
-                || msg.contains("alternate MV VLC")
-                || msg.contains("0x1c25a0b8"),
-            "expected alternate-MV-table unsupported error; got: {msg}"
+            msg.contains("mv_table_sel=1") || msg.contains("0x1c25a0b8"),
+            "expected alternate-MV diagnostic; got: {msg}"
+        );
+        assert!(
+            msg.contains("region_0594b8"),
+            "diagnostic must cite the extraction-blocker file (region_0594b8); got: {msg}"
         );
     }
 

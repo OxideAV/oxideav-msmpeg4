@@ -34,11 +34,27 @@
 //! # Alphabet variant selection
 //!
 //! MSMPEG4 v3 has two MV VLC tables selected by the per-P-frame
-//! `mv_table_sel` bit (`[esi+0x834]`). This crate currently carries
-//! **only the default variant (selector 0)**; the alternate (selector
-//! 1, VMA `0x1c25a0b8`) has only a 256-byte extraction dump available
-//! and is not yet usable. Streams with `mv_table_sel == 1` are rejected
-//! with [`oxideav_core::Error::Unsupported`].
+//! `mv_table_sel` bit (`[esi+0x834]`):
+//!
+//! | `mv_table_sel` | VLC source VMA   | MVDx LUT    | MVDy LUT    | Status |
+//! | -------------- | ---------------- | ----------- | ----------- | ------ |
+//! | 0 (default)    | `0x1c25cbc0`     | `0x1c25ee28`| `0x1c25f278`| **wired** ([`MvTable::Default`]) |
+//! | 1 (alternate)  | `0x1c25a0b8`     | `0x1c25c320`| `0x1c25c770`| placeholder ([`MvTable::Alternate`]) |
+//!
+//! [`MvTable::Alternate`] is not yet usable because only a 256-byte
+//! extraction dump is available for the VLC source at `0x1c25a0b8`
+//! (per `docs/video/msmpeg4/tables/region_0594b8.meta`: `note: 256
+//! bytes is an over-dump; real table may be shorter` /
+//! `likely_interpretation: u8_scan_plausible`). The full ~8 KB
+//! 1099-entry packed-Huffman source has not been re-extracted, and
+//! the `(MVDx, MVDy)` byte LUTs at `0x1c25c320` / `0x1c25c770` have
+//! not been extracted at all. Until both land, [`decode_mv`] called
+//! with [`MvTable::Alternate`] returns the actionable
+//! [`Error::Unsupported`] diagnostic. Streams that use the alternate
+//! table include div3.avi frames 37/38/40 and div4.avi frames 1/16
+//! per `memory/project_msmpeg4_runtime_binding_clues.md` §2.1; the
+//! reject is the cause of div4.avi's `first_diverge=1` (the very
+//! first P-frame).
 
 use oxideav_core::bits::BitReader;
 use oxideav_core::{Error, Result};
@@ -47,6 +63,29 @@ use crate::tables_data::{
     MVDX_V3_BYTES, MVDY_V3_BYTES, MV_V1_V2_BIAS, MV_V1_V2_RAW, MV_V3_ESC_INDEX, MV_V3_RAW,
 };
 use crate::vlc::{self, VlcEntry};
+
+/// Per-frame MV VLC variant selector. The picture-header
+/// `mv_table_sel` bit picks one of two MV VLC sources for v3 P-frames
+/// (see module-level table). Only the default variant has a
+/// fully-extracted source today; the alternate is a placeholder.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MvTable {
+    /// Default variant — VLC source at file `0x5bfc0` / VMA
+    /// `0x1c25cbc0` with byte LUTs at `0x1c25ee28` / `0x1c25f278`.
+    /// Wired through [`MV_V3_RAW`] / [`MVDX_V3_BYTES`] /
+    /// [`MVDY_V3_BYTES`].
+    #[default]
+    Default,
+    /// Alternate variant — VLC source candidate at file `0x594b8` /
+    /// VMA `0x1c25a0b8`, byte LUTs at `0x1c25c320` / `0x1c25c770`.
+    /// Currently a placeholder: only a 256-byte over-dump of the VLC
+    /// source exists (per `tables/region_0594b8.meta`), the byte LUTs
+    /// are not extracted, and the per-G-table packed-Huffman →
+    /// runtime constructor is not yet disassembled. [`decode_mv`]
+    /// with this variant returns [`Error::Unsupported`] with an
+    /// actionable extractor-blocker diagnostic.
+    Alternate,
+}
 
 /// Lazy-built canonical-Huffman table for the v3 MV VLC default variant.
 /// 1100 symbols (indices 0..=1099); index 1099 is the ESC sentinel.
@@ -129,7 +168,51 @@ pub fn median_predictor(left: Option<Mv>, top: Option<Mv>, top_right: Option<Mv>
 ///
 /// Returns the final `(MVx, MVy)` byte-pair ready to store in the
 /// MB-info row.
+///
+/// This variant uses the **default** v3 MV VLC ([`MvTable::Default`]).
+/// For per-frame dispatch from the picture-header `mv_table_sel` bit
+/// use [`decode_mv_with_table`].
 pub fn decode_mv(br: &mut BitReader<'_>, predictor: Mv) -> Result<Mv> {
+    decode_mv_with_table(br, predictor, MvTable::Default)
+}
+
+/// Variant of [`decode_mv`] with explicit MV-VLC selection. The v3
+/// picture decoder threads the per-frame `mv_table_sel` bit through
+/// here so streams with `mv_table_sel == 1` route to
+/// [`MvTable::Alternate`] instead of being rejected at picture
+/// dispatch time. The Alternate path is currently a placeholder that
+/// returns [`Error::Unsupported`] with the extractor-blocker
+/// diagnostic — the dispatch is wired so when the alternate-VLC
+/// extraction lands the swap is local to this function.
+pub fn decode_mv_with_table(
+    br: &mut BitReader<'_>,
+    predictor: Mv,
+    mv_table: MvTable,
+) -> Result<Mv> {
+    match mv_table {
+        MvTable::Default => decode_mv_default(br, predictor),
+        MvTable::Alternate => Err(Error::unsupported(
+            "msmpeg4v3 mv: alternate MV VLC (mv_table_sel=1, source VMA \
+             0x1c25a0b8) is not yet wired. The available extraction at \
+             docs/video/msmpeg4/tables/region_0594b8 is a 256-byte \
+             over-dump (likely_interpretation: u8_scan_plausible per the \
+             meta file) — the full ~8 KB 1099-entry packed-Huffman \
+             source has not been re-extracted, and the alternate \
+             (MVDx, MVDy) byte LUTs at VMAs 0x1c25c320 / 0x1c25c770 \
+             have not been extracted at all. To unblock: re-dump the \
+             three regions at full size and re-resolve their packed-\
+             Huffman record format, then swap the placeholder body in \
+             mv::decode_mv_with_table for the same canonical-Huffman \
+             builder pattern as decode_mv_default. Affected fixtures \
+             per memory/project_msmpeg4_runtime_binding_clues.md §2.1: \
+             div3.avi frames 37/38/40, div4.avi frames 1/16.",
+        )),
+    }
+}
+
+/// Internal: the default-variant decode body, factored out so
+/// [`decode_mv_with_table`] can dispatch on the `MvTable` selector.
+fn decode_mv_default(br: &mut BitReader<'_>, predictor: Mv) -> Result<Mv> {
     let idx = vlc::decode(br, table())? as usize;
 
     let (raw_x, raw_y) = if idx == MV_V3_ESC_INDEX {
@@ -585,5 +668,54 @@ mod tests {
         assert_eq!(out.x, 8);
         // raw_y = 24, predictor 0 → 24 - 32 = -8, no wrap needed.
         assert_eq!(out.y, -8);
+    }
+
+    /// Round 32 piece 3: [`MvTable::Default`] is wired,
+    /// [`MvTable::Alternate`] is a placeholder that returns
+    /// [`Error::Unsupported`] with the actionable extractor-blocker
+    /// diagnostic. Pin the diagnostic content so any future drift in
+    /// the message gets caught — and so that when extraction lands and
+    /// the placeholder body is swapped, the test breaks loudly.
+    #[test]
+    fn mv_table_alternate_is_unsupported_with_diagnostic() {
+        let data = [0xffu8; 8]; // arbitrary; never read because the dispatch errors first.
+        let mut br = BitReader::new(&data);
+        let err = decode_mv_with_table(&mut br, Mv::default(), MvTable::Alternate).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("mv_table_sel=1"),
+            "diagnostic must reference the picture-header field; got: {msg}"
+        );
+        assert!(
+            msg.contains("0x1c25a0b8"),
+            "diagnostic must cite the alternate-VLC source VMA; got: {msg}"
+        );
+        assert!(
+            msg.contains("region_0594b8"),
+            "diagnostic must cite the truncated extraction file; got: {msg}"
+        );
+        assert!(
+            msg.contains("0x1c25c320") && msg.contains("0x1c25c770"),
+            "diagnostic must cite the alternate (MVDx, MVDy) byte LUT VMAs (so re-extraction \
+             knows what to dump); got: {msg}"
+        );
+    }
+
+    /// [`MvTable::Default`] decodes the default MV VLC bit-for-bit
+    /// identically to [`decode_mv`] (which is just a thin wrapper).
+    /// Sanity check that the new dispatch path doesn't drift.
+    #[test]
+    fn mv_table_default_matches_decode_mv() {
+        let data = [0x00u8, 0x00, 0x00];
+        let mut br1 = BitReader::new(&data);
+        let mut br2 = BitReader::new(&data);
+        let a = decode_mv(&mut br1, Mv::default()).unwrap();
+        let b = decode_mv_with_table(&mut br2, Mv::default(), MvTable::Default).unwrap();
+        assert_eq!(a, b, "default-table dispatch must match plain decode_mv");
+        assert_eq!(
+            br1.bit_position(),
+            br2.bit_position(),
+            "bit consumption must match"
+        );
     }
 }
