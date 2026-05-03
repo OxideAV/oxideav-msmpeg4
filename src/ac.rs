@@ -792,6 +792,7 @@ pub fn decode_intra_block(
 }
 
 #[cfg(test)]
+#[allow(clippy::needless_range_loop, clippy::bool_assert_comparison)]
 mod tests {
     use super::*;
 
