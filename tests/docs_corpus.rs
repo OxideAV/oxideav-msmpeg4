@@ -234,7 +234,8 @@ fn decode_fixture(case: &CorpusCase) -> Option<Vec<FrameOutcome>> {
     let tag = CodecTag::fourcc(&fourcc);
     let ctx = ProbeContext::new(&tag).packet(&chunks[0]);
     let resolved = CodecResolver::resolve_tag(&reg, &ctx);
-    if resolved.map(|c| c.as_str().to_string()).as_deref() != Some(cid_str) {
+    let resolved_id = resolved.as_ref().map(|c| c.as_str().to_string());
+    if resolved_id.as_deref() != Some(cid_str) {
         eprintln!(
             "warn {}: registry resolved {:?} as {:?} but classify picked {cid_str}",
             case.name, fourcc, resolved
@@ -287,13 +288,13 @@ fn decode_fixture(case: &CorpusCase) -> Option<Vec<FrameOutcome>> {
         loop {
             match dec.receive_frame() {
                 Ok(Frame::Video(vf)) => {
-                    if visible_idx >= case.n_frames || frame_size * (visible_idx + 1) > yuv_ref.len() {
+                    if visible_idx >= case.n_frames
+                        || frame_size * (visible_idx + 1) > yuv_ref.len()
+                    {
                         // More visible frames than reference — record but skip diff.
                         outcomes.push(FrameOutcome {
                             diff: None,
-                            err: Some(format!(
-                                "visible {visible_idx}: out of reference range"
-                            )),
+                            err: Some(format!("visible {visible_idx}: out of reference range")),
                         });
                         visible_idx += 1;
                         continue;
@@ -363,9 +364,13 @@ fn evaluate(case: &CorpusCase) {
             eprintln!(
                 "  frame {i}: Y match {:.2}% / PSNR {:.2} dB (max diff {}); \
                  U match {:.2}% / PSNR {:.2} dB; V match {:.2}% / PSNR {:.2} dB",
-                dy.match_pct(), psnr_y, dy.max_abs_diff,
-                du.match_pct(), psnr_u,
-                dv.match_pct(), psnr_v,
+                dy.match_pct(),
+                psnr_y,
+                dy.max_abs_diff,
+                du.match_pct(),
+                psnr_u,
+                dv.match_pct(),
+                psnr_v,
             );
             agg_y.merge(dy);
             agg_u.merge(du);

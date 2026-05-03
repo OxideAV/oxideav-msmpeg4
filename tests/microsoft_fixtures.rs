@@ -229,7 +229,11 @@ fn fetch_fixture(fix: &Fixture) -> Option<Vec<u8>> {
     }
     let tmp = path.with_extension("tmp");
     if let Err(e) = fs::write(&tmp, &buf).and_then(|_| fs::rename(&tmp, &path)) {
-        eprintln!("[{}] cache write to {} failed ({e})", fix.name, path.display());
+        eprintln!(
+            "[{}] cache write to {} failed ({e})",
+            fix.name,
+            path.display()
+        );
     } else {
         eprintln!("[{}] cached at {}", fix.name, path.display());
     }
@@ -452,11 +456,7 @@ struct FrameOutcome {
 /// Run the registry-driven decoder against the per-frame `00dc` chunks
 /// and diff each visible frame against the `width × height × 1.5`
 /// stride-packed YUV420p reference.
-fn decode_and_compare(
-    fix: &Fixture,
-    avi_bytes: &[u8],
-    yuv_ref: &[u8],
-) -> Vec<FrameOutcome> {
+fn decode_and_compare(fix: &Fixture, avi_bytes: &[u8], yuv_ref: &[u8]) -> Vec<FrameOutcome> {
     let chunks = all_video_chunks(avi_bytes);
     if chunks.is_empty() {
         return vec![FrameOutcome {
@@ -535,14 +535,11 @@ fn decode_and_compare(
         loop {
             match dec.receive_frame() {
                 Ok(Frame::Video(vf)) => {
-                    if visible_idx >= fix.n_frames
-                        || frame_size * (visible_idx + 1) > yuv_ref.len()
+                    if visible_idx >= fix.n_frames || frame_size * (visible_idx + 1) > yuv_ref.len()
                     {
                         outcomes.push(FrameOutcome {
                             diff: None,
-                            err: Some(format!(
-                                "visible {visible_idx}: out of reference range"
-                            )),
+                            err: Some(format!("visible {visible_idx}: out of reference range")),
                         });
                         visible_idx += 1;
                         continue;
@@ -562,7 +559,8 @@ fn decode_and_compare(
                         visible_idx += 1;
                         continue;
                     }
-                    let dy = diff_plane_strided(&vf.planes[0].data, vf.planes[0].stride, ref_y, w, h);
+                    let dy =
+                        diff_plane_strided(&vf.planes[0].data, vf.planes[0].stride, ref_y, w, h);
                     let du =
                         diff_plane_strided(&vf.planes[1].data, vf.planes[1].stride, ref_u, cw, ch);
                     let dv =
@@ -612,9 +610,13 @@ fn evaluate_outcomes(fix: &Fixture, outcomes: &[FrameOutcome]) {
                     "  [{}] frame {i}: Y match {:.2}% / PSNR {:.2} dB (max diff {}); \
                      U {:.2}%/{:.2} dB; V {:.2}%/{:.2} dB",
                     fix.name,
-                    dy.match_pct(), dy.psnr_db(), dy.max_abs_diff,
-                    du.match_pct(), du.psnr_db(),
-                    dv.match_pct(), dv.psnr_db(),
+                    dy.match_pct(),
+                    dy.psnr_db(),
+                    dy.max_abs_diff,
+                    du.match_pct(),
+                    du.psnr_db(),
+                    dv.match_pct(),
+                    dv.psnr_db(),
                 );
             }
             if first_diverge.is_none() && dy.match_pct() < 99.0 {
@@ -651,7 +653,10 @@ fn evaluate_outcomes(fix: &Fixture, outcomes: &[FrameOutcome]) {
 
 /// Run one fixture end-to-end, fetching + remuxing as needed.
 fn run_fixture(fix: &Fixture) {
-    eprintln!("=== {} ({}x{}, {} frames) ===", fix.name, fix.width, fix.height, fix.n_frames);
+    eprintln!(
+        "=== {} ({}x{}, {} frames) ===",
+        fix.name, fix.width, fix.height, fix.n_frames
+    );
 
     // 1. Fetch (or load from cache).
     let raw = match fetch_fixture(fix) {
