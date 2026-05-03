@@ -157,15 +157,40 @@ pub fn decode_picture(
 /// `docs/video/msmpeg4/spec/11-walker-format-resolved.md`. G5 is now the
 /// shipping default — the placeholder and 64-entry candidate are kept as
 /// alternative selectors for pipeline tests and historical compatibility.
+///
+/// Round 32 (2026-05-03) adds [`AcSelection::FromHeader`] — the
+/// dispatch path that actually consults the per-frame
+/// `hdr.ac_chroma_sel` / `hdr.ac_luma_sel` selector bits from
+/// [`MsV3PictureHeader`] and routes each (luma, chroma) block pair to
+/// the correct G-family per spec/14 §3.1. This is the production
+/// default for real-content decode; the G5 / Placeholder / Candidate
+/// variants remain available for hand-crafted synthetic streams.
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AcSelection {
+    /// Per-frame dispatch from the picture-header selector bits.
+    /// Resolves each block to one of {G0..G5} by mapping
+    /// `hdr.ac_luma_sel` ∈ {0,1,2} → {G3, G1, G5} (luma) and
+    /// `hdr.ac_chroma_sel` ∈ {0,1,2} → {G2, G0, G4} (chroma) per
+    /// spec/14 §3.1. **G0..G3 fall back to DC-only reconstruction**
+    /// today because their packed-Huffman bit-length sources have not
+    /// been extracted (the candidate input regions at file offsets
+    /// `0x57a30 / 0x57f80 / 0x58558 / 0x58a08` are flagged "suspect"
+    /// in their meta files; only the `(idx → (run, level, last))`
+    /// enumerations are present, in `crate::g_enum`). When those
+    /// extractions land, swap [`luma_ac_table_for`] /
+    /// [`chroma_ac_table_for`]'s G0..G3 placeholder branches for real
+    /// `AcVlcTable::v3_intra_g{0,1,2,3}()` constructors and the
+    /// dispatch infrastructure is already in place.
+    #[default]
+    FromHeader,
     /// Real G5 primary VLC built from the packed-Huffman source at file
     /// `0x59178` / VMA `0x1c259d78` (102 + 1 ESC entries) wired through
     /// [`AcVlcTable::v3_intra_g5`]. The post-VLC `(idx → (last, run,
     /// |level|))` mapping is the G5 descriptor from
-    /// [`crate::g_descriptor::g5_decode`] (round 18/19). This is the
-    /// shipping default for v3 intra blocks.
-    #[default]
+    /// [`crate::g_descriptor::g5_decode`] (round 18/19). Hard-wired
+    /// luma=G5, chroma=G4 path — useful for pre-round-32 regression
+    /// comparison and tests that hand-craft a stream with `ac_luma_sel
+    /// = 2`, `ac_chroma_sel = 2` selector bits.
     G5,
     /// Empty placeholder: when a coded block is encountered, the
     /// decoder falls back to DC-only reconstruction. Retained as an
@@ -225,11 +250,30 @@ pub fn decode_picture_with_ac(
 
 /// Resolve the picture decoder's [`AcSelection`] into the **luma**
 /// intra-AC table (blocks 0..=3 of an MB). Per
-/// `docs/video/msmpeg4/spec/99-current-understanding.md` §5 / §5.2,
-/// luma uses slot `[esi+0xab4]` (G3/G1/G5 selected by `[esi+0xad4]`);
-/// G5 is the v1/v2 default and the production-ready choice for v3.
-fn luma_ac_table_for(selection: AcSelection) -> AcVlcTable {
+/// `docs/video/msmpeg4/spec/99-current-understanding.md` §5 / §5.2 and
+/// spec/14 §3.1, luma uses slot `[esi+0xab4]`. The picture-header
+/// `ac_luma_sel` ∈ {0, 1, 2} field selects between {G3, G1, G5}
+/// respectively. G5 is the v1/v2 default and the only G-family with a
+/// fully-extracted packed-Huffman primary VLC source today; G3 / G1
+/// fall back to the empty placeholder (DC-only reconstruction) because
+/// their packed-Huffman bit-length sources are not yet extracted (the
+/// candidate VMAs at `0x1c258b80` (G1) / `0x1c259608` (G3) per spec/99
+/// are flagged "suspect" in their meta files).
+fn luma_ac_table_for(selection: AcSelection, hdr: &MsV3PictureHeader) -> AcVlcTable {
     match selection {
+        AcSelection::FromHeader => match hdr.ac_luma_sel {
+            // Spec/14 §3.1: 0 → G3, 1 → G1, 2 → G5. G3 / G1 are not
+            // yet wired (no packed-Huffman extraction); fall through
+            // to the placeholder so the dispatch is right and only the
+            // VLC body is missing.
+            0 => AcVlcTable::V3_INTRA_PLACEHOLDER, // would be G3
+            1 => AcVlcTable::V3_INTRA_PLACEHOLDER, // would be G1
+            2 => AcVlcTable::v3_intra_g5(),
+            // Header parser already clamps to {0, 1, 2} via the unary-
+            // capped-at-2 read; this branch is unreachable in practice
+            // but guard against future header changes.
+            _ => AcVlcTable::v3_intra_g5(),
+        },
         AcSelection::G5 => AcVlcTable::v3_intra_g5(),
         AcSelection::Placeholder => AcVlcTable::V3_INTRA_PLACEHOLDER,
         AcSelection::Candidate => AcVlcTable::v3_intra_candidate(),
@@ -237,14 +281,27 @@ fn luma_ac_table_for(selection: AcSelection) -> AcVlcTable {
 }
 
 /// Resolve the picture decoder's [`AcSelection`] into the **chroma**
-/// intra-AC table (blocks 4 = Cb, 5 = Cr). Per spec/99 §5 / §5.2 the
-/// chroma path lives in slot `[esi+0xab0]` and uses a G2/G0/G4 variant
-/// (selected by `[esi+0xad0]`); G4 is the v1/v2 default and the
-/// production-ready choice for v3 round-27 wiring. Placeholder /
-/// candidate selectors fall through to the same as luma so the
-/// diagnostic test paths still bisect cleanly.
-fn chroma_ac_table_for(selection: AcSelection) -> AcVlcTable {
+/// intra-AC table (blocks 4 = Cb, 5 = Cr). Per spec/99 §5 / §5.2 and
+/// spec/14 §3.1 the chroma path lives in slot `[esi+0xab0]`. The
+/// picture-header `ac_chroma_sel` ∈ {0, 1, 2} field selects between
+/// {G2, G0, G4} respectively. G4 is the v1/v2 default and the only
+/// chroma-side G-family with a fully-extracted packed-Huffman primary
+/// VLC source today; G2 / G0 fall back to the empty placeholder
+/// (DC-only reconstruction) because their packed-Huffman bit-length
+/// sources are not yet extracted (the candidate VMAs at `0x1c259158`
+/// (G2) / `0x1c258630` (G0) per spec/99 are flagged "suspect").
+fn chroma_ac_table_for(selection: AcSelection, hdr: &MsV3PictureHeader) -> AcVlcTable {
     match selection {
+        AcSelection::FromHeader => match hdr.ac_chroma_sel {
+            // Spec/14 §3.1: 0 → G2, 1 → G0, 2 → G4. G2 / G0 are not
+            // yet wired (no packed-Huffman extraction); fall through
+            // to the placeholder so the dispatch is right and only the
+            // VLC body is missing.
+            0 => AcVlcTable::V3_INTRA_PLACEHOLDER, // would be G2
+            1 => AcVlcTable::V3_INTRA_PLACEHOLDER, // would be G0
+            2 => AcVlcTable::g4_inter(),
+            _ => AcVlcTable::g4_inter(),
+        },
         AcSelection::G5 => AcVlcTable::g4_inter(),
         AcSelection::Placeholder => AcVlcTable::V3_INTRA_PLACEHOLDER,
         AcSelection::Candidate => AcVlcTable::v3_intra_candidate(),
@@ -283,8 +340,8 @@ fn decode_iframe(
     let mut dc_cache = DcCache::new(mb_w, mb_h);
 
     let quant = hdr.quant as u32;
-    let luma_ac = luma_ac_table_for(ac_selection);
-    let chroma_ac = chroma_ac_table_for(ac_selection);
+    let luma_ac = luma_ac_table_for(ac_selection, hdr);
+    let chroma_ac = chroma_ac_table_for(ac_selection, hdr);
 
     for my in 0..mb_h {
         for mx in 0..mb_w {
@@ -344,8 +401,8 @@ fn decode_pframe(
     let mut pic = Picture::alloc(dims, PictureType::P);
     let mut dc_cache = DcCache::new(mb_w, mb_h);
     let quant = hdr.quant as u32;
-    let luma_ac = luma_ac_table_for(ac_selection);
-    let chroma_ac = chroma_ac_table_for(ac_selection);
+    let luma_ac = luma_ac_table_for(ac_selection, hdr);
+    let chroma_ac = chroma_ac_table_for(ac_selection, hdr);
 
     // MV grid: one (MVx, MVy) entry per MB. Skipped / intra MBs use
     // (0, 0) so the predictor's zero-substitution semantics match
