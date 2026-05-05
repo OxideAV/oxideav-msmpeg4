@@ -197,7 +197,7 @@ fn ffmpeg_generated_div3_decodes_to_video_frame() {
     let mut params = CodecParameters::video(CodecId::new("msmpeg4v3"));
     params.width = Some(16);
     params.height = Some(16);
-    let mut dec = reg.make_decoder(&params).expect("decoder creation");
+    let mut dec = reg.first_decoder(&params).expect("decoder creation");
 
     let pkt = Packet::new(0, TimeBase::new(1, 25), chunk)
         .with_pts(0)
@@ -341,7 +341,7 @@ fn testsrc2_32x32_ffmpeg_parity() {
     let mut params = CodecParameters::video(CodecId::new("msmpeg4v3"));
     params.width = Some(32);
     params.height = Some(32);
-    let mut dec = reg.make_decoder(&params).expect("decoder creation");
+    let mut dec = reg.first_decoder(&params).expect("decoder creation");
 
     let pkt = Packet::new(0, TimeBase::new(1, 25), chunk.clone())
         .with_pts(0)
@@ -497,7 +497,7 @@ fn pframe_smoke_32x32_decodes() {
     let mut params = CodecParameters::video(CodecId::new("msmpeg4v3"));
     params.width = Some(32);
     params.height = Some(32);
-    let mut dec = reg.make_decoder(&params).expect("decoder creation");
+    let mut dec = reg.first_decoder(&params).expect("decoder creation");
 
     // I-frame first.
     let pkt0 = Packet::new(0, TimeBase::new(1, 25), chunks[0].clone())

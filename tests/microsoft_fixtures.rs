@@ -482,7 +482,7 @@ fn decode_and_compare(fix: &Fixture, avi_bytes: &[u8], yuv_ref: &[u8]) -> Vec<Fr
     let mut params = CodecParameters::video(CodecId::new(cid_str));
     params.width = Some(fix.width);
     params.height = Some(fix.height);
-    let mut dec: Box<dyn Decoder> = match reg.make_decoder(&params) {
+    let mut dec: Box<dyn Decoder> = match reg.first_decoder(&params) {
         Ok(d) => d,
         Err(e) => {
             return vec![FrameOutcome {

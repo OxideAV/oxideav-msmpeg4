@@ -245,7 +245,7 @@ fn decode_fixture(case: &CorpusCase) -> Option<Vec<FrameOutcome>> {
     let mut params = CodecParameters::video(CodecId::new(cid_str));
     params.width = Some(case.width as u32);
     params.height = Some(case.height as u32);
-    let mut dec: Box<dyn Decoder> = match reg.make_decoder(&params) {
+    let mut dec: Box<dyn Decoder> = match reg.first_decoder(&params) {
         Ok(d) => d,
         Err(e) => {
             eprintln!("skip {}: make_decoder failed: {e:?}", case.name);
