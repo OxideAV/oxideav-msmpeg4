@@ -382,6 +382,8 @@ pub fn register(ctx: &mut oxideav_core::RuntimeContext) {
     register_codecs(&mut ctx.codecs);
 }
 
+oxideav_core::register!("msmpeg4", register);
+
 #[cfg(test)]
 mod register_runtime_context_tests {
     use super::*;
