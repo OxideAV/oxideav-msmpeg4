@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.5](https://github.com/OxideAV/oxideav-msmpeg4/compare/v0.0.4...v0.0.5) - 2026-05-03
+
+### Other
+
+- thread mv_table_sel into MV decode (round 32 piece 3 of 3)
+- add G0..G3 named AC table constructors (round 32 piece 2 of 3)
+- wire AcSelection::FromHeader (round 32 piece 1 of 3)
+
 ## [0.0.4](https://github.com/OxideAV/oxideav-msmpeg4/compare/v0.0.3...v0.0.4) - 2026-05-03
 
 ### Other
