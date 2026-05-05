@@ -477,7 +477,7 @@ fn decode_and_compare(fix: &Fixture, avi_bytes: &[u8], yuv_ref: &[u8]) -> Vec<Fr
     };
 
     let mut reg = CodecRegistry::new();
-    oxideav_msmpeg4::register(&mut reg);
+    oxideav_msmpeg4::register_codecs(&mut reg);
 
     let mut params = CodecParameters::video(CodecId::new(cid_str));
     params.width = Some(fix.width);

@@ -322,7 +322,10 @@ pub fn probe_is_msmpeg4(ctx: &ProbeContext) -> f32 {
 /// The decoders themselves currently return
 /// `Error::Unsupported` on `send_packet`, with distinct diagnostic
 /// messages for the two failure modes.
-pub fn register(reg: &mut CodecRegistry) {
+///
+/// Prefer the unified [`register`] entry point when you have a
+/// [`oxideav_core::RuntimeContext`] in hand.
+pub fn register_codecs(reg: &mut CodecRegistry) {
     fn make_caps(name: &'static str) -> CodecCapabilities {
         CodecCapabilities::video(name).with_intra_only(false)
     }
@@ -369,6 +372,38 @@ pub fn register(reg: &mut CodecRegistry) {
             ]);
         }
         reg.register(info);
+    }
+}
+
+/// Unified registration entry point — installs every MS-MPEG4 alias
+/// into the codec sub-registry of the supplied
+/// [`oxideav_core::RuntimeContext`].
+pub fn register(ctx: &mut oxideav_core::RuntimeContext) {
+    register_codecs(&mut ctx.codecs);
+}
+
+#[cfg(test)]
+mod register_runtime_context_tests {
+    use super::*;
+
+    #[test]
+    fn register_via_runtime_context_installs_codec_factory() {
+        let mut ctx = oxideav_core::RuntimeContext::new();
+        register(&mut ctx);
+        // Canonical aliases (first entry of each version array) carry
+        // the decoder factory.
+        assert!(
+            ctx.codecs.has_decoder(&CodecId::new(ALIASES_V1[0])),
+            "v1 decoder factory not installed via RuntimeContext"
+        );
+        assert!(
+            ctx.codecs.has_decoder(&CodecId::new(ALIASES_V2[0])),
+            "v2 decoder factory not installed via RuntimeContext"
+        );
+        assert!(
+            ctx.codecs.has_decoder(&CodecId::new(ALIASES_V3[0])),
+            "v3 decoder factory not installed via RuntimeContext"
+        );
     }
 }
 
@@ -656,7 +691,7 @@ mod tests {
     fn registered_tag_claims_route_correctly() {
         use oxideav_core::CodecResolver;
         let mut reg = CodecRegistry::new();
-        register(&mut reg);
+        register_codecs(&mut reg);
 
         let ms_bytes = msmpeg4v3_picture_header();
         let iso_bytes = vos_header();

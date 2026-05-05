@@ -185,7 +185,7 @@ fn ffmpeg_v2_picture_header_parses_through_decoder() {
 
     // Drive through the registered decoder.
     let mut reg = CodecRegistry::new();
-    oxideav_msmpeg4::register(&mut reg);
+    oxideav_msmpeg4::register_codecs(&mut reg);
     let mut params = CodecParameters::video(CodecId::new("msmpeg4v2"));
     params.width = Some(16);
     params.height = Some(16);

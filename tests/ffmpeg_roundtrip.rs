@@ -192,7 +192,7 @@ fn ffmpeg_generated_div3_decodes_to_video_frame() {
     // Build a decoder via the crate's registry, with dimensions handed in
     // from the caller (AVI BITMAPINFOHEADER would normally supply these).
     let mut reg = CodecRegistry::new();
-    oxideav_msmpeg4::register(&mut reg);
+    oxideav_msmpeg4::register_codecs(&mut reg);
 
     let mut params = CodecParameters::video(CodecId::new("msmpeg4v3"));
     params.width = Some(16);
@@ -336,7 +336,7 @@ fn testsrc2_32x32_ffmpeg_parity() {
 
     // Decode via our crate.
     let mut reg = CodecRegistry::new();
-    oxideav_msmpeg4::register(&mut reg);
+    oxideav_msmpeg4::register_codecs(&mut reg);
 
     let mut params = CodecParameters::video(CodecId::new("msmpeg4v3"));
     params.width = Some(32);
@@ -493,7 +493,7 @@ fn pframe_smoke_32x32_decodes() {
     }
 
     let mut reg = CodecRegistry::new();
-    oxideav_msmpeg4::register(&mut reg);
+    oxideav_msmpeg4::register_codecs(&mut reg);
     let mut params = CodecParameters::video(CodecId::new("msmpeg4v3"));
     params.width = Some(32);
     params.height = Some(32);

@@ -227,7 +227,7 @@ fn decode_fixture(case: &CorpusCase) -> Option<Vec<FrameOutcome>> {
     // Build a registry, register our decoders, resolve via tag, and
     // construct an actual decoder instance.
     let mut reg = CodecRegistry::new();
-    oxideav_msmpeg4::register(&mut reg);
+    oxideav_msmpeg4::register_codecs(&mut reg);
 
     // Sanity-check that the registry resolves this fourcc to the same
     // codec id classify() picked (catches a registry/router mismatch).
