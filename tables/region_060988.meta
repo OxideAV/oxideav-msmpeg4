@@ -1,0 +1,54 @@
+# region_060988.meta
+
+source_path: /home/magicaltux/projects/oxideav-docs/video/msmpeg4/reference/binaries/wmpcdcs8-2001/mpg4c32.dll
+source_sha256: aedb4cf3d33c8554ab8acf04afe2d936eaa7c49107c5fefe163bca2e94b3c099
+region_sha256: 46795e81ee210fcde98925556de2b4b5f6b0780017117295c5cdd80f101124a3
+file_offset_start: 0x060988
+file_offset_end: 0x061200
+vma_start: 0x1c261588
+vma_end: 0x1c261e00
+length_bytes: 2168
+record_size_bytes: 8
+record_count: 271
+record_format: u32_le symbol + u32_le bit_length
+
+# bit_length histogram (bit_length,count)
+bit_length_0: 45
+bit_length_1: 112
+bit_length_2: 37
+bit_length_3: 29
+bit_length_4: 13
+bit_length_5: 6
+bit_length_6: 4
+bit_length_7: 3
+bit_length_9: 1
+bit_length_10: 1
+bit_length_11: 4
+bit_length_12: 1
+bit_length_13: 1
+bit_length_14: 1
+bit_length_15: 2
+bit_length_20: 2
+bit_length_26: 3
+bit_length_29: 1
+bit_length_30: 1
+bit_length_36: 1
+bit_length_37: 1
+bit_length_40: 1
+bit_length_43: 1
+
+out_of_range_count: 49  # bl==0 or bl>32
+
+# anomalies
+# This region is a *cluster* of 24 ESC extension table slices;
+# the 8-byte record-pair interpretation is a *mechanical* pass
+# over the entire region. Records at slice boundaries or within
+# padding bytes need not obey the "bit_length <= 32" invariant.
+# Out-of-range records: 49 of 271.
+# Per-slice structure is given in region_060988_index.csv; slice-
+# local record validity is to be checked at slice granularity.
+
+verdict: pass-with-note
+note: mechanical pass over whole region; slice-level validation
+  deferred to per-slice extraction. Region boundaries (file offset,
+  VMA, length) verified against source binary.

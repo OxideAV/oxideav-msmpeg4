@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Round 33 — ESC extension table cluster wired** (2026-05-08):
+  clean-room ingest of `region_060988.hex` (2168 bytes at file
+  `0x60988..0x61200`, VMA `0x1c261588..0x1c261e00`) plus
+  `region_060988_index.csv` (24 slice-boundary rows). Per
+  `docs/video/msmpeg4/spec/08-descriptor-constants.md` §1-§2 +
+  `spec/14-pri-ab-runtime-binding.md` §2.1, the cluster is the
+  back-store for every G-descriptor's `+0x0c..+0x18` pointer block
+  (sub-A / sub-B level- and run-extension arrays the v2/v3 inter
+  kernel `0x1c215e6f` and v1/v2/v3 intra kernel `0x1c216d97` read on
+  first- and second-tier ESC paths). The new `build.rs::emit_esc_ext_cluster`
+  step parses both files and emits `tables_data::ESC_EXT_SLICES:
+  [&[u8]; 24]`, per-slice metadata `ESC_EXT_SLICE_META`, and six
+  per-G-descriptor index quadruples `ESC_EXT_G{0..5}_SLICE_INDICES`
+  matching the four-pointer spec/08 §2.2 attribution. Build-time
+  invariants verify cluster size (= 2168), slice contiguity, every
+  slice length is a multiple of the 8-byte record stride, and each
+  G-descriptor's four VMAs resolve to slice-array indices.
+  **Slice-content semantics remain spec-OPEN per `spec/08` §4.1**
+  — the kernel reads `[base + idx*4]` (BYTE for `+0x0c/+0x10`,
+  DWORD for `+0x14/+0x18`) but the slices' on-disk record format is
+  `(symbol_u32_le, bit_length_u32_le)` 8-byte pairs, and the
+  relationship between the two is not yet pinned down by docs.
+  Round 33 wires the bytes and per-descriptor attribution; the
+  ESC-body decoder using these tables awaits a future Specifier
+  round on the inter / intra kernel ESC bodies.
+- **8 new `tables_data::tests`** for the ESC-ext cluster: cluster
+  size, slice-lengths-sum-to-total, first/last slice VMAs from the
+  CSV index, per-G-descriptor index attribution (spec/08 §2.2),
+  per-G VMA round-trip, the 24 verbatim slice lengths in CSV order,
+  the multiple-of-8 invariant, and a first-record byte spot-check
+  for slice 0 (G1 sub-A level-extension).
+
 ## [0.0.5](https://github.com/OxideAV/oxideav-msmpeg4/compare/v0.0.4...v0.0.5) - 2026-05-03
 
 ### Other

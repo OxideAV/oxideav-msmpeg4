@@ -249,6 +249,38 @@ fn main() {
     emit_g_enum(&g2_enum, &out_dir.join("g2_enum.rs"), "G2", 148, 80);
     emit_g_enum(&g3_enum, &out_dir.join("g3_enum.rs"), "G3", 132, 84);
 
+    // ESC-extension table cluster — region_060988 (round 33; spec/08 §1
+    // + §2 + §4). 24 contiguous slices at file 0x60988..0x61200 (VMA
+    // 0x1c261588..0x1c261e00, 2168 bytes). Per spec/08 §2.2 each
+    // G-descriptor (G0..G5) carries four pointers in slots
+    // `desc+0x0c..+0x18` to byte / u32 extension arrays the v2/v3
+    // inter kernel `1c215e6f` and v1/v2/v3 intra kernel `1c216d97` read
+    // on first-tier (`+0x0c/+0x10`) and second-tier (`+0x14/+0x18`) ESC
+    // paths. The slice boundaries come from
+    // `region_060988_index.csv` (24 rows, one per slice); per-VMA
+    // attribution to G0..G5 × {sub-A lev-ext, sub-B lev-ext, sub-A
+    // run-ext, sub-B run-ext} comes from spec/08 §2.2 / spec/14 §2.1.
+    //
+    // **Semantic interpretation OPEN per spec/08 §4.1.** The 8-byte
+    // `(symbol_u32_le, bit_length_u32_le)` record format the slices
+    // mechanically parse as is consistent with the per-slot packed-
+    // Huffman source format used elsewhere (G4/G5 primary VLC, intra-
+    // DC), but the kernel's `[base + idx*4]` access pattern (BYTE PTR
+    // for `+0x0c/+0x10`, DWORD PTR for `+0x14/+0x18`) does not
+    // straightforwardly map onto an 8-byte-per-record secondary VLC.
+    // This round (33) wires the **bytes and slice boundaries only**;
+    // the (level-ext, run-ext) decoder semantics await a future
+    // Specifier round on the inter / intra kernel ESC bodies.
+    let esc_ext_hex = tables_dir.join("region_060988.hex");
+    let esc_ext_idx = tables_dir.join("region_060988_index.csv");
+    println!("cargo:rerun-if-changed={}", esc_ext_hex.display());
+    println!("cargo:rerun-if-changed={}", esc_ext_idx.display());
+    emit_esc_ext_cluster(
+        &esc_ext_hex,
+        &esc_ext_idx,
+        &out_dir.join("esc_ext_cluster.rs"),
+    );
+
     println!("cargo:rerun-if-changed=build.rs");
 }
 
@@ -1619,4 +1651,257 @@ fn parse_xxd(path: &Path) -> Vec<u8> {
         }
     }
     out
+}
+
+/// Parse `region_060988.hex` (the ESC-extension table cluster) and
+/// `region_060988_index.csv` (the per-slice byte boundaries) and emit
+/// per-G-descriptor byte slices for the 4-pointer descriptor block.
+///
+/// Per `docs/video/msmpeg4/spec/08-descriptor-constants.md` §2.2 +
+/// §2.4 / `spec/14-pri-ab-runtime-binding.md` §2.1, the 24 cluster
+/// slices map to (G, descriptor-offset) tuples as follows:
+///
+/// ```text
+/// G0  +0x0c=0x1c261710 (slice 4)   +0x10=0x1c261780 (slice 5)
+/// G0  +0x14=0x1c261818 (slice 6)   +0x18=0x1c261878 (slice 7)
+/// G1  +0x0c=0x1c261588 (slice 0)   +0x10=0x1c261608 (slice 1)
+/// G1  +0x14=0x1c2616a0 (slice 2)   +0x18=0x1c2616f0 (slice 3)
+/// G2  +0x0c=0x1c2619c8 (slice 12)  +0x10=0x1c261a40 (slice 13)
+/// G2  +0x14=0x1c261af0 (slice 14)  +0x18=0x1c261b30 (slice 15)
+/// G3  +0x0c=0x1c2618a0 (slice 8)   +0x10=0x1c2618f8 (slice 9)
+/// G3  +0x14=0x1c261968 (slice 10)  +0x18=0x1c2619b0 (slice 11)
+/// G4  +0x0c=0x1c261c78 (slice 20)  +0x10=0x1c261ce8 (slice 21)
+/// G4  +0x14=0x1c261d90 (slice 22)  +0x18=0x1c261dc8 (slice 23)
+/// G5  +0x0c=0x1c261b48 (slice 16)  +0x10=0x1c261b88 (slice 17)
+/// G5  +0x14=0x1c261be0 (slice 18)  +0x18=0x1c261c50 (slice 19)
+/// ```
+///
+/// The function emits a 24-element `ESC_EXT_SLICES: [&[u8]; 24]` in
+/// slice-index order plus six 4-tuple `ESC_EXT_G{n}_SLICE_INDICES:
+/// [usize; 4]` constants giving the slice-array indices that match
+/// each G-descriptor's `(+0x0c, +0x10, +0x14, +0x18)` pointer block.
+/// Build-time invariants enforced:
+///   * cluster size matches the meta (`length_bytes: 2168`)
+///   * 24 slice rows in the CSV
+///   * slice boundaries reconstruct the cluster byte-for-byte
+///   * each slice length is a multiple of 8 (the record stride per
+///     `region_060988.meta`)
+///   * VMAs in `region_060988_index.csv` match the
+///     spec/08 §2.2 / spec/14 §2.1 G-descriptor table above
+fn emit_esc_ext_cluster(hex_path: &Path, csv_path: &Path, out_path: &Path) {
+    let bytes = parse_xxd(hex_path);
+    if bytes.len() != 2168 {
+        panic!(
+            "ESC-ext cluster: expected 2168 bytes in {} per spec/08 §2.4 (range 0x60988..0x61200), got {}",
+            hex_path.display(),
+            bytes.len()
+        );
+    }
+
+    // Parse the slice index CSV. Columns:
+    //   slice_index, relative_offset, absolute_file_offset_hex,
+    //   vma_hex, next_slice_relative_offset, slice_length_bytes
+    let csv_text = fs::read_to_string(csv_path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", csv_path.display()));
+    let mut slices: Vec<(usize, u32, usize)> = Vec::new(); // (rel_off, vma, len)
+    for (lineno, line) in csv_text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with("slice_index") {
+            continue;
+        }
+        let cols: Vec<&str> = line.split(',').collect();
+        if cols.len() < 6 {
+            panic!(
+                "{}:{}: expected 6 columns, got {}: {line:?}",
+                csv_path.display(),
+                lineno + 1,
+                cols.len()
+            );
+        }
+        let rel_off: usize = cols[1].parse().unwrap_or_else(|_| {
+            panic!(
+                "{}:{}: bad rel_off {:?}",
+                csv_path.display(),
+                lineno + 1,
+                cols[1]
+            )
+        });
+        let vma_hex = cols[3].trim_start_matches("0x");
+        let vma = u32::from_str_radix(vma_hex, 16).unwrap_or_else(|_| {
+            panic!(
+                "{}:{}: bad vma {:?}",
+                csv_path.display(),
+                lineno + 1,
+                cols[3]
+            )
+        });
+        let len: usize = cols[5].parse().unwrap_or_else(|_| {
+            panic!(
+                "{}:{}: bad slice_length {:?}",
+                csv_path.display(),
+                lineno + 1,
+                cols[5]
+            )
+        });
+        slices.push((rel_off, vma, len));
+    }
+    if slices.len() != 24 {
+        panic!(
+            "ESC-ext cluster: expected 24 slices in {}, got {}",
+            csv_path.display(),
+            slices.len()
+        );
+    }
+
+    // Verify boundaries reconstruct the cluster contiguously and each
+    // slice length is a multiple of 8.
+    let mut expected_rel = 0usize;
+    for (i, &(rel_off, _vma, len)) in slices.iter().enumerate() {
+        if rel_off != expected_rel {
+            panic!(
+                "ESC-ext slice {i}: rel_off {rel_off} != expected {expected_rel} \
+                 (slices must be contiguous per region_060988.meta)"
+            );
+        }
+        if len % 8 != 0 {
+            panic!(
+                "ESC-ext slice {i}: length {len} is not a multiple of 8 \
+                 (records are 8 bytes per region_060988.meta)"
+            );
+        }
+        if rel_off + len > bytes.len() {
+            panic!(
+                "ESC-ext slice {i}: rel_off+len = {} exceeds cluster size {}",
+                rel_off + len,
+                bytes.len()
+            );
+        }
+        expected_rel += len;
+    }
+    if expected_rel != bytes.len() {
+        panic!(
+            "ESC-ext cluster: slice spans sum to {} but cluster has {} bytes \
+             (region_060988_index.csv must cover the cluster exactly)",
+            expected_rel,
+            bytes.len()
+        );
+    }
+
+    // Per-G slice-index attribution per spec/08 §2.2 (slice index =
+    // (vma - 0x1c261588) / 8 conceptually, but we cross-check directly
+    // against the CSV's vma column).
+    let g_table: &[(&str, [u32; 4])] = &[
+        ("G0", [0x1c261710, 0x1c261780, 0x1c261818, 0x1c261878]),
+        ("G1", [0x1c261588, 0x1c261608, 0x1c2616a0, 0x1c2616f0]),
+        ("G2", [0x1c2619c8, 0x1c261a40, 0x1c261af0, 0x1c261b30]),
+        ("G3", [0x1c2618a0, 0x1c2618f8, 0x1c261968, 0x1c2619b0]),
+        ("G4", [0x1c261c78, 0x1c261ce8, 0x1c261d90, 0x1c261dc8]),
+        ("G5", [0x1c261b48, 0x1c261b88, 0x1c261be0, 0x1c261c50]),
+    ];
+    let mut g_slice_idx: Vec<(&str, [usize; 4])> = Vec::with_capacity(6);
+    for &(name, vmas) in g_table {
+        let mut idxs = [0usize; 4];
+        for (k, &want_vma) in vmas.iter().enumerate() {
+            let pos = slices
+                .iter()
+                .position(|&(_, vma, _)| vma == want_vma)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "ESC-ext cluster: descriptor {name} slot {k} VMA 0x{want_vma:08x} \
+                         not found in region_060988_index.csv \
+                         (spec/08 §2.2 / spec/14 §2.1 lookup failed)"
+                    )
+                });
+            idxs[k] = pos;
+        }
+        g_slice_idx.push((name, idxs));
+    }
+
+    // Emit the file.
+    let mut f = fs::File::create(out_path)
+        .unwrap_or_else(|e| panic!("failed to create {}: {e}", out_path.display()));
+    writeln!(
+        f,
+        "// Auto-generated by build.rs from \
+         crates/oxideav-msmpeg4/tables/region_060988.hex +\n\
+         // crates/oxideav-msmpeg4/tables/region_060988_index.csv.\n\
+         // DO NOT EDIT.\n\
+         // Source binary: mpg4c32.dll SHA-256 \
+         aedb4cf3d33c8554ab8acf04afe2d936eaa7c49107c5fefe163bca2e94b3c099\n\
+         // Region: file 0x060988..0x061200, VMA 0x1c261588..0x1c261e00, 2168 bytes.\n\
+         // Role per docs/video/msmpeg4/spec/08-descriptor-constants.md §1-§2:\n\
+         //   24 contiguous slices, one per (G-descriptor × {{+0x0c, +0x10,\n\
+         //   +0x14, +0x18}}) tuple. Inter / intra kernels read these as base\n\
+         //   pointers for the first- and second-tier ESC bodies (level- and\n\
+         //   run-extension lookup arrays). Detailed slice-content semantics\n\
+         //   remain spec-OPEN per spec/08 §4.1; this file wires the byte\n\
+         //   slices and per-descriptor attribution only.\n\
+         "
+    )
+    .unwrap();
+
+    writeln!(
+        f,
+        "/// Number of ESC-extension cluster slices.\n\
+         pub const ESC_EXT_SLICE_COUNT: usize = 24;\n\n\
+         /// Total cluster size in bytes (per `region_060988.meta`).\n\
+         pub const ESC_EXT_CLUSTER_BYTES: usize = 2168;\n"
+    )
+    .unwrap();
+
+    // Emit each slice as a `&[u8]` constant + the master `ESC_EXT_SLICES`
+    // array.
+    for (i, &(rel_off, vma, len)) in slices.iter().enumerate() {
+        writeln!(
+            f,
+            "/// Slice {i}: VMA 0x{vma:08x}, file 0x{:06x}, {len} bytes.",
+            0x60988usize + rel_off,
+        )
+        .unwrap();
+        writeln!(f, "pub const ESC_EXT_SLICE_{i}: &[u8] = &[").unwrap();
+        emit_byte_array(&mut f, &bytes[rel_off..rel_off + len]);
+        writeln!(f, "];\n").unwrap();
+    }
+
+    writeln!(f, "/// All 24 cluster slices in slice-index order.").unwrap();
+    writeln!(
+        f,
+        "pub const ESC_EXT_SLICES: [&[u8]; ESC_EXT_SLICE_COUNT] = ["
+    )
+    .unwrap();
+    for i in 0..slices.len() {
+        writeln!(f, "    ESC_EXT_SLICE_{i},").unwrap();
+    }
+    writeln!(f, "];\n").unwrap();
+
+    writeln!(
+        f,
+        "/// Per-slice (relative_offset, vma, length_bytes) metadata."
+    )
+    .unwrap();
+    writeln!(
+        f,
+        "pub const ESC_EXT_SLICE_META: [(usize, u32, usize); ESC_EXT_SLICE_COUNT] = ["
+    )
+    .unwrap();
+    for &(rel_off, vma, len) in &slices {
+        writeln!(f, "    ({rel_off}, 0x{vma:08x}, {len}),").unwrap();
+    }
+    writeln!(f, "];\n").unwrap();
+
+    // Per-descriptor slice indices.
+    for &(name, idxs) in &g_slice_idx {
+        writeln!(
+            f,
+            "/// Slice indices for {name}'s descriptor pointer block \
+             (`+0x0c`, `+0x10`, `+0x14`, `+0x18`) per spec/08 §2.2."
+        )
+        .unwrap();
+        writeln!(
+            f,
+            "pub const ESC_EXT_{name}_SLICE_INDICES: [usize; 4] = [{}, {}, {}, {}];\n",
+            idxs[0], idxs[1], idxs[2], idxs[3],
+        )
+        .unwrap();
+    }
 }
