@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.6](https://github.com/OxideAV/oxideav-msmpeg4/compare/v0.0.5...v0.0.6) - 2026-05-07
+
+### Other
+
+- round 33: wire ESC extension table cluster (region_060988)
+- drop dead `linkme` dep
+- registry calls: rename make_decoder/make_encoder → first_decoder/first_encoder
+- auto-register via oxideav_core::register! macro (linkme distributed slice)
+- unify entry point on register(&mut RuntimeContext) ([#502](https://github.com/OxideAV/oxideav-msmpeg4/pull/502))
+
 ### Added
 
 - **Round 33 — ESC extension table cluster wired** (2026-05-08):
