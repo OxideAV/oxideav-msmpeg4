@@ -268,8 +268,40 @@ impl AcVlcTable {
     /// FROM: `docs/video/msmpeg4/spec/14-pri-ab-runtime-binding.md` §3 (selector → G mapping)
     /// FROM: `docs/video/msmpeg4/spec/15-count-ab-per-g-family.md` §7 (count_A=168, count_B=98)
     /// FROM: `docs/video/msmpeg4/spec/99-current-understanding.md` §10 row 1058 (G0 source VMA)
+    ///
+    /// **Round 7 update**: `entries` is still empty pending the
+    /// canonical-Huffman bit-length extraction, but `lmax` / `rmax` are
+    /// now wired from the G0 enumeration (round 29) so the 3-tier ESC
+    /// body in [`decode_escape_body`] has the right level- and
+    /// run-extension offsets when the primary VLC lands. Tests should
+    /// use [`v3_intra_g0_synthetic`] to exercise the post-VLC pipeline
+    /// against a synthetic (non-bit-exact) canonical-Huffman over the
+    /// G0 alphabet.
     pub fn v3_intra_g0() -> AcVlcTable {
-        Self::V3_INTRA_PLACEHOLDER
+        AcVlcTable {
+            entries: &[],
+            esc_last_bits: Self::MPEG4_ESC_LAST_BITS,
+            esc_run_bits: Self::MPEG4_ESC_RUN_BITS,
+            esc_level_bits: Self::MPEG4_ESC_LEVEL_BITS,
+            lmax: Some(g0_lmax()),
+            rmax: Some(g0_rmax()),
+        }
+    }
+
+    /// Synthetic-VLC variant of [`v3_intra_g0`] for regression tests.
+    /// Uses a fixed-length canonical Huffman over the G0 alphabet (every
+    /// idx is its own bit-pattern at `ceil(log2(count_A + 1))` bits).
+    /// **Not bit-exact** against the binary; do not use for real-content
+    /// decode.
+    pub fn v3_intra_g0_synthetic() -> AcVlcTable {
+        AcVlcTable {
+            entries: g0_synthetic_entries(),
+            esc_last_bits: Self::MPEG4_ESC_LAST_BITS,
+            esc_run_bits: Self::MPEG4_ESC_RUN_BITS,
+            esc_level_bits: Self::MPEG4_ESC_LEVEL_BITS,
+            lmax: Some(g0_lmax()),
+            rmax: Some(g0_rmax()),
+        }
     }
 
     /// Build the **G1 (intra-luma, class 1) DCT AC TCOEF primary
@@ -292,8 +324,31 @@ impl AcVlcTable {
     /// FROM: `docs/video/msmpeg4/spec/14-pri-ab-runtime-binding.md` §3
     /// FROM: `docs/video/msmpeg4/spec/15-count-ab-per-g-family.md` §7
     /// FROM: `docs/video/msmpeg4/spec/99-current-understanding.md` §10 row 1059
+    ///
+    /// **Round 7 update**: `entries` still empty, `lmax` / `rmax` now
+    /// wired from the G1 enumeration. See [`v3_intra_g1_synthetic`] for
+    /// the test-only synthetic-VLC variant.
     pub fn v3_intra_g1() -> AcVlcTable {
-        Self::V3_INTRA_PLACEHOLDER
+        AcVlcTable {
+            entries: &[],
+            esc_last_bits: Self::MPEG4_ESC_LAST_BITS,
+            esc_run_bits: Self::MPEG4_ESC_RUN_BITS,
+            esc_level_bits: Self::MPEG4_ESC_LEVEL_BITS,
+            lmax: Some(g1_lmax()),
+            rmax: Some(g1_rmax()),
+        }
+    }
+
+    /// Synthetic-VLC variant of [`v3_intra_g1`] for regression tests.
+    pub fn v3_intra_g1_synthetic() -> AcVlcTable {
+        AcVlcTable {
+            entries: g1_synthetic_entries(),
+            esc_last_bits: Self::MPEG4_ESC_LAST_BITS,
+            esc_run_bits: Self::MPEG4_ESC_RUN_BITS,
+            esc_level_bits: Self::MPEG4_ESC_LEVEL_BITS,
+            lmax: Some(g1_lmax()),
+            rmax: Some(g1_rmax()),
+        }
     }
 
     /// Build the **G2 (chroma + all-inter, class 0) DCT AC TCOEF
@@ -316,8 +371,30 @@ impl AcVlcTable {
     /// FROM: `docs/video/msmpeg4/spec/14-pri-ab-runtime-binding.md` §3
     /// FROM: `docs/video/msmpeg4/spec/15-count-ab-per-g-family.md` §7
     /// FROM: `docs/video/msmpeg4/spec/99-current-understanding.md` §10 row 1060
+    ///
+    /// **Round 7 update**: `entries` still empty, `lmax` / `rmax` now
+    /// wired from the G2 enumeration. See [`v3_intra_g2_synthetic`].
     pub fn v3_intra_g2() -> AcVlcTable {
-        Self::V3_INTRA_PLACEHOLDER
+        AcVlcTable {
+            entries: &[],
+            esc_last_bits: Self::MPEG4_ESC_LAST_BITS,
+            esc_run_bits: Self::MPEG4_ESC_RUN_BITS,
+            esc_level_bits: Self::MPEG4_ESC_LEVEL_BITS,
+            lmax: Some(g2_lmax()),
+            rmax: Some(g2_rmax()),
+        }
+    }
+
+    /// Synthetic-VLC variant of [`v3_intra_g2`] for regression tests.
+    pub fn v3_intra_g2_synthetic() -> AcVlcTable {
+        AcVlcTable {
+            entries: g2_synthetic_entries(),
+            esc_last_bits: Self::MPEG4_ESC_LAST_BITS,
+            esc_run_bits: Self::MPEG4_ESC_RUN_BITS,
+            esc_level_bits: Self::MPEG4_ESC_LEVEL_BITS,
+            lmax: Some(g2_lmax()),
+            rmax: Some(g2_rmax()),
+        }
     }
 
     /// Build the **G3 (intra-luma, class 0) DCT AC TCOEF primary
@@ -344,8 +421,30 @@ impl AcVlcTable {
     /// FROM: `docs/video/msmpeg4/spec/14-pri-ab-runtime-binding.md` §3
     /// FROM: `docs/video/msmpeg4/spec/15-count-ab-per-g-family.md` §7
     /// FROM: `docs/video/msmpeg4/spec/99-current-understanding.md` §10 row 1061
+    ///
+    /// **Round 7 update**: `entries` still empty, `lmax` / `rmax` now
+    /// wired from the G3 enumeration. See [`v3_intra_g3_synthetic`].
     pub fn v3_intra_g3() -> AcVlcTable {
-        Self::V3_INTRA_PLACEHOLDER
+        AcVlcTable {
+            entries: &[],
+            esc_last_bits: Self::MPEG4_ESC_LAST_BITS,
+            esc_run_bits: Self::MPEG4_ESC_RUN_BITS,
+            esc_level_bits: Self::MPEG4_ESC_LEVEL_BITS,
+            lmax: Some(g3_lmax()),
+            rmax: Some(g3_rmax()),
+        }
+    }
+
+    /// Synthetic-VLC variant of [`v3_intra_g3`] for regression tests.
+    pub fn v3_intra_g3_synthetic() -> AcVlcTable {
+        AcVlcTable {
+            entries: g3_synthetic_entries(),
+            esc_last_bits: Self::MPEG4_ESC_LAST_BITS,
+            esc_run_bits: Self::MPEG4_ESC_RUN_BITS,
+            esc_level_bits: Self::MPEG4_ESC_LEVEL_BITS,
+            lmax: Some(g3_lmax()),
+            rmax: Some(g3_rmax()),
+        }
     }
 
     /// Build the candidate v3 intra-AC primary VLC table from the
@@ -666,6 +765,178 @@ fn build_g5_rmax() -> RunLimitTable {
         }
     }
     rmax
+}
+
+// ====================================================================
+// G0..G3 extended-alphabet LMAX / RMAX builders — round 7 (2026-05-14).
+//
+// Per `docs/video/msmpeg4/spec/09-g0-g3-enumeration.md` §1 + §9 the four
+// extended G-descriptors carry strictly larger `(last, run)` alphabets
+// than G4 / G5 (G0=168, G1=185, G2=148, G3=132 entries vs G4/G5's 102),
+// and the per-(last, run) level histogram is gap-free 1..=LMAX. The
+// LMAX / RMAX tables are mechanically derivable from the enumeration
+// data in `tables/region_*_g{0..3}_enum.csv` (round 29 extraction),
+// matching the same pattern G5 uses via [`g5_iter`].
+//
+// These builders feed [`AcVlcTable::v3_intra_g{0..3}`] so the 3-tier
+// ESC body in [`decode_escape_body`] has the level- and run-extension
+// offsets ready for when the primary VLC bit-length array
+// (canonical-Huffman source) lands — the only piece of G0..G3 still
+// blocked per `docs/video/msmpeg4/spec/99-current-understanding.md` §10
+// (candidate sources at file `0x57a30 / 0x57f80 / 0x58558 / 0x58a08`
+// flagged `verdict: suspect` in their `.meta` files).
+//
+// The expected per-(last, run) LMAX values (cross-check target) are
+// the spec/09 §8 consolidated table.
+// ====================================================================
+
+static G0_LMAX: std::sync::OnceLock<LevelLimitTable> = std::sync::OnceLock::new();
+static G0_RMAX: std::sync::OnceLock<RunLimitTable> = std::sync::OnceLock::new();
+static G1_LMAX: std::sync::OnceLock<LevelLimitTable> = std::sync::OnceLock::new();
+static G1_RMAX: std::sync::OnceLock<RunLimitTable> = std::sync::OnceLock::new();
+static G2_LMAX: std::sync::OnceLock<LevelLimitTable> = std::sync::OnceLock::new();
+static G2_RMAX: std::sync::OnceLock<RunLimitTable> = std::sync::OnceLock::new();
+static G3_LMAX: std::sync::OnceLock<LevelLimitTable> = std::sync::OnceLock::new();
+static G3_RMAX: std::sync::OnceLock<RunLimitTable> = std::sync::OnceLock::new();
+
+/// Build a LMAX table from any [`crate::g_enum::GExtended`] descriptor.
+/// `LMAX[last][run]` is the max `|level|` observed at the given
+/// `(last, run)` in the enumeration. Matches the same shape as
+/// [`build_g5_lmax`] but iterates the extended-alphabet enumeration.
+fn build_g_extended_lmax(g: crate::g_enum::GExtended) -> LevelLimitTable {
+    use crate::g_descriptor::GSymbol;
+    let mut lmax: LevelLimitTable = [[0u8; 64]; 2];
+    for (_idx, sym) in g.iter() {
+        if let GSymbol::Token(t) = sym {
+            let last_idx = if t.last { 1 } else { 0 };
+            let run_idx = t.run as usize;
+            if run_idx < 64 {
+                let prev = lmax[last_idx][run_idx];
+                if t.level_mag > prev {
+                    lmax[last_idx][run_idx] = t.level_mag;
+                }
+            }
+        }
+    }
+    lmax
+}
+
+/// Build a RMAX table from any [`crate::g_enum::GExtended`] descriptor.
+/// `RMAX[last][|level|]` is the max `run` observed at the given
+/// `(last, |level|)` in the enumeration.
+fn build_g_extended_rmax(g: crate::g_enum::GExtended) -> RunLimitTable {
+    use crate::g_descriptor::GSymbol;
+    let mut rmax: RunLimitTable = [[0u8; 32]; 2];
+    for (_idx, sym) in g.iter() {
+        if let GSymbol::Token(t) = sym {
+            let last_idx = if t.last { 1 } else { 0 };
+            let level_idx = t.level_mag as usize;
+            if level_idx < 32 {
+                let prev = rmax[last_idx][level_idx];
+                if t.run > prev {
+                    rmax[last_idx][level_idx] = t.run;
+                }
+            }
+        }
+    }
+    rmax
+}
+
+pub(crate) fn g0_lmax() -> &'static LevelLimitTable {
+    G0_LMAX.get_or_init(|| build_g_extended_lmax(crate::g_enum::GExtended::G0))
+}
+pub(crate) fn g0_rmax() -> &'static RunLimitTable {
+    G0_RMAX.get_or_init(|| build_g_extended_rmax(crate::g_enum::GExtended::G0))
+}
+pub(crate) fn g1_lmax() -> &'static LevelLimitTable {
+    G1_LMAX.get_or_init(|| build_g_extended_lmax(crate::g_enum::GExtended::G1))
+}
+pub(crate) fn g1_rmax() -> &'static RunLimitTable {
+    G1_RMAX.get_or_init(|| build_g_extended_rmax(crate::g_enum::GExtended::G1))
+}
+pub(crate) fn g2_lmax() -> &'static LevelLimitTable {
+    G2_LMAX.get_or_init(|| build_g_extended_lmax(crate::g_enum::GExtended::G2))
+}
+pub(crate) fn g2_rmax() -> &'static RunLimitTable {
+    G2_RMAX.get_or_init(|| build_g_extended_rmax(crate::g_enum::GExtended::G2))
+}
+pub(crate) fn g3_lmax() -> &'static LevelLimitTable {
+    G3_LMAX.get_or_init(|| build_g_extended_lmax(crate::g_enum::GExtended::G3))
+}
+pub(crate) fn g3_rmax() -> &'static RunLimitTable {
+    G3_RMAX.get_or_init(|| build_g_extended_rmax(crate::g_enum::GExtended::G3))
+}
+
+/// Build a canonical-Huffman VLC over a [`crate::g_enum::GExtended`]
+/// alphabet using **synthetic** bit-lengths — round 7 transitional path
+/// until the per-G packed-Huffman bit-length source is unblocked.
+///
+/// The bit-lengths are derived deterministically from the symbol index:
+/// every entry gets a uniform bit-length of `ceil(log2(count_A + 1))`
+/// (so the Kraft sum is exactly 1, every code is prefix-free, and the
+/// alphabet round-trips through [`decode_token`]). This is **not**
+/// bit-exact against the binary's packed-Huffman source (which would
+/// assign variable bit-lengths skewed toward low-magnitude symbols),
+/// but it lets the post-VLC `(run, level, last)` pipeline + the 3-tier
+/// ESC body execute end-to-end against a known-good prefix code for
+/// regression tests.
+///
+/// The resulting table is **only** used by [`AcVlcTable::v3_intra_g0_synthetic`]
+/// / `_g1_synthetic` / `_g2_synthetic` / `_g3_synthetic` (not by the
+/// production [`v3_intra_g0`] / `v3_intra_g1` / `v3_intra_g2` /
+/// `v3_intra_g3` placeholders) — production decode of streams that
+/// select G0..G3 still bails to DC-only reconstruction until the real
+/// bit-length array is wired.
+///
+/// Per spec/09 §10 "Implementer notes" the alphabet is fully
+/// reconstructible from `(count_A, count_B, per-run LMAX)`; this
+/// builder consumes the same data to enumerate the symbols.
+fn build_g_extended_synthetic(g: crate::g_enum::GExtended) -> Vec<VlcEntry<Symbol>> {
+    use crate::g_descriptor::GSymbol;
+    let count_a = g.count_a();
+    // Uniform bit-length = the smallest n such that 2^n >= count_a + 1
+    // (the +1 reserves a code for ESC). Yields a fixed-length code where
+    // every symbol index is its own bit-pattern.
+    let mut bl: u8 = 0;
+    while (1usize << bl) < count_a + 1 {
+        bl += 1;
+    }
+    let mut entries: Vec<VlcEntry<Symbol>> = Vec::with_capacity(count_a + 1);
+    for idx in 0..count_a {
+        let g_symbol = g
+            .decode(idx)
+            .expect("g_enum::decode within count_A range must yield Some");
+        let symbol = match g_symbol {
+            GSymbol::Token(t) => Symbol::RunLevel {
+                last: t.last,
+                run: t.run,
+                level: t.level_mag as u16,
+            },
+            GSymbol::Esc => Symbol::Escape,
+        };
+        entries.push(VlcEntry::new(bl, idx as u32, symbol));
+    }
+    // ESC at idx == count_A (the same convention spec/09 §2 fixes).
+    entries.push(VlcEntry::new(bl, count_a as u32, Symbol::Escape));
+    entries
+}
+
+static G0_SYNTHETIC_TABLE: std::sync::OnceLock<Vec<VlcEntry<Symbol>>> = std::sync::OnceLock::new();
+static G1_SYNTHETIC_TABLE: std::sync::OnceLock<Vec<VlcEntry<Symbol>>> = std::sync::OnceLock::new();
+static G2_SYNTHETIC_TABLE: std::sync::OnceLock<Vec<VlcEntry<Symbol>>> = std::sync::OnceLock::new();
+static G3_SYNTHETIC_TABLE: std::sync::OnceLock<Vec<VlcEntry<Symbol>>> = std::sync::OnceLock::new();
+
+fn g0_synthetic_entries() -> &'static [VlcEntry<Symbol>] {
+    G0_SYNTHETIC_TABLE.get_or_init(|| build_g_extended_synthetic(crate::g_enum::GExtended::G0))
+}
+fn g1_synthetic_entries() -> &'static [VlcEntry<Symbol>] {
+    G1_SYNTHETIC_TABLE.get_or_init(|| build_g_extended_synthetic(crate::g_enum::GExtended::G1))
+}
+fn g2_synthetic_entries() -> &'static [VlcEntry<Symbol>] {
+    G2_SYNTHETIC_TABLE.get_or_init(|| build_g_extended_synthetic(crate::g_enum::GExtended::G2))
+}
+fn g3_synthetic_entries() -> &'static [VlcEntry<Symbol>] {
+    G3_SYNTHETIC_TABLE.get_or_init(|| build_g_extended_synthetic(crate::g_enum::GExtended::G3))
 }
 
 /// Scan-order selection for the AC walk. MS-MPEG4v3 picks this per-block
@@ -1499,15 +1770,21 @@ mod tests {
         assert_eq!(tok.level, 4);
     }
 
-    /// G0..G3 named constructors return the empty placeholder until
+    /// G0..G3 named constructors retain an empty `entries` slice until
     /// their packed-Huffman bit-length sources are extracted (see the
-    /// per-constructor doc-comments for the file-offset blocker).
-    /// This test pins the placeholder behaviour so that when the
-    /// extraction lands and the constructors switch to a real VLC, the
-    /// test breaks loudly and forces a deliberate update — a safety
-    /// net against silent attribution drift.
+    /// per-constructor doc-comments for the file-offset blocker). Round
+    /// 7 (2026-05-14) promoted them from full PLACEHOLDER (no LMAX/RMAX)
+    /// to LMAX/RMAX-bearing placeholders — the level- and run-extension
+    /// tables are derived from the round-29 enumeration so the 3-tier
+    /// ESC body has its offsets ready when the primary VLC lands.
+    ///
+    /// This test pins both invariants: empty `entries` (still spec-OPEN
+    /// per spec/99 §10), LMAX / RMAX populated (round-7 deliverable).
+    /// When the bit-length extraction lands and `entries` becomes
+    /// non-empty, the assert below will break loudly and force a
+    /// deliberate update — safety net against silent attribution drift.
     #[test]
-    fn g0_g3_placeholder_constructors_return_empty_entries() {
+    fn g0_g3_placeholder_constructors_have_lmax_rmax_round_7() {
         for (name, table) in [
             ("G0", AcVlcTable::v3_intra_g0()),
             ("G1", AcVlcTable::v3_intra_g1()),
@@ -1516,14 +1793,39 @@ mod tests {
         ] {
             assert!(
                 table.entries.is_empty(),
-                "{name} constructor should be a placeholder until packed-\
-                 Huffman bit-length extraction lands; got {} entries",
+                "{name} entries should still be empty until packed-\
+                 Huffman bit-length extraction lands (spec/99 §10); \
+                 got {} entries",
                 table.entries.len(),
             );
             assert!(
-                table.lmax.is_none() && table.rmax.is_none(),
-                "{name} placeholder must not carry LMAX/RMAX",
+                table.lmax.is_some(),
+                "{name} placeholder MUST carry LMAX (round-7 deliverable)",
+            );
+            assert!(
+                table.rmax.is_some(),
+                "{name} placeholder MUST carry RMAX (round-7 deliverable)",
             );
         }
+    }
+
+    /// Round-7 cross-check: every G0..G3 enumeration index (run, level,
+    /// last) reflects in the derived LMAX / RMAX tables. The builder
+    /// in [`build_g_extended_lmax`] / [`build_g_extended_rmax`] is
+    /// straight iteration; this test verifies a few load-bearing
+    /// per-(last, run) caps from `spec/09` §8.
+    #[test]
+    fn g0_g3_lmax_rmax_load_bearing_values() {
+        // spec/09 §8 G0 sub-A r0 LMAX = 23 (the largest of any
+        // run=0 sub-A across the four extended descriptors).
+        assert_eq!(g0_lmax()[0][0], 23);
+        // spec/09 §8 G1 sub-A r1 LMAX = 15 (the largest of any r1
+        // across G0..G3 — "G1 is the most aggressively extended").
+        assert_eq!(g1_lmax()[0][1], 15);
+        // spec/09 §5 G2 sub-B level-1 tail extends to r=43 (the
+        // longest of any G-descriptor).
+        assert_eq!(g2_rmax()[1][1], 43);
+        // spec/09 §6 G3 sub-A caps at r=20.
+        assert_eq!(g3_rmax()[0][1], 20);
     }
 }

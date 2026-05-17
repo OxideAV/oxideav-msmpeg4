@@ -7,6 +7,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Round 7 — G0..G3 LMAX/RMAX + synthetic-VLC pipeline wired**
+  (2026-05-17): the four extended-alphabet DCT AC TCOEF descriptors
+  (G0/G1/G2/G3) now carry `Some(lmax)` / `Some(rmax)` extension tables
+  derived from the round-29 enumeration data
+  (`tables/region_*_g{0..3}_enum.csv`), per
+  `docs/video/msmpeg4/spec/09-g0-g3-enumeration.md` §1 + §8. The 3-tier
+  ESC body in `decode_escape_body` can now chain through tier-1
+  (level extension) and tier-2 (run extension) for the G0..G3 paths
+  when the primary canonical-Huffman bit-length array lands.
+  Cross-checked at runtime against every per-(last, run) cap in
+  spec/09 §8's consolidated summary table — G0 sub-A r0 LMAX=23,
+  G1 sub-A r1 LMAX=15, G2 sub-B level-1 tail r=43, G3 sub-A caps at
+  r=20. The `entries` slice on `AcVlcTable::v3_intra_g{0..3}()`
+  remains empty (primary VLC bit-length extraction still spec-OPEN
+  per `docs/video/msmpeg4/spec/99-current-understanding.md` §10 —
+  candidate sources at `0x57a30 / 0x57f80 / 0x58558 / 0x58a08`
+  flagged `verdict: suspect`).
+- **`AcVlcTable::v3_intra_g{0..3}_synthetic`** — new test-only
+  constructors that build a fixed-length canonical Huffman over the
+  G0..G3 enumeration alphabet (every idx is its own bit-pattern at
+  `ceil(log2(count_A + 1))` bits). NOT bit-exact against the binary
+  but lets the post-VLC pipeline + 3-tier ESC body run end-to-end
+  against a known-good prefix code for regression tests. The
+  synthetic VLC bit-width is 8 bits for G0/G2/G3 (count_A 132–168)
+  and 8 bits for G1 (count_A 185). ESC lives at `code == count_A`
+  per spec/09 §2.
+- **`tests/g0_g3_extended.rs`** — 16 new integration tests covering
+  (1) LMAX/RMAX wiring assertions per spec/09 §8, (2) synthetic-VLC
+  round-trip of every non-ESC symbol for all four G-alphabets
+  (633 token round-trips total across G0..G3), (3) 3-tier ESC body
+  walking (tier-1 level extension on G0, tier-2 run extension on G1,
+  tier-3 verbatim FLC on G2, sub-A/sub-B boundary on G3), (4)
+  alphabet shape cross-checks vs spec/15 §7.
+- **Renamed test** `g0_g3_placeholder_constructors_return_empty_entries`
+  → `g0_g3_placeholder_constructors_have_lmax_rmax_round_7` to reflect
+  the round-7 invariant change. New companion test
+  `g0_g3_lmax_rmax_load_bearing_values` pins four load-bearing
+  values from spec/09 §8 against the derived tables.
+
+### Notes
+
+- **PSNR baseline unchanged** at 9.76 dB Y on `testsrc2_32x32_ffmpeg_parity`
+  and 10.93 dB Y on the 176×144 real-fixture diagnostic. Round 7
+  wires the LMAX/RMAX scaffolding and the synthetic-VLC test path;
+  real-content decode of streams that select G0..G3 still bails to
+  DC-only reconstruction until the primary canonical-Huffman
+  bit-length array lands. The unblocking is then `entries: g{0..3}_primary_entries()`
+  swapped into the existing `v3_intra_g{0..3}()` constructors — the
+  LMAX/RMAX are already in place.
+- **Alt-MV (mv_table_sel=1) remains unsupported**: the docs
+  collaborator's round-34..37 docs landed G0..G3 enumeration but did
+  NOT re-extract the truncated 256-byte `region_0594b8.hex` dump.
+  Per spec/06 §2.1 the alt-MV VLC source at VMA `0x1c25a0b8` is the
+  full ~8 KB 1099-entry table — still missing. Dispatch wiring
+  through `decode_mv_with_table` (round 32) is already complete; the
+  swap-in is local to `mv.rs::decode_mv_with_table` once the
+  extraction lands.
+
 ## [0.0.6](https://github.com/OxideAV/oxideav-msmpeg4/compare/v0.0.5...v0.0.6) - 2026-05-07
 
 ### Other

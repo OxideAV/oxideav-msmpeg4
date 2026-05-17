@@ -42,6 +42,9 @@ right decoder when a packet arrives.
 | G5 (intra-luma) `pri_A`                        | wired (round 18)      |
 | G5 (intra-luma) `pri_B`                        | wired (round 19)      |
 | G4 / G5 canonical-Huffman primary VLC          | wired (round 26)      |
+| G0..G3 `(idx → (run, level, last))` enumeration | wired (round 29)     |
+| G0..G3 LMAX / RMAX (ESC-extension offsets)     | wired (round 7, 2026-05-17) |
+| G0..G3 canonical-Huffman primary VLC           | OPEN — extraction blocked (spec/99 §10) |
 | MS-MPEG4v3 3-tier ESC body                     | OPEN — MPEG-4 fallback only |
 | P-frame MV VLC + half-pel MC (default table)   | complete              |
 | P-frame MV VLC alternate table                 | unsupported (truncated dump) |
