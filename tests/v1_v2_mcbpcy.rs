@@ -97,6 +97,109 @@ fn v2_picture_header_parse_round_trip() {
     assert_eq!(h.quant, 8);
 }
 
+/// Round 75 — confirm the shared v1/v2 CBPY codes used at decode time
+/// match the binary's pre-expanded LUT at VMA `0x1c254240`.
+///
+/// Both `decode_mcbpcy_v1` and `decode_mcbpcy_v2` read CBPY via
+/// `decode_cbpy_with_wrap`, which consumes `tables::CBPY_INTRA_TABLE`
+/// (the H.263 Table 8 / MPEG-4 Part 2 Table B-6 hand-derived constants).
+/// Round 75's build.rs cross-check (`emit_cbpy_v1_v2`) parses the binary
+/// LUT and panics at compile time on any drift. This integration test
+/// adds the runtime corroboration: encode each H.263-standard CBPY code
+/// into the same bitstream the binary would, then run it through the
+/// public `mcbpcy::decode_cbpy_no_wrap` entry point and confirm the
+/// recovered CBPY bits match what we packed.
+#[test]
+fn v1_decodes_every_cbpy_code_per_h263_table_8() {
+    // CBPY codes per H.263 Table 8 / MPEG-4 Part 2 Table B-6, sym 0..=15.
+    // Cross-checked by build.rs against the binary's pre-expanded LUT at
+    // VMA 0x1c254240; both sources of truth converge on these tuples.
+    let cbpy: &[(u8, u32, u32)] = &[
+        (0, 4, 0b0011),
+        (1, 5, 0b00101),
+        (2, 5, 0b00100),
+        (3, 4, 0b1001),
+        (4, 5, 0b00011),
+        (5, 4, 0b0111),
+        (6, 6, 0b000010),
+        (7, 4, 0b1011),
+        (8, 5, 0b00010),
+        (9, 6, 0b000011),
+        (10, 4, 0b0101),
+        (11, 4, 0b1010),
+        (12, 4, 0b0100),
+        (13, 4, 0b1000),
+        (14, 4, 0b0110),
+        (15, 2, 0b11),
+    ];
+
+    // We use v1 MCBPC sym=3 (`MBtype=0, CBPC=11`, the inter MB-type with
+    // both chroma blocks coded — see spec/07 §1.4). The v1 MCBPC code
+    // for sym 3 is part of MCBPC_V1_RAW; we don't need to know it
+    // explicitly — we encode it by packing the canonical-Huffman bit
+    // pattern. To avoid coupling the test to MCBPC_V1_RAW internals,
+    // synthesise the MCBPC for sym 0 (always present in the alphabet at
+    // some bl); the exact value isn't important — we just need a valid
+    // v1 MCBPC prefix so the decoder advances to the CBPY read.
+    //
+    // Reading the round-11 v1 test fixtures (mcbpcy.rs::tests at
+    // src/mcbpcy.rs: the v1 MCBPC sym=0 corresponds to (bl=1, code=1)).
+    //
+    // Actually it's cleaner to bypass the decoder and assert that the
+    // *standalone* CBPY decoder produces the expected sym for every
+    // bit-pattern. The v1 decoder skip-path test already exercises
+    // decoder framing; this test exercises only the CBPY side.
+    //
+    // We use the public `decode_cbpy_with_wrap` (apply_wrap = false) so
+    // the decoded `raw` equals the H.263-standard CBPY value directly.
+    use oxideav_core::bits::BitReader;
+    use oxideav_msmpeg4::mcbpcy::decode_cbpy_no_wrap;
+    for &(sym, bl, code) in cbpy {
+        let bytes = pack(&[(code, bl)]);
+        let mut br = BitReader::new(&bytes);
+        let decoded = decode_cbpy_no_wrap(&mut br)
+            .unwrap_or_else(|e| panic!("CBPY decode for sym {sym} (bl={bl}) failed: {e}"));
+        assert_eq!(
+            decoded,
+            sym,
+            "sym {sym} (bl={bl}, code=0b{code:0width$b}) decoded as {decoded}",
+            width = bl as usize
+        );
+    }
+}
+
+/// Round 75 — confirm the binary's reserved-sentinel CBPY entries
+/// surface as bitstream errors (raw > 15 ⇒ runtime range-check rejection).
+#[test]
+fn v1_v2_cbpy_reserved_sentinel_codes_are_rejected() {
+    // Per build.rs::emit_cbpy_v1_v2, the binary places sentinel symbols
+    // 0x10 and 0x11 at the all-zero (`000000`) and `000001` 6-bit
+    // windows. Both are outside the 0..15 CBPY alphabet. Confirm the
+    // runtime decoder rejects them via the existing `raw > 15` check.
+    use oxideav_core::bits::BitReader;
+    use oxideav_msmpeg4::mcbpcy::decode_cbpy_no_wrap;
+    for code in [0b000000u32, 0b000001u32] {
+        let bytes = pack(&[(code, 6)]);
+        let mut br = BitReader::new(&bytes);
+        let result = decode_cbpy_no_wrap(&mut br);
+        // The hand-derived CBPY_INTRA_TABLE does NOT include the
+        // reserved-sentinel symbols, so the decoder either (a) returns
+        // an error (no matching codeword) or (b) returns a raw value
+        // that fails the downstream `> 15` range check. Both outcomes
+        // are correct — the bitstream is malformed. Assert the call
+        // does not silently succeed with a value in 0..=15.
+        match result {
+            Ok(v) => assert!(
+                v > 15,
+                "reserved CBPY code 0b{code:06b} silently decoded to in-alphabet sym {v}"
+            ),
+            Err(_) => {
+                // Expected: codeword not found in the hand-derived table.
+            }
+        }
+    }
+}
+
 /// Drive a real ffmpeg-encoded msmpeg4v2 stream through our top-level
 /// decoder. We expect the picture header to parse successfully and the
 /// decoder to surface a documented `Unsupported` error citing spec/99

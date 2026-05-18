@@ -81,6 +81,30 @@ fn main() {
     println!("cargo:rerun-if-changed={}", mcbpc_hex.display());
     emit_mcbpc_v1_v2(&mcbpc_hex, &out_dir.join("mcbpc_v1_v2.rs"));
 
+    // v1/v2 shared CBPY table — 053640 (4096 bytes at file 0x53640 / VMA
+    // 0x1c254240). Per spec/07 §1.3 / §2.3 the shared 16-entry CBPY VLC
+    // (max-bitlen 6) is consumed by helper 0x1c215811 from both v1's
+    // 0x1c2171c7 and v2's 0x1c21729c MB-header decoders. The first 64
+    // entries (= 6-bit pre-expanded LUT, 128 bytes) hold the CBPY table
+    // itself; the trailing 3968 bytes are sibling LUTs unrelated to CBPY
+    // (different pre-expansion widths per the per-pair stride observed
+    // in `tables/region_053640.hex`).
+    //
+    // Round 75 (2026-05-18): the binary's CBPY pre-expanded LUT is now
+    // parsed in build.rs and cross-checked byte-for-byte against the
+    // hand-derived `CBPY_INTRA_TABLE` (which comes from H.263 Table 8 /
+    // MPEG-4 Part 2 Table B-6, public standards). This closes the v1/v2
+    // CBPY provenance gap: the H.263-derived (bl, code, sym) tuples
+    // match the binary's pre-expanded LUT exactly, and a build break
+    // fires if the docs ever drift. The binary additionally fills the
+    // 6-bit-window slots `000000` and `000001` with sentinel symbols
+    // (0x10, 0x11) — these are not part of the 16-symbol CBPY alphabet
+    // and mark "invalid bitstream" outcomes; the runtime decoder rejects
+    // syms ≥ 16 via the existing range check in `decode_cbpy_with_wrap`.
+    let cbpy_hex = tables_dir.join("region_053640.hex");
+    println!("cargo:rerun-if-changed={}", cbpy_hex.display());
+    emit_cbpy_v1_v2(&cbpy_hex, &out_dir.join("cbpy_v1_v2.rs"));
+
     // v1/v2 per-component MV VLC table — 04ed30_full (16384 bytes at file
     // offset 0x4ed30 / VMA 0x1c24f930). Per spec/06 §2.3 / spec/07 §3 the
     // helper 0x1c215811 is invoked with max-bitlen 13, so the LUT is
@@ -708,6 +732,167 @@ fn emit_mcbpc_v1_v2(hex_path: &Path, out_path: &Path) {
     )
     .unwrap();
     for &(sym, bl, code) in &v2 {
+        writeln!(f, "    ({sym}, {bl}, 0x{code:x}),").unwrap();
+    }
+    writeln!(f, "];").unwrap();
+}
+
+/// Parse the shared v1/v2 CBPY pre-expanded LUT (region at file 0x53640 /
+/// VMA 0x1c254240) and emit canonical-Huffman `(sym, bit_length, code)`
+/// triples for the 16-entry CBPY alphabet.
+///
+/// LUT format: same `(bit_length, symbol)` halfword convention as
+/// `emit_mcbpc_v1_v2`, with max-bitlen 6. The first 64 entries (128
+/// bytes) hold the CBPY pre-expansion; subsequent sub-tables in the
+/// 4096-byte region belong to different VLCs (different alphabets and
+/// pre-expansion widths per the per-pair stride observed in the hex
+/// dump) and are NOT consumed here. Per spec/07 §1.3 / §2.3, only the
+/// first 6-bit window is the CBPY VLC.
+///
+/// Special-case decoding: the binary fills the two reserved 6-bit
+/// prefixes `000000` and `000001` with sentinel symbols 0x10 and 0x11
+/// respectively. Neither is in the 0..15 CBPY alphabet — they mark
+/// "invalid bitstream" outcomes that the runtime decoder rejects via
+/// `decode_cbpy_with_wrap`'s `raw > 15` range check. Per `audit/01`
+/// §2.3's sentinel convention this is consistent with how the binary
+/// marks reserved codewords.
+///
+/// **Cross-check guarantee:** the emitted `CBPY_V1_V2_RAW` table is
+/// verified at build time against the hand-derived `CBPY_INTRA_TABLE`
+/// (H.263 Table 8 / MPEG-4 Part 2 Table B-6, public standards). If the
+/// binary's pre-expanded LUT ever drifts from the standard, the build
+/// breaks with a precise error pointing at the divergent (sym, bl,
+/// code) tuple.
+fn emit_cbpy_v1_v2(hex_path: &Path, out_path: &Path) {
+    let bytes = parse_xxd(hex_path);
+    if bytes.len() != 4096 {
+        panic!(
+            "expected 4096 bytes in {} (shared CBPY + sibling LUTs at file 0x53640), got {}",
+            hex_path.display(),
+            bytes.len()
+        );
+    }
+
+    // First 128 bytes = 6-bit pre-expanded CBPY LUT (64 entries × 2 bytes).
+    let cbpy_lut = &bytes[..128];
+    let raw = extract_lut_alphabet(cbpy_lut, 6);
+
+    // Filter out the two reserved-sentinel symbols (0x10 and 0x11) — both
+    // are bl=6 codes at the all-zero / all-zero-but-LSB 6-bit windows,
+    // not part of the 16-entry CBPY alphabet. The runtime decoder
+    // rejects raw values > 15 via the existing range check.
+    let cbpy: Vec<(u8, u8, u32)> = raw.iter().filter(|&&(s, _, _)| s < 16).copied().collect();
+
+    if cbpy.len() != 16 {
+        panic!(
+            "v1/v2 CBPY: expected 16 alphabet symbols (per H.263 Table 8 / MPEG-4 Part 2 \
+             Table B-6, spec/07 §1.3), got {} after filtering reserved sentinels {{0x10, 0x11}}",
+            cbpy.len()
+        );
+    }
+
+    // Cross-check against the H.263 / MPEG-4 Part 2 Table B-6 values that
+    // ship in `src/tables.rs::CBPY_INTRA_TABLE`. The table is small
+    // enough to inline here as the cross-check oracle. If the binary
+    // ever drifts from H.263 the build breaks with a precise tuple
+    // mismatch error.
+    let expected: &[(u8, u8, u32)] = &[
+        (0, 4, 0b0011),
+        (1, 5, 0b00101),
+        (2, 5, 0b00100),
+        (3, 4, 0b1001),
+        (4, 5, 0b00011),
+        (5, 4, 0b0111),
+        (6, 6, 0b000010),
+        (7, 4, 0b1011),
+        (8, 5, 0b00010),
+        (9, 6, 0b000011),
+        (10, 4, 0b0101),
+        (11, 4, 0b1010),
+        (12, 4, 0b0100),
+        (13, 4, 0b1000),
+        (14, 4, 0b0110),
+        (15, 2, 0b11),
+    ];
+    for (got, exp) in cbpy.iter().zip(expected.iter()) {
+        if got != exp {
+            panic!(
+                "v1/v2 CBPY binary-vs-H.263 mismatch at sym {}: binary (bl={}, code=0b{:0width$b}) \
+                 vs H.263 Table 8 (bl={}, code=0b{:0width$b})",
+                exp.0,
+                got.1,
+                got.2,
+                exp.1,
+                exp.2,
+                width = exp.1 as usize,
+            );
+        }
+    }
+
+    // Kraft sum check: 16 codes + 2 reserved sentinels = 18 leaves of
+    // a 6-bit prefix space. Kraft sum over the 16 alphabet entries
+    // (excluding sentinels) is 1 - 2 * 2^-6 = 1 - 1/32 = 31/32. The two
+    // reserved sentinels each occupy one bl=6 leaf.
+    let kraft: u64 = cbpy.iter().map(|&(_, bl, _)| 1u64 << (32 - bl)).sum();
+    let target_kraft: u64 = (1u64 << 32) - 2 * (1u64 << (32 - 6));
+    if kraft != target_kraft {
+        panic!(
+            "v1/v2 CBPY Kraft sum {kraft} != expected {target_kraft} (= 1 - 2/64 \
+             in fixed-point, accounting for the 2 reserved bl=6 sentinels)"
+        );
+    }
+
+    // Also capture the two sentinel symbols + their code positions for
+    // the diagnostic test surface (so a regression in the binary's
+    // sentinel positioning is visible).
+    let sentinels: Vec<(u8, u8, u32)> = raw.iter().filter(|&&(s, _, _)| s >= 16).copied().collect();
+    if sentinels.len() != 2 {
+        panic!(
+            "v1/v2 CBPY: expected exactly 2 reserved-sentinel symbols (per binary @ VMA \
+             0x1c254240 LUT slots 0..1), got {} (syms: {:?})",
+            sentinels.len(),
+            sentinels.iter().map(|&(s, _, _)| s).collect::<Vec<_>>()
+        );
+    }
+
+    let mut f = fs::File::create(out_path)
+        .unwrap_or_else(|e| panic!("failed to create {}: {e}", out_path.display()));
+    writeln!(
+        f,
+        "// Auto-generated by build.rs from \
+         docs/video/msmpeg4/tables/region_053640.hex (copied to\n\
+         // crates/oxideav-msmpeg4/tables/). DO NOT EDIT.\n\
+         // Source binary: mpg4c32.dll SHA-256 \
+         aedb4cf3d33c8554ab8acf04afe2d936eaa7c49107c5fefe163bca2e94b3c099\n\
+         // Role: shared v1/v2 CBPY VLC at VMA 0x1c254240 (per spec/07 §1.3 / §2.3,\n\
+         // helper 0x1c215811 with max-bitlen 6, 16-entry alphabet + 2 reserved\n\
+         // sentinels). Cross-checked at build time against H.263 Table 8 /\n\
+         // MPEG-4 Part 2 Table B-6 values in src/tables.rs::CBPY_INTRA_TABLE.\n\
+         \n\
+         /// (symbol, bit_length, canonical_code) triples for the shared v1/v2 CBPY\n\
+         /// VLC, extracted from the binary's 6-bit pre-expanded LUT and verified\n\
+         /// to match H.263 Table 8 / MPEG-4 Part 2 Table B-6 byte-for-byte. The\n\
+         /// runtime decoder uses src/tables.rs::CBPY_INTRA_TABLE; this constant\n\
+         /// exists so the build cross-checks the two against each other and so\n\
+         /// downstream tests can assert binary-traceability of the CBPY VLC path.\n\
+         pub const CBPY_V1_V2_RAW: &[(u8, u8, u32)] = &["
+    )
+    .unwrap();
+    for &(sym, bl, code) in &cbpy {
+        writeln!(f, "    ({sym}, {bl}, 0x{code:x}),").unwrap();
+    }
+    writeln!(
+        f,
+        "];\n\n\
+         /// Reserved-sentinel `(sym, bl, code)` entries the binary's CBPY LUT\n\
+         /// places at the all-zero (`000000`) and next-to-all-zero (`000001`)\n\
+         /// 6-bit windows. Both syms are outside the 0..15 CBPY alphabet and\n\
+         /// would be rejected by the runtime decoder's `raw > 15` range check.\n\
+         /// Per spec/07 §1.3 these are 'invalid bitstream' markers.\n\
+         pub const CBPY_V1_V2_SENTINELS: &[(u8, u8, u32)] = &["
+    )
+    .unwrap();
+    for &(sym, bl, code) in &sentinels {
         writeln!(f, "    ({sym}, {bl}, 0x{code:x}),").unwrap();
     }
     writeln!(f, "];").unwrap();

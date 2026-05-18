@@ -288,6 +288,18 @@ fn decode_cbpy_with_wrap(br: &mut BitReader<'_>, apply_wrap: bool) -> Result<u8>
     Ok(val)
 }
 
+/// Public entry point for the raw CBPY VLC decode (no `15 - raw` wrap).
+///
+/// Returns the literal 4-bit CBPY pattern read from the bitstream. The
+/// runtime v1/v2 decoder bodies (`decode_mcbpcy_v1` / `decode_mcbpcy_v2`)
+/// always apply the wrap per spec/07 §1.2 / §2.5; this raw form is
+/// exposed for integration tests that need to cross-check the CBPY VLC
+/// codes against an external table (e.g. the binary-derived
+/// `CBPY_V1_V2_RAW` triples in `tables_data`).
+pub fn decode_cbpy_no_wrap(br: &mut BitReader<'_>) -> Result<u8> {
+    decode_cbpy_with_wrap(br, false)
+}
+
 /// Decode one v1 MCBPCY packet from the bitstream.
 ///
 /// Sequence (matching spec/07 §1.1-§1.4, decoder body at

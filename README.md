@@ -50,6 +50,7 @@ right decoder when a packet arrives.
 | P-frame MV VLC alternate table                 | unsupported (truncated dump) |
 | Inter AC run/level VLC (G4 wired but unused)   | pending — needs P-frame plumbing |
 | V1 / V2 bitstream                              | header + MV + MCBPC done; AC OPEN |
+| V1 / V2 shared CBPY VLC                        | binary cross-check vs H.263 (round 75) |
 
 ### What's still spec-OPEN for real-content decode
 

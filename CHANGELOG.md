@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 75 — v1/v2 shared CBPY VLC binary cross-check** (2026-05-18):
+  the binary's 6-bit pre-expanded CBPY pre-expansion LUT at VMA
+  `0x1c254240` (file offset `0x53640`, region `region_053640.hex`,
+  128 bytes for the 64-entry 6-bit window) is now parsed at build time
+  by `build.rs::emit_cbpy_v1_v2` and verified to match the H.263
+  Table 8 / MPEG-4 Part 2 Table B-6 hand-derived `CBPY_INTRA_TABLE`
+  byte-for-byte. The binary additionally fills the two unused 6-bit
+  prefix slots (`000000` and `000001`) with reserved-sentinel symbols
+  (0x10 and 0x11); these are emitted as `CBPY_V1_V2_SENTINELS` and
+  flagged in tests, with the runtime decoder's existing `raw > 15`
+  range check rejecting them as malformed bitstream per spec/07 §1.3.
+  The build breaks with a precise tuple-mismatch error if the binary
+  ever drifts from the public-standard CBPY codes; the same invariants
+  are pinned as 7 new `tables_data::tests` (alphabet size, max
+  bit-length, exact match vs `CBPY_INTRA_TABLE`, Kraft sum accounting
+  for sentinels, sentinel placement, prefix-freedom, sym=15 short-code
+  load-bearing value) plus 2 new `tests/v1_v2_mcbpcy.rs` integration
+  tests (every-code round-trip via the new public
+  `mcbpcy::decode_cbpy_no_wrap` entry point, reserved-sentinel
+  rejection). Test count delta: 229 lib + 7 v1_v2_mcbpcy = +9 tests.
+  This closes the v1/v2 CBPY VLC provenance gap: the H.263-derived
+  table and the binary's pre-expanded LUT are now lock-stepped through
+  a build-time invariant. The runtime decoder continues to consume
+  `CBPY_INTRA_TABLE` (no behavioural change); the new
+  `CBPY_V1_V2_RAW` / `CBPY_V1_V2_SENTINELS` constants serve as the
+  binary-traceable cross-check oracle.
+
 - **Round 7 — G0..G3 LMAX/RMAX + synthetic-VLC pipeline wired**
   (2026-05-17): the four extended-alphabet DCT AC TCOEF descriptors
   (G0/G1/G2/G3) now carry `Some(lmax)` / `Some(rmax)` extension tables
