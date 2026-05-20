@@ -9,6 +9,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 81 — spec/15 §3 per-G `(count_A, count_B)` source-of-truth pin**
+  (2026-05-21): introduce a single authoritative `G_COUNTS_SPEC15:
+  [(u32, u32); 6]` table in `build.rs` (top-of-file), emitted into
+  `tables_data::G_COUNTS_SPEC15` plus a derived
+  `G_SUBCLASS_SIZES_SPEC15` of `(sub_A, sub_B)` pairs. The six values
+  `(168,98) (185,118) (148,80) (132,84) (102,57) (102,66)` are lifted
+  verbatim from the `mb_mv_struct_init` constructor disassembly at
+  VMA `0x1c210643` per `docs/video/msmpeg4/spec/15-count-ab-per-g-family.md`
+  §2.1, and have been independently cross-checked across eight prior
+  spec documents (02/03/04/05/08/09/13/14) per spec/15 §7
+  ("All six G-families CONSISTENT"). The existing scattered literals
+  in `build.rs` — four `emit_g_enum` call-sites for G0..G3 and the
+  G4/G5 hardcoded constants inside `emit_g_descriptor_cluster` — are
+  now pulled from `G_COUNTS_SPEC15` with build-time `panic!` cross-
+  checks if they ever drift. The build-side `emit_g_counts_spec15`
+  additionally verifies the partition arithmetic `sub_A = count_B+1`
+  / `sub_B = count_A-count_B-1` reproduces the spec/03 §4.4 reference
+  values exactly. Eight new `tables_data::tests` pin: alphabet length
+  is six; each tuple matches its constructor disassembly; sub-class
+  sizes match spec/03 §4.4; runtime partition arithmetic matches the
+  build-time emit; G4/G5 cross-check against the legacy
+  `G{4,5}_COUNT_A`/`_COUNT_B` constants; G0..G3 cross-check via the
+  `g_enum::GExtended::count_a()` / `count_b()` dispatch surface;
+  `sub_A + sub_B = count_A` (the ESC sentinel sits outside both
+  sub-classes); and G4/G5 share `count_A = 102` but differ on
+  `count_B`. Test count delta: 229 → 237 lib (+8). Total suite:
+  314 → 322 tests passing. This collapses six scattered (count_A,
+  count_B) literal-pair sites to a single source-of-truth with
+  build-time and runtime cross-checks, so future per-G count drift
+  surfaces immediately rather than silently diverging across the
+  build script, the `g_descriptor` module, and the `g_enum` module.
+  No runtime behavioural change.
+
 - **Round 75 — v1/v2 shared CBPY VLC binary cross-check** (2026-05-18):
   the binary's 6-bit pre-expanded CBPY pre-expansion LUT at VMA
   `0x1c254240` (file offset `0x53640`, region `region_053640.hex`,

@@ -51,6 +51,7 @@ right decoder when a packet arrives.
 | Inter AC run/level VLC (G4 wired but unused)   | pending — needs P-frame plumbing |
 | V1 / V2 bitstream                              | header + MV + MCBPC done; AC OPEN |
 | V1 / V2 shared CBPY VLC                        | binary cross-check vs H.263 (round 75) |
+| G0..G5 (count_A, count_B) provenance pin       | spec/15 §3 binary-derived (round 81) |
 
 ### What's still spec-OPEN for real-content decode
 

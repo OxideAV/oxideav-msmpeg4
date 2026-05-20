@@ -42,10 +42,66 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+/// Authoritative per-G-family `(count_A, count_B)` values lifted from
+/// the `mb_mv_struct_init` constructor body at VMA `0x1c210643` per
+/// `docs/video/msmpeg4/spec/15-count-ab-per-g-family.md` §2.1 / §3.
+///
+/// Each tuple is `(count_A, count_B)` for descriptors G0 through G5 in
+/// index order. `count_A` is the alphabet size (= the ESC sentinel
+/// index); `count_B` is the sub-A / sub-B partition boundary
+/// (`idx ≤ count_B` ⇒ sub-A / `last = 0`; `count_B < idx < count_A` ⇒
+/// sub-B / `last = 1`; `idx == count_A` ⇒ ESC).
+///
+/// These six pairs are the single source of truth the build script
+/// cross-checks every per-G consumer against:
+///
+/// * `emit_g_enum` for G0..G3 (per-G enum CSV row counts must equal
+///   `count_A` and the implied sub-A length must equal `count_B + 1`).
+/// * `emit_g_descriptor_cluster` for G4/G5 (the byte slices' lengths
+///   are sized by `count_A`; the sub-A/B partition pivot index is
+///   `count_B`).
+///
+/// Per spec/15 §7 ("All six G-families CONSISTENT") this table is
+/// cross-checked against eight independent prior `spec/*.md` documents
+/// (02, 03, 04, 05, 08, 09, 13, 14) and the per-G `tables/region_*g{0..3}_enum.{csv,meta}`
+/// extractor outputs — every citation agrees. If the binary's
+/// constructor immediates ever drift from these values, this constant
+/// (and every consumer of it) needs to be re-derived from a fresh
+/// disassembly per spec/15 §2; do NOT edit the numbers in-place
+/// without re-running that workflow.
+///
+/// FROM: `docs/video/msmpeg4/spec/15-count-ab-per-g-family.md` §3
+/// (table at lines 181-187) and §2.1 (constructor disassembly at
+/// VMAs `1c210653..1c21086c`).
+const G_COUNTS_SPEC15: [(u32, u32); 6] = [
+    (168, 98),  // G0 — chroma + all-inter (class 1); constructor 1c210653 / 1c21065d
+    (185, 118), // G1 — intra-luma (class 1); constructor 1c2106b1 / 1c2106bb
+    (148, 80),  // G2 — chroma + all-inter (class 0); constructor 1c210710 / 1c21071a
+    (132, 84),  // G3 — intra-luma (class 0); constructor 1c210778 / 1c210788
+    (102, 57),  // G4 — MPEG-4 Part 2 Inter LMAX baseline; constructor 1c210810 / 1c21081a
+    (102, 66),  // G5 — MPEG-4 Part 2 Intra LMAX baseline; constructor 1c210862 / 1c21086c
+];
+
+/// Sub-class partition arithmetic per spec/03 §4.4 / spec/15 §5.2:
+/// `sub_A = count_B + 1`; `sub_B = count_A - count_B - 1`. Returns the
+/// `(sub_A, sub_B)` pair for the supplied G-family index.
+fn g_subclass_sizes(g: usize) -> (u32, u32) {
+    let (count_a, count_b) = G_COUNTS_SPEC15[g];
+    (count_b + 1, count_a - count_b - 1)
+}
+
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let tables_dir = manifest_dir.join("tables");
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+
+    // Emit the authoritative spec/15 §3 per-G (count_A, count_B) table
+    // as a runtime constant so downstream tests and any future per-G
+    // dispatch logic can re-cite it instead of hardcoding six pairs.
+    // This is the single source of truth the rest of build.rs
+    // cross-checks against (see `emit_g_enum` and
+    // `emit_g_descriptor_cluster`).
+    emit_g_counts_spec15(&out_dir.join("g_counts.rs"));
 
     // MCBPCY table — 05eac8.
     let mcbpcy_csv = tables_dir.join("region_05eac8.csv");
@@ -268,10 +324,43 @@ fn main() {
     println!("cargo:rerun-if-changed={}", g1_enum.display());
     println!("cargo:rerun-if-changed={}", g2_enum.display());
     println!("cargo:rerun-if-changed={}", g3_enum.display());
-    emit_g_enum(&g0_enum, &out_dir.join("g0_enum.rs"), "G0", 168, 98);
-    emit_g_enum(&g1_enum, &out_dir.join("g1_enum.rs"), "G1", 185, 118);
-    emit_g_enum(&g2_enum, &out_dir.join("g2_enum.rs"), "G2", 148, 80);
-    emit_g_enum(&g3_enum, &out_dir.join("g3_enum.rs"), "G3", 132, 84);
+    // Per-G enum extraction. The `(count_A, count_B)` arguments are
+    // pulled from the spec/15 §3 authoritative table — DO NOT hardcode
+    // them locally. The emitter additionally cross-checks the CSV row
+    // count against `count_A` and the sub-A row count against
+    // `count_B + 1` (see `emit_g_enum`).
+    let (g0_ca, g0_cb) = G_COUNTS_SPEC15[0];
+    let (g1_ca, g1_cb) = G_COUNTS_SPEC15[1];
+    let (g2_ca, g2_cb) = G_COUNTS_SPEC15[2];
+    let (g3_ca, g3_cb) = G_COUNTS_SPEC15[3];
+    emit_g_enum(
+        &g0_enum,
+        &out_dir.join("g0_enum.rs"),
+        "G0",
+        g0_ca as usize,
+        g0_cb as usize,
+    );
+    emit_g_enum(
+        &g1_enum,
+        &out_dir.join("g1_enum.rs"),
+        "G1",
+        g1_ca as usize,
+        g1_cb as usize,
+    );
+    emit_g_enum(
+        &g2_enum,
+        &out_dir.join("g2_enum.rs"),
+        "G2",
+        g2_ca as usize,
+        g2_cb as usize,
+    );
+    emit_g_enum(
+        &g3_enum,
+        &out_dir.join("g3_enum.rs"),
+        "G3",
+        g3_ca as usize,
+        g3_cb as usize,
+    );
 
     // ESC-extension table cluster — region_060988 (round 33; spec/08 §1
     // + §2 + §4). 24 contiguous slices at file 0x60988..0x61200 (VMA
@@ -1052,11 +1141,35 @@ fn emit_g_descriptor_cluster(hex_path: &Path, g5_pri_b_path: &Path, out_path: &P
     // ⇒ slice offset 0xc70..0xcd6.
     const G4_PRIA_OFF: usize = 0xc70;
     const G4_PRIB_OFF: usize = 0xcd8;
+    const G5_PRIA_OFF: usize = 0xe70;
+    // G4 / G5 (count_A, count_B) pulled from the spec/15 §3
+    // authoritative table — do NOT inline literal values here.
+    // Per spec/15 §2.1 the constructor literals at VMAs `1c210810` (G4)
+    // and `1c210862` (G5) store `0x66 = 102` for both `count_A`s;
+    // `1c21081a` stores `0x39 = 57` for G4 `count_B` and `1c21086c`
+    // stores `0x42 = 66` for G5 `count_B`. The local constants below
+    // are cross-checked against `G_COUNTS_SPEC15` at build time so a
+    // future drift on either side surfaces immediately.
+    let (g4_ca_u32, g4_cb_u32) = G_COUNTS_SPEC15[4];
+    let (g5_ca_u32, g5_cb_u32) = G_COUNTS_SPEC15[5];
     const G4_COUNT_A: usize = 102;
     const G4_COUNT_B: usize = 57;
-    const G5_PRIA_OFF: usize = 0xe70;
     const G5_COUNT_A: usize = 102;
     const G5_COUNT_B: usize = 66;
+    if G4_COUNT_A as u32 != g4_ca_u32 || G4_COUNT_B as u32 != g4_cb_u32 {
+        panic!(
+            "build.rs G-descriptor cluster: G4 ({G4_COUNT_A}, {G4_COUNT_B}) mismatch vs \
+             spec/15 §3 G_COUNTS_SPEC15[4] = ({g4_ca_u32}, {g4_cb_u32}) — re-derive \
+             from the constructor disassembly per spec/15 §2"
+        );
+    }
+    if G5_COUNT_A as u32 != g5_ca_u32 || G5_COUNT_B as u32 != g5_cb_u32 {
+        panic!(
+            "build.rs G-descriptor cluster: G5 ({G5_COUNT_A}, {G5_COUNT_B}) mismatch vs \
+             spec/15 §3 G_COUNTS_SPEC15[5] = ({g5_ca_u32}, {g5_cb_u32}) — re-derive \
+             from the constructor disassembly per spec/15 §2"
+        );
+    }
 
     let g4_pri_a = &bytes[G4_PRIA_OFF..G4_PRIA_OFF + G4_COUNT_A];
     let g4_pri_b_bytes = &bytes[G4_PRIB_OFF..G4_PRIB_OFF + G4_COUNT_A * 4];
@@ -2089,4 +2202,95 @@ fn emit_esc_ext_cluster(hex_path: &Path, csv_path: &Path, out_path: &Path) {
         )
         .unwrap();
     }
+}
+
+/// Emit `g_counts.rs` carrying the spec/15 §3 authoritative per-G
+/// `(count_A, count_B)` table as a runtime constant. The values are
+/// lifted verbatim from `G_COUNTS_SPEC15` (see top of build.rs); each
+/// pair was originally extracted from the binary's `mb_mv_struct_init`
+/// constructor body at VMA `0x1c210643` per spec/15 §2.1.
+///
+/// Build-time self-check: the partition arithmetic
+/// `sub_A = count_B + 1` / `sub_B = count_A - count_B - 1` must yield
+/// the sizes spec/03 §4.4 documents. This catches the case where one
+/// of the six (count_A, count_B) pairs is off-by-one without the
+/// partition pivot in `emit_g_descriptor_cluster` / `emit_g_enum`
+/// noticing.
+///
+/// FROM: `docs/video/msmpeg4/spec/15-count-ab-per-g-family.md` §3
+/// (binary), §4.1 (enum CSVs), §5 (eight prior spec citations).
+fn emit_g_counts_spec15(out_path: &Path) {
+    // Spec/03 §4.4 / spec/15 §5.2 sub-A / sub-B sizes per G. These are
+    // the reference values the partition arithmetic must reproduce
+    // exactly. If a future round needs to add G6+ or revise the binary
+    // constructor disassembly, update both `G_COUNTS_SPEC15` and this
+    // reference table together (and re-run the build).
+    let expected_sub_a_b: [(u32, u32); 6] = [
+        (99, 69),  // G0
+        (119, 66), // G1
+        (81, 67),  // G2
+        (85, 47),  // G3
+        (58, 44),  // G4
+        (67, 35),  // G5
+    ];
+    for (g, &(want_a, want_b)) in expected_sub_a_b.iter().enumerate() {
+        let (got_a, got_b) = g_subclass_sizes(g);
+        if got_a != want_a || got_b != want_b {
+            panic!(
+                "G{g} sub-class sizes ({got_a}, {got_b}) mismatch vs spec/03 §4.4 / \
+                 spec/15 §5.2 ({want_a}, {want_b}) — partition arithmetic on \
+                 G_COUNTS_SPEC15[{g}] is wrong; check whether (count_A, count_B) = \
+                 {:?} is consistent with the constructor disassembly per spec/15 §2.1",
+                G_COUNTS_SPEC15[g],
+            );
+        }
+    }
+
+    let mut f = fs::File::create(out_path)
+        .unwrap_or_else(|e| panic!("failed to create {}: {e}", out_path.display()));
+    writeln!(
+        f,
+        "// Auto-generated by build.rs from the in-source `G_COUNTS_SPEC15` table.\n\
+         // DO NOT EDIT.\n\
+         // Source: docs/video/msmpeg4/spec/15-count-ab-per-g-family.md §3 /\n\
+         //         constructor disassembly `mb_mv_struct_init` at VMA 0x1c210643\n\
+         //         in mpg4c32.dll (SHA-256\n\
+         //         aedb4cf3d33c8554ab8acf04afe2d936eaa7c49107c5fefe163bca2e94b3c099).\n\
+         \n\
+         /// Per-G-family `(count_A, count_B)` for the six MS-MPEG4 DCT-AC\n\
+         /// G-descriptors (G0..G5). Indexed by G-family number. `count_A`\n\
+         /// is the alphabet size (and ESC sentinel index). `count_B` is\n\
+         /// the sub-A / sub-B partition boundary: `idx <= count_B` is\n\
+         /// sub-A (`last = 0`), `count_B < idx < count_A` is sub-B\n\
+         /// (`last = 1`), `idx == count_A` is ESC.\n\
+         ///\n\
+         /// Per spec/15 §7 (\"All six G-families CONSISTENT\") these values\n\
+         /// have been cross-checked against eight independent prior spec\n\
+         /// documents (02, 03, 04, 05, 08, 09, 13, 14) and the\n\
+         /// per-G enum CSV row counts; every citation agrees.\n\
+         pub const G_COUNTS_SPEC15: [(u32, u32); 6] = ["
+    )
+    .unwrap();
+    for (g, &(ca, cb)) in G_COUNTS_SPEC15.iter().enumerate() {
+        writeln!(f, "    ({ca}, {cb}), // G{g}").unwrap();
+    }
+    writeln!(f, "];\n").unwrap();
+
+    writeln!(
+        f,
+        "/// Per-G-family `(sub_A_size, sub_B_size)` derived from\n\
+         /// `G_COUNTS_SPEC15` via the partition arithmetic in\n\
+         /// spec/03 §4.4 / spec/15 §5.2: `sub_A = count_B + 1`,\n\
+         /// `sub_B = count_A - count_B - 1`. Cross-checked at build\n\
+         /// time against the explicit reference table emit_g_counts_spec15\n\
+         /// carries (so a future drift in either source surfaces as a\n\
+         /// build break, not a runtime mismatch).\n\
+         pub const G_SUBCLASS_SIZES_SPEC15: [(u32, u32); 6] = ["
+    )
+    .unwrap();
+    for (g, _) in G_COUNTS_SPEC15.iter().enumerate() {
+        let (sa, sb) = g_subclass_sizes(g);
+        writeln!(f, "    ({sa}, {sb}), // G{g}").unwrap();
+    }
+    writeln!(f, "];\n").unwrap();
 }
