@@ -48,7 +48,7 @@ right decoder when a packet arrives.
 | MS-MPEG4v3 3-tier ESC body                     | OPEN — MPEG-4 fallback only |
 | P-frame MV VLC + half-pel MC (default table)   | complete              |
 | P-frame MV VLC alternate table                 | unsupported (truncated dump) |
-| Inter AC run/level VLC (G4 wired but unused)   | pending — needs P-frame plumbing |
+| Inter AC residual (G4 VLC → IDCT → add to MC)  | complete (round 123) |
 | V1 / V2 bitstream                              | header + MV + MCBPC done; AC OPEN |
 | V1 / V2 shared CBPY VLC                        | binary cross-check vs H.263 (round 75) |
 | G0..G5 (count_A, count_B) provenance pin       | spec/15 §3 binary-derived (round 81) |
@@ -115,9 +115,15 @@ What's **still missing for bit-exact real-content decode**:
   bit-stream desync whenever it fires, which produces the
   `scan position ≥ 64` overflow currently seen on `testsrc2 32×32`
   past the first MB or two. Wiring this is the next round's work.
-* **Inter AC** — G4 primary VLC is also wired (`AcVlcTable::g4_inter`)
-  but the P-frame block-decode path doesn't yet consume it. Round
-  26 leaves the G4 hookup as plumbing for the next inter round.
+* **Inter AC** — wired end-to-end as of **round 123**. The P-frame
+  inter-MB path now decodes the G4 inter VLC (`AcVlcTable::g4_inter`)
+  for every CBP-coded block, dequantises, IDCTs to a signed residual,
+  and adds it onto the MC prediction (`ac::decode_inter_block` +
+  `picture::add_residual_to_picture`, spec/04 §1 / §2.6). Inter blocks
+  start the scan at position 0 (DC is coded), always use fixed zigzag,
+  and use the single-tier verbatim ESC. What remains inter-side is the
+  **alternate MV VLC** (`mv_table_sel == 1`, truncated dump) and
+  **INTER4V** (per-4×4 MV) signalling.
 
 Net effect: `testsrc2 32×32` real DIV3 decode now reaches per-block
 AC walks (errors at `scan position 64 exceeds block` past the first

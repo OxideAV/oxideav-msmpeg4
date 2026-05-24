@@ -1216,6 +1216,112 @@ pub fn decode_intra_block(
     Ok(n)
 }
 
+/// Decode one full 8×8 **inter** AC block and place the bitstream levels
+/// into `block[0..64]`. Inter blocks differ from intra blocks in three
+/// ways visible to this walker (per
+/// `docs/video/msmpeg4/spec/04-decoder-kernels.md` §1.3 / §1.6, the v1
+/// inter kernel `0x1c215d2c` and the §2.6 inter-vs-intra comparison):
+///
+/// 1. **Scan starts at position 0** — there is no separately-decoded DC
+///    coefficient. The inter kernel initialises its running scan
+///    position to 0 (`[ebp-0x10] = 0` at `1c215d4a`), so the very first
+///    decoded token may land on the DC slot (run = 0 ⇒ position 0).
+/// 2. **The scan is always fixed zigzag** — spec/04 §1.6: inter blocks
+///    never consult the alt-horizontal / alt-vertical scan tables. The
+///    AC-prediction-direction scan flip is an intra-only feature
+///    (§2.4 / §2.6). The caller therefore does not pass a `Scan`.
+/// 3. **The ESC body is a single tier** — the inter G4 table
+///    ([`AcVlcTable::g4_inter`]) carries `lmax`/`rmax = None`, so
+///    [`decode_escape_body`] collapses straight to the verbatim
+///    `1 + 6 + 8`-bit FLC triple (spec/04 §1.3 step 10).
+///
+/// Termination is identical to the intra walker: the sub-class-B flag
+/// (`tok.last`, derived by [`build_g_primary`] from the `idx > count_B`
+/// partition test) ends the block, and a running scan position that
+/// reaches 64 without a `last` is the kernel's `-100` hard error
+/// (spec/04 §1.7, label `1c215e61`).
+///
+/// Returns the number of non-zero coefficients written.
+pub fn decode_inter_ac(
+    br: &mut BitReader<'_>,
+    block: &mut [i32; 64],
+    table: &AcVlcTable,
+) -> Result<u32> {
+    let trace = std::env::var_os("OXIDEAV_MSMPEG4_AC_TRACE").is_some();
+    // Inter blocks always use the fixed zigzag scan (spec/04 §1.6).
+    let order = &ZIGZAG;
+    // Running scan position starts at 0 (DC is a coded coefficient on
+    // the inter path; spec/04 §1.3 / §2.6).
+    let mut pos: usize = 0;
+    let mut written = 0u32;
+    let mut tok_idx = 0u32;
+    let mut first = true;
+    loop {
+        if pos > 63 {
+            return Err(Error::invalid(format!(
+                "msmpeg4 inter ac: scan_pos overflow (=={pos}); kernel `0x1c215e61` returns \
+                 -100 per docs/video/msmpeg4/spec/04-decoder-kernels.md §1.7"
+            )));
+        }
+        let bit_pos_before = br.bit_position();
+        let tok = decode_token(br, table)?;
+        // After the very first token the running position advances by
+        // `run + 1` (the `+1` skips the slot just written); the first
+        // token advances by `run` only, so a leading run=0 token writes
+        // the DC slot (position 0). This mirrors the inter kernel's
+        // pre-increment-free first iteration at `1c215df2`.
+        if !first {
+            pos += 1;
+        }
+        first = false;
+        pos += tok.run as usize;
+        if trace {
+            let bit_pos_after = br.bit_position();
+            eprintln!(
+                "[inter ac trace] tok {tok_idx}: pos={pos} run={} level={} last={} \
+                 bits=[{bit_pos_before}..{bit_pos_after}]",
+                tok.run, tok.level, tok.last,
+            );
+        }
+        tok_idx += 1;
+        if pos > 63 {
+            return Err(Error::invalid(format!(
+                "msmpeg4 inter ac: scan_pos {pos} exceeds 63 after run={} (sub-class flag \
+                 last={}); kernel `0x1c215e61` returns -100 per spec/04 §1.7",
+                tok.run, tok.last
+            )));
+        }
+        if tok.level != 0 {
+            block[order[pos]] = tok.level as i32;
+            written += 1;
+        }
+        // spec/04 §1.3 step 9: sub-class B membership IS the `last` flag.
+        if tok.last {
+            return Ok(written);
+        }
+    }
+}
+
+/// Full inter-residual block decode: AC walk (DC included) +
+/// H.263 dequantisation. Returns the dequantised residual in `block`
+/// (DCT domain), ready for the caller's IDCT + add-to-prediction. Unlike
+/// the intra path there is no DC scaler — every coefficient, including
+/// position 0, is dequantised with the same `dequantise_h263` step
+/// (`level_start = 0`) per spec/08 §3.2 (all kernels share the
+/// `[esi+0x13c]`/`[esi+0x140]` mag/bias pair).
+///
+/// Returns the number of non-zero AC coefficients decoded.
+pub fn decode_inter_block(
+    br: &mut BitReader<'_>,
+    block: &mut [i32; 64],
+    table: &AcVlcTable,
+    quant: u32,
+) -> Result<u32> {
+    let n = decode_inter_ac(br, block, table)?;
+    dequantise_h263(block, quant, 0)?;
+    Ok(n)
+}
+
 #[cfg(test)]
 #[allow(clippy::needless_range_loop, clippy::bool_assert_comparison)]
 mod tests {
@@ -1827,5 +1933,146 @@ mod tests {
         assert_eq!(g2_rmax()[1][1], 43);
         // spec/09 §6 G3 sub-A caps at r=20.
         assert_eq!(g3_rmax()[0][1], 20);
+    }
+
+    // ----- inter AC walker tests (round 123) -----
+
+    #[test]
+    fn inter_ac_first_token_run_zero_writes_dc_slot() {
+        // Inter blocks start the running scan position at 0 (spec/04
+        // §1.3): a leading run=0 token lands on the DC slot (zigzag
+        // position 0 = raster 0), unlike the intra walker which starts
+        // at 1. Code `1` (last=0, run=0, level=1) sign `0`, then
+        // `01` (last=1, run=0, level=1) sign `0`.
+        let t = toy_table();
+        let bytes = pack(&[(0b1, 1), (0, 1), (0b01, 2), (0, 1)]);
+        let mut br = BitReader::new(&bytes);
+        let mut block = [0i32; 64];
+        let n = decode_inter_ac(&mut br, &mut block, &t).unwrap();
+        assert_eq!(n, 2);
+        // First token: run=0 from pos 0 → DC slot (ZIGZAG[0] = 0).
+        assert_eq!(block[ZIGZAG[0]], 1, "DC slot written by leading run=0");
+        // Second token: pos advances by +1 (post-write skip) then +run(0)
+        // → ZIGZAG[1].
+        assert_eq!(block[ZIGZAG[1]], 1, "terminator at next zigzag slot");
+    }
+
+    #[test]
+    fn inter_ac_uses_fixed_zigzag_and_advances_by_run() {
+        // `001` (last=0, run=2, level=1) sign `0`, then `01` terminator.
+        // First token: pos = 0 + run(2) = 2 → ZIGZAG[2].
+        // Second token: pos = 2 + 1 + run(0) = 3 → ZIGZAG[3].
+        let t = toy_table();
+        let bytes = pack(&[(0b001, 3), (0, 1), (0b01, 2), (0, 1)]);
+        let mut br = BitReader::new(&bytes);
+        let mut block = [0i32; 64];
+        let n = decode_inter_ac(&mut br, &mut block, &t).unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(block[ZIGZAG[2]], 1);
+        assert_eq!(block[ZIGZAG[3]], 1);
+    }
+
+    #[test]
+    fn inter_ac_negative_sign_applied() {
+        // `1` (run=0, level=1) sign `1` (negative), then `01` terminator
+        // sign `0`.
+        let t = toy_table();
+        let bytes = pack(&[(0b1, 1), (1, 1), (0b01, 2), (0, 1)]);
+        let mut br = BitReader::new(&bytes);
+        let mut block = [0i32; 64];
+        decode_inter_ac(&mut br, &mut block, &t).unwrap();
+        assert_eq!(block[ZIGZAG[0]], -1, "negative sign bit applied");
+    }
+
+    #[test]
+    fn inter_ac_escape_is_verbatim_single_tier() {
+        // The inter path uses a single (verbatim) ESC tier (spec/04
+        // §1.3 step 10). ESC marker `000`, then verbatim
+        // last=0 (1 bit), run=5 (6 bits), level=7 (8 bits signed), then
+        // a terminator `01` sign `0`.
+        let t = toy_table();
+        let bytes = pack(&[
+            (0b000, 3), // ESC
+            (0, 1),     // last=0
+            (5, 6),     // run
+            (7, 8),     // level (signed 8-bit)
+            (0b01, 2),  // terminator
+            (0, 1),     // sign
+        ]);
+        let mut br = BitReader::new(&bytes);
+        let mut block = [0i32; 64];
+        let n = decode_inter_ac(&mut br, &mut block, &t).unwrap();
+        assert_eq!(n, 2);
+        // ESC token: pos = 0 + run(5) = 5.
+        assert_eq!(block[ZIGZAG[5]], 7, "ESC verbatim level placed at run");
+        // Terminator: pos = 5 + 1 = 6.
+        assert_eq!(block[ZIGZAG[6]], 1);
+    }
+
+    #[test]
+    fn inter_ac_overflow_is_hard_error() {
+        // A run that pushes the scan position past 63 without a `last`
+        // is the kernel's -100 hard error (spec/04 §1.7), not an
+        // implicit EOB. ESC with run=63 from a non-DC position overflows.
+        let t = toy_table();
+        let bytes = pack(&[
+            (0b001, 3), // run=2 (pos -> 2), last=0, continue
+            (0, 1),     // sign
+            (0b000, 3), // ESC
+            (0, 1),     // last=0
+            (63, 6),    // run=63 → pos = 2 + 1 + 63 = 66 > 63
+            (1, 8),     // level
+        ]);
+        let mut br = BitReader::new(&bytes);
+        let mut block = [0i32; 64];
+        assert!(decode_inter_ac(&mut br, &mut block, &t).is_err());
+    }
+
+    #[test]
+    fn inter_block_dequantises_with_level_start_zero() {
+        // decode_inter_block runs the AC walk then dequantises ALL
+        // positions (level_start = 0) — there is no separate DC scaler
+        // on the inter path. `1` (run=0, level=1) sign 0 lands on the DC
+        // slot and must be dequantised. q=5 → mag=10, bias=4 → 1*10+4=14.
+        let t = toy_table();
+        let bytes = pack(&[(0b1, 1), (0, 1), (0b01, 2), (0, 1)]);
+        let mut br = BitReader::new(&bytes);
+        let mut block = [0i32; 64];
+        decode_inter_block(&mut br, &mut block, &t, 5).unwrap();
+        assert_eq!(block[ZIGZAG[0]], 14, "DC dequantised on inter path");
+        assert_eq!(block[ZIGZAG[1]], 14, "terminator dequantised");
+    }
+
+    #[test]
+    fn inter_ac_g4_real_table_round_trips_a_terminator() {
+        // The real G4 inter table walks end-to-end: pick its shortest
+        // sub-class-B (last=1) symbol and decode it as a single
+        // terminating token. This exercises the canonical-Huffman primary
+        // VLC + the partition-derived `last` flag on the inter path.
+        let t = AcVlcTable::g4_inter();
+        let term = t
+            .entries
+            .iter()
+            .filter(|e| matches!(e.value, Symbol::RunLevel { last: true, .. }))
+            .min_by_key(|e| e.bits)
+            .expect("G4 has at least one sub-class-B symbol");
+        let (last, run, level) = match term.value {
+            Symbol::RunLevel { last, run, level } => (last, run, level),
+            Symbol::Escape => unreachable!(),
+        };
+        assert!(last, "selected a sub-class-B terminator");
+        let bytes = pack(&[(term.code, term.bits as u32), (0, 1)]);
+        let mut br = BitReader::new(&bytes);
+        let mut block = [0i32; 64];
+        let n = decode_inter_ac(&mut br, &mut block, &t).unwrap();
+        // A single terminating token writes one coefficient (unless its
+        // level is zero, which the G4 alphabet does not contain for
+        // normal symbols).
+        let pos = run as usize; // first token: pos = 0 + run.
+        assert!(pos <= 63);
+        if level != 0 {
+            assert_eq!(n, 1);
+            assert_eq!(block[ZIGZAG[pos]], level as i32);
+        }
     }
 }

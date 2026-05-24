@@ -385,12 +385,12 @@ fn decode_iframe(
 /// intra-in-P blocks are reconstructed DC-only when their CBP bit is
 /// set — same behaviour as in I-frames.
 ///
-/// Because the *inter* AC VLC has not been extracted either, all
-/// inter MBs here are decoded with a **zero residual**: MC copy only.
-/// This is a partial P-frame decode that will show the reference
-/// frame's motion-compensated pixels without the residual detail.
-/// When the Extractor lands the inter AC VLC a future round will
-/// plug it in and the inter-residual path will activate.
+/// The *inter* AC residual now decodes through the G4 inter VLC
+/// ([`AcVlcTable::g4_inter`], whose packed-Huffman primary VLC is fully
+/// extracted): each inter MB lays down its MC prediction and then adds
+/// the per-block IDCT residual for every CBP-coded block (spec/04 §1 /
+/// §2.6). Intra-in-P AC remains placeholder/DC-only where the intra
+/// G-table VLC has not been extracted (spec/99 §9 OPEN).
 fn decode_pframe(
     br: &mut BitReader<'_>,
     dims: PictureDims,
@@ -414,6 +414,14 @@ fn decode_pframe(
     let quant = hdr.quant as u32;
     let luma_ac = luma_ac_table_for(ac_selection, hdr);
     let chroma_ac = chroma_ac_table_for(ac_selection, hdr);
+    // Inter residual VLC: the G4 (chroma + all-inter) table is the
+    // v1/v2/v3 inter-block AC alphabet (spec/04 §1, kernel
+    // `0x1c215d2c`). It has a fully-extracted packed-Huffman primary
+    // VLC, so inter residuals decode end-to-end. The same table covers
+    // luma and chroma inter blocks — the inter kernel does not branch
+    // on plane (spec/04 §2.6 "Magnitude/bias pairs" row: inter uses a
+    // single mag/bias pair for all six blocks).
+    let inter_ac = crate::ac::AcVlcTable::g4_inter();
 
     // MV grid: one (MVx, MVy) entry per MB. Skipped / intra MBs use
     // (0, 0) so the predictor's zero-substitution semantics match
@@ -445,6 +453,7 @@ fn decode_pframe(
                 hdr.dc_size_sel,
                 &luma_ac,
                 &chroma_ac,
+                &inter_ac,
                 mv_table,
             )?;
         }
@@ -469,6 +478,7 @@ fn decode_pframe_mb(
     dc_size_sel: u8,
     luma_ac: &AcVlcTable,
     chroma_ac: &AcVlcTable,
+    inter_ac: &AcVlcTable,
     mv_table: crate::mv::MvTable,
 ) -> Result<()> {
     use crate::mcbpcy::{decode_mcbpcy_pframe, PFrameMcbpcy};
@@ -546,11 +556,86 @@ fn decode_pframe_mb(
     let mv = crate::mv::decode_mv_with_table(br, predictor, mv_table)?;
     mv_grid[mb_idx] = Some(mv);
 
+    // Lay down the motion-compensated prediction first; the residual
+    // (decoded below) is added on top of it.
     apply_mc_to_mb(pic, reference, mb_x, mb_y, (mv.x as i32, mv.y as i32));
 
-    // Inter residual: OPEN (no inter AC VLC extracted). Zero residual
-    // for now → the output is pure MC prediction.
+    // Inter residual: per spec/04 §1 the coded-block-pattern from the
+    // MCBPCY decode selects which of the 6 blocks carry an AC walk. The
+    // four luma CBPY bits are MSB-first (block 0 = bit 3); chroma blocks
+    // use the cbp_cb / cbp_cr flags. Each coded block decodes the G4
+    // inter AC VLC (spec/04 §1.3), dequantises (spec/08 §3.2,
+    // level_start = 0 — DC is a coded coefficient on the inter path),
+    // IDCTs to a signed residual, and is added onto the MC prediction.
+    for block_idx in 0..6usize {
+        let coded = match block_idx {
+            0..=3 => decode.cbpy & (1 << (3 - block_idx)) != 0,
+            4 => decode.cbp_cb,
+            5 => decode.cbp_cr,
+            _ => unreachable!(),
+        };
+        if !coded {
+            continue;
+        }
+        let mut coeffs = [0i32; 64];
+        crate::ac::decode_inter_block(br, &mut coeffs, inter_ac, quant)?;
+        let mut residual = [0i32; 64];
+        idct8x8_to_pel(&coeffs, &mut residual);
+        add_residual_to_picture(pic, mb_x, mb_y, block_idx, &residual);
+    }
+
     Ok(())
+}
+
+/// Add a signed 8×8 IDCT residual onto the existing (motion-compensated)
+/// pel values of the picture at the given block position, clamping the
+/// sum to `[0, 255]`. Inter blocks reconstruct as `pred + residual`
+/// (spec/04 §2.6: the inter IDCT output is a signed residual added to
+/// the MC prediction, in contrast to the intra path where the IDCT
+/// output is the final pel value).
+fn add_residual_to_picture(
+    pic: &mut Picture,
+    mb_x: usize,
+    mb_y: usize,
+    block_idx: usize,
+    residual: &[i32; 64],
+) {
+    match block_idx {
+        0..=3 => {
+            let bx = (block_idx & 1) * 8;
+            let by = (block_idx >> 1) * 8;
+            let y_base = mb_y * 16 + by;
+            let x_base = mb_x * 16 + bx;
+            for j in 0..8usize {
+                for i in 0..8usize {
+                    let off = (y_base + j) * pic.y_stride + (x_base + i);
+                    if off < pic.y.len() {
+                        let sum = pic.y[off] as i32 + residual[j * 8 + i];
+                        pic.y[off] = sum.clamp(0, 255) as u8;
+                    }
+                }
+            }
+        }
+        4 | 5 => {
+            let plane = if block_idx == 4 {
+                &mut pic.cb
+            } else {
+                &mut pic.cr
+            };
+            let y_base = mb_y * 8;
+            let x_base = mb_x * 8;
+            for j in 0..8usize {
+                for i in 0..8usize {
+                    let off = (y_base + j) * pic.c_stride + (x_base + i);
+                    if off < plane.len() {
+                        let sum = plane[off] as i32 + residual[j * 8 + i];
+                        plane[off] = sum.clamp(0, 255) as u8;
+                    }
+                }
+            }
+        }
+        _ => unreachable!(),
+    }
 }
 
 /// Apply motion compensation to the (mb_x, mb_y) MB using the given
@@ -1506,6 +1591,167 @@ mod tests {
             mismatches, 0,
             "inter-MB with MV=(0,0) should match reference exactly",
         );
+    }
+
+    /// Hand-crafted P-frame with a single non-skipped inter MB whose
+    /// luma block 0 is CBP-coded and carries a G4 inter residual. With
+    /// MV=(0,0) the MC prediction equals the reference; the decoded
+    /// residual must then be *added* on top, so the output luma must
+    /// differ from a pure MC copy precisely within block 0's 8×8 region
+    /// and be identical everywhere else. Exercises the round-123 inter
+    /// residual path end-to-end (G4 VLC walk + dequant + IDCT + add).
+    #[test]
+    fn handcrafted_inter_mb_applies_residual() {
+        use oxideav_core::bits::BitReader;
+
+        fn pack(fields: &[(u32, u32)]) -> Vec<u8> {
+            let mut out: Vec<u8> = Vec::new();
+            let mut acc: u64 = 0;
+            let mut bits: u32 = 0;
+            for (v, w) in fields {
+                let mask = if *w == 32 { u32::MAX } else { (1u32 << w) - 1 };
+                acc = (acc << w) | ((*v & mask) as u64);
+                bits += w;
+                while bits >= 8 {
+                    let shift = bits - 8;
+                    out.push(((acc >> shift) & 0xff) as u8);
+                    acc &= (1u64 << shift) - 1;
+                    bits -= 8;
+                }
+            }
+            if bits > 0 {
+                out.push(((acc << (8 - bits)) & 0xff) as u8);
+            }
+            out
+        }
+
+        // Canonical MCBPCY table (mirrors mcbpcy.rs).
+        let t_mcbpcy = {
+            let mut syms: Vec<(u32, u8)> = crate::tables_data::MCBPCY_V3_RAW
+                .iter()
+                .enumerate()
+                .filter_map(|(i, &(bl, _))| if bl == 0 { None } else { Some((bl, i as u8)) })
+                .collect();
+            syms.sort_by_key(|&(bl, idx)| (bl, idx));
+            let mut entries: Vec<(u8, u32, u8)> = Vec::new();
+            let mut code: u32 = 0;
+            let mut prev_bl: u32 = 0;
+            for (i, &(bl, idx)) in syms.iter().enumerate() {
+                if i == 0 {
+                    code = 0;
+                } else {
+                    code = (code + 1) << (bl - prev_bl);
+                }
+                entries.push((bl as u8, code, idx));
+                prev_bl = bl;
+            }
+            entries
+        };
+
+        // We want an inter MB (bit 6 of idx clear) with luma block 0
+        // coded: cbpy bit 3 set ⇒ cbpy = 0b1000 = 8 ⇒ pattern = 8 << 2
+        // = 32 ⇒ idx = 32 (chroma + Y1..Y3 uncoded). Find its canonical
+        // code.
+        let target_idx: u8 = 32;
+        let (bl_mb, code_mb) = t_mcbpcy
+            .iter()
+            .find(|(_, _, sym)| *sym == target_idx)
+            .map(|(bl, code, _)| (*bl as u32, *code))
+            .expect("MCBPCY symbol 32 (inter, Y0-coded) in canonical table");
+
+        // G4 inter residual: pick the shortest sub-class-B (last=1)
+        // terminator. The single token writes its level at zigzag
+        // position `run`, then the block ends.
+        let g4 = crate::ac::AcVlcTable::g4_inter();
+        let term = g4
+            .entries
+            .iter()
+            .filter_map(|e| match e.value {
+                crate::ac::Symbol::RunLevel {
+                    last: true,
+                    run,
+                    level,
+                } => Some((e, run, level)),
+                _ => None,
+            })
+            .filter(|(_, _, level)| *level != 0)
+            .min_by_key(|(e, _, _)| e.bits)
+            .expect("G4 sub-class-B terminator with non-zero level");
+        let (term_entry, _term_run, _term_level) = term;
+
+        let dims = PictureDims::new(16, 16).unwrap();
+        let mut reference = Picture::alloc(dims, PictureType::I);
+        // Flat mid-grey reference so the residual is the only source of
+        // variation in the output.
+        for p in reference.y.iter_mut() {
+            *p = 128;
+        }
+        for p in reference.cb.iter_mut() {
+            *p = 128;
+        }
+        for p in reference.cr.iter_mut() {
+            *p = 128;
+        }
+
+        // P-frame header + one MB.
+        let mut fields: Vec<(u32, u32)> = vec![
+            (1, 2), // P
+            (8, 5), // quant
+            (0, 1), // ac_chroma_sel = 0
+            (0, 1), // dc_size_sel = 0
+            (0, 1), // mv_table_sel = 0
+        ];
+        fields.push((0, 1)); // skip = 0
+        fields.push((code_mb, bl_mb)); // MCBPCY idx 32 (inter, Y0 coded)
+        fields.push((0, 1)); // ac_pred (ignored for inter)
+        fields.push((0, 1)); // MV sym 0 → MV (0,0)
+                             // Luma block 0 residual: single sub-class-B terminator + sign 0.
+        fields.push((term_entry.code, term_entry.bits as u32));
+        fields.push((0, 1)); // sign = positive
+        fields.push((0, 16)); // tail padding
+        let bytes = pack(&fields);
+        let mut br = BitReader::new(&bytes);
+        let pic = decode_picture(&mut br, dims, Some(&reference))
+            .expect("inter-residual P-frame must decode");
+
+        assert_eq!(pic.picture_type, PictureType::P);
+
+        // Block 0 occupies luma rows 0..8, cols 0..8. The residual must
+        // have changed at least one pel there (it is added onto the
+        // flat-128 prediction, then clamped).
+        let mut block0_changed = false;
+        for j in 0..8usize {
+            for i in 0..8usize {
+                if pic.y[j * pic.y_stride + i] != 128 {
+                    block0_changed = true;
+                }
+            }
+        }
+        assert!(
+            block0_changed,
+            "inter residual must modify luma block 0 (was a flat MC copy)"
+        );
+
+        // Everything outside block 0 must remain the MC copy (128):
+        // Y1..Y3 + chroma were not CBP-coded, so no residual there.
+        for j in 0..16usize {
+            for i in 0..16usize {
+                if j < 8 && i < 8 {
+                    continue; // block 0 — allowed to change
+                }
+                assert_eq!(
+                    pic.y[j * pic.y_stride + i],
+                    128,
+                    "uncoded luma pel ({j},{i}) must stay the MC copy"
+                );
+            }
+        }
+        for &v in &pic.cb {
+            assert_eq!(v, 128, "uncoded Cb must stay the MC copy");
+        }
+        for &v in &pic.cr {
+            assert_eq!(v, 128, "uncoded Cr must stay the MC copy");
+        }
     }
 
     #[test]

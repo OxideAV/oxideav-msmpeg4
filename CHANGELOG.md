@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 123 — inter (P-frame) AC residual decode wired**
+  (2026-05-25): the P-frame inter-MB path now decodes and applies the
+  per-block AC residual instead of laying down a pure motion-compensated
+  copy. New `ac::decode_inter_ac` / `ac::decode_inter_block` mirror the
+  inter kernel `0x1c215d2c` per
+  `docs/video/msmpeg4/spec/04-decoder-kernels.md` §1: the running scan
+  position starts at **0** (DC is a coded coefficient on the inter path,
+  not separately predicted), the scan is the **fixed zigzag** (§1.6 —
+  inter blocks never consult the alt-horizontal / alt-vertical tables),
+  the ESC body is a **single verbatim tier** (§1.3 step 10 — the G4
+  inter table carries `lmax`/`rmax = None` so `decode_escape_body`
+  collapses to the `1 + 6 + 8`-bit FLC triple), and termination is the
+  sub-class-B `last` flag (§1.3 step 9). `decode_pframe_mb` now decodes
+  the G4 inter VLC ([`AcVlcTable::g4_inter`], whose packed-Huffman
+  primary VLC is fully extracted) for every CBP-coded block (luma CBPY
+  bits MSB-first, chroma cbp_cb / cbp_cr), dequantises with
+  `dequantise_h263(.., level_start = 0)` per spec/08 §3.2, IDCTs to a
+  signed residual, and **adds** it onto the MC prediction (new
+  `add_residual_to_picture`, clamped to `[0, 255]` per spec/04 §2.6
+  "inter IDCT output is a signed residual added to the prediction").
+  Eight new tests: seven `ac::tests` covering the inter walker
+  (leading-run-0 writes the DC slot, fixed-zigzag run advance, negative
+  sign, single-tier verbatim ESC, scan-overflow hard error, inter-block
+  dequant with `level_start = 0`, and a real-G4-table terminator
+  round-trip) plus one `picture::tests::handcrafted_inter_mb_applies_residual`
+  integration test (a coded inter MB over a flat-grey reference: the
+  residual modifies luma block 0 while every uncoded block stays the MC
+  copy). Test suite 322 → 330 (+8). No new spec tables required —
+  spec/04 §1 + the already-extracted G4 packed-Huffman source were
+  sufficient.
+
 - **Round 81 — spec/15 §3 per-G `(count_A, count_B)` source-of-truth pin**
   (2026-05-21): introduce a single authoritative `G_COUNTS_SPEC15:
   [(u32, u32); 6]` table in `build.rs` (top-of-file), emitted into
