@@ -9,6 +9,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 126 — 3-tier ESC body integration tests + stale-row fix**
+  (2026-05-25): adds `tests/intra_block_3tier_esc.rs` (8 tests) that
+  exercise the v1/v2/v3 intra block decoder kernel `0x1c216d97`
+  3-tier ESC body end-to-end through the public
+  [`mb::decode_intra_block_full_v3`] boundary — i.e. the real
+  intra-DC direct-value 120-entry VLC consumes the leading bits, the
+  G5 primary canonical-Huffman VLC consumes the AC walk, the 3-tier
+  ESC body (level extension via `LMAX[last][run]`, run extension via
+  `RMAX[last][|level|] + 1`, verbatim `1 + 6 + 8`-bit FLC) handles
+  each escape tier, and `dequantise_h263` runs on the assembled
+  coefficient array. Cases covered: (1) DC differential + sub-class-B
+  terminator, (2) zero-DC fast path (no sign bit consumed per spec/07
+  §5.2), (3) tier-1 level extension, (4) tier-2 run extension,
+  (5) tier-3 verbatim FLC triple, (6) CBP-zero short-circuit (verifies
+  the AC walk is skipped and zero AC bits are consumed),
+  (7) chroma DC-scaler routing (block_idx ≥ 4 must use
+  `C_DC_SCALE_TABLE` per `iq::dc_scaler`), and (8) the DC ESC tier
+  in the 120-entry intra-DC VLC (idx == 119 ⇒ 8-bit raw + sign per
+  `spec/07-remaining-opens.md` §5.2). These integration tests catch
+  regressions that only manifest at the
+  `(DC VLC) + (AC walk) + (3-tier ESC body) + (dequant)` boundary —
+  e.g. a bit-reader desync that the per-token `decode_token` unit
+  tests in `src/ac.rs` cannot see because they call into a synthetic
+  ESC byte stream rather than chaining through
+  `decode_intra_dc_diff_v3` first. Test suite 330 → 338 (+8). No
+  runtime behavioural change; no new spec tables consulted (spec/04
+  §2.3 + spec/07 §5.2 + spec/11 §3-§5 + audit/01 §4.1 cite the
+  already-staged docs that drove the round-7 / round-27 work).
+  Also fixes a stale README status row that still claimed the
+  MS-MPEG4v3 3-tier ESC body was "OPEN — MPEG-4 fallback only" —
+  rounds 7 and 27 wired the full tier 1 / 2 / 3 walk in
+  `ac::decode_escape_body`; the row now reflects the implemented
+  state and links the new integration tests.
+
 - **Round 123 — inter (P-frame) AC residual decode wired**
   (2026-05-25): the P-frame inter-MB path now decodes and applies the
   per-block AC residual instead of laying down a pure motion-compensated

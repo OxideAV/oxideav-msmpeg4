@@ -45,7 +45,7 @@ right decoder when a packet arrives.
 | G0..G3 `(idx → (run, level, last))` enumeration | wired (round 29)     |
 | G0..G3 LMAX / RMAX (ESC-extension offsets)     | wired (round 7, 2026-05-17) |
 | G0..G3 canonical-Huffman primary VLC           | OPEN — extraction blocked (spec/99 §10) |
-| MS-MPEG4v3 3-tier ESC body                     | OPEN — MPEG-4 fallback only |
+| MS-MPEG4v3 3-tier ESC body                     | wired (rounds 7 + 27 + 126: G5 LMAX/RMAX + tier 1/2/3 walk; integration-tested through `decode_intra_block_full_v3`) |
 | P-frame MV VLC + half-pel MC (default table)   | complete              |
 | P-frame MV VLC alternate table                 | unsupported (truncated dump) |
 | Inter AC residual (G4 VLC → IDCT → add to MC)  | complete (round 123) |
@@ -106,15 +106,21 @@ O(n)-per-symbol reference decoder.
 
 What's **still missing for bit-exact real-content decode**:
 
-* **MS-MPEG4v3 intra 3-tier ESC body** (spec/04 §2.3 /
-  `0x1c216d97`). The current `decode_escape_body` implements only the
-  MPEG-4 Part 2 fixed-length fallback (1 + 6 + 8 = 15 bits); the v3
-  intra path uses (a) a level-extension VLC tier, (b) a run-extension
-  VLC tier with a symbol-indexed run offset, then (c) the verbatim
-  6/8 fallback. ESC is rare on low-bitrate intra content but causes
-  bit-stream desync whenever it fires, which produces the
-  `scan position ≥ 64` overflow currently seen on `testsrc2 32×32`
-  past the first MB or two. Wiring this is the next round's work.
+* **MS-MPEG4v3 intra 3-tier ESC body** — wired end-to-end as of
+  **rounds 7 + 27** (and integration-hardened in round 126). The
+  `decode_escape_body` walker chains tier 1 (level extension via
+  `LMAX[last][run]`) → tier 2 (run extension via
+  `RMAX[last][|level|] + 1`) → tier 3 (verbatim `1 + 6 + 8`-bit FLC
+  triple) per spec/04 §2.3, driven by the G5 LMAX / RMAX tables
+  (`audit/01` §4.1) re-derived from the same packed-Huffman source
+  the primary VLC consumes. The same builders feed the G0..G3
+  placeholders (round 7), so when those packed-Huffman bit-length
+  sources land the 3-tier walk is unblocked for them too without
+  re-touching `decode_escape_body`. Eight integration tests at
+  `tests/intra_block_3tier_esc.rs` exercise the full DC + AC + ESC
+  chain through the public `decode_intra_block_full_v3` boundary
+  (tier 1 / 2 / 3 / DC-ESC tier / CBP-zero short-circuit / chroma
+  DC scaler routing).
 * **Inter AC** — wired end-to-end as of **round 123**. The P-frame
   inter-MB path now decodes the G4 inter VLC (`AcVlcTable::g4_inter`)
   for every CBP-coded block, dequantises, IDCTs to a signed residual,
@@ -145,6 +151,17 @@ G4 / G5 descriptor coverage lives in `tests/g_descriptor_g4.rs`,
 `tests/g_descriptor_g5.rs`, and `src/g_descriptor.rs::tests`
 (39 tests total, including the LMAX-per-run audit cross-check
 for both inter and intra alphabets).
+
+Round-126 adds `tests/intra_block_3tier_esc.rs` (8 tests): the
+3-tier ESC body is exercised end-to-end through the public
+`decode_intra_block_full_v3` entry point (DC VLC → AC walk → ESC
+tiers → dequant). Tests cover (1) DC differential + sub-class-B
+terminator, (2) zero-DC fast path (no sign bit consumed),
+(3) tier-1 level extension, (4) tier-2 run extension,
+(5) tier-3 verbatim FLC triple, (6) CBP-zero short-circuit
+(no AC bits consumed), (7) chroma DC-scaler routing
+(block_idx ≥ 4 uses `C_DC_SCALE_TABLE`), and (8) the DC ESC tier
+in the direct-value 120-entry intra-DC VLC.
 
 ## License
 
