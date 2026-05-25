@@ -9,6 +9,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 129 — v1 / v2 → v3-compat selector defaults pinned as public API**
+  (2026-05-25): closes the docs-gap noted in r126 about "v1/v2 picture-level
+  decode parameters" by surfacing the spec/01 §1.4 + spec/07 §1.4 / §1.6 /
+  §2.4 facts as two associated constants on
+  [`header::MsV1V2PictureHeader`]: `V1_COMPAT_DEFAULTS` and
+  `V2_COMPAT_DEFAULTS` (each a `V1V2V3CompatDefaults` carrying
+  `dc_size_sel`, `ac_chroma_sel`, `ac_luma_sel`, `mv_table_sel`,
+  `has_ac_pred_anywhere`, and `has_spatial_dc_predictor`). The v1 and v2
+  paths never read the v3-only per-frame selector bits (the reads gate on
+  `version == 3` at VMA `1c211fdd` / `1c21205a..1c2120aa` per spec/01 §1.4),
+  so downstream code sharing a v3 decode entry point must use
+  `dc_size_sel = 0` (primary intra-DC VLC pair) and the G4 + G5 default
+  clusters for chroma + luma. v1 additionally lacks both the MB-level
+  AC-prediction bit (spec/07 §1.4 — the v1 MCBPCY body `0x1c2171c7` "does
+  NOT read a post-VLC sign / AC-pred bit (no `call 0x1c215c9b` after the
+  CBPY decode)") and the patent-7,054,494 spatial DC predictor (§1.6 — the
+  `0x1c23a788 / 0x1c23a7b0` LUTs are "absent from v1"); v2 adds AC
+  prediction only at intra-in-P macroblocks (§2.4 — a "v2 innovation"
+  gated on `mcbpc / 4 == 1`). A const-block at module scope pins every
+  default at **compile time** (any silent drift fails the build) and a
+  block of 8 new runtime `#[test]`s in `src/header.rs::tests` exercises
+  the same invariants via a `black_box_defaults` helper that defeats
+  const-folding so the lints see real field reads. The new tests are
+  `v1_compat_defaults_carry_v3_zero_initialisation_at_runtime`,
+  `v2_compat_defaults_carry_v3_zero_initialisation_at_runtime`,
+  `v1_has_no_ac_prediction_anywhere_at_runtime`,
+  `v2_has_ac_prediction_only_at_intra_in_p_macroblocks_at_runtime`,
+  `v1_v2_lack_spatial_dc_predictor_at_runtime`,
+  `v1_v2_compat_defaults_are_distinct_values` (rejects a future copy-paste
+  that flattens the two consts), `v1_pframe_with_umv_clear_parses` (covers
+  the previously-untested `umv = 0` round-trip), and
+  `v1_iframe_does_not_read_umv_bit` (canary-bit assertion that the I-frame
+  parser doesn't consume a 38th bit). Test suite 338 → 346 (+8). No
+  runtime behavioural change; the consts are new **public** API that
+  downstream consumers (oxideav-avi tag dispatch, oxideav-mkv codec
+  resolver) can read to spell out the "v1/v2 share v3 decode paths but
+  with these defaults" contract.
+
 - **Round 126 — 3-tier ESC body integration tests + stale-row fix**
   (2026-05-25): adds `tests/intra_block_3tier_esc.rs` (8 tests) that
   exercise the v1/v2/v3 intra block decoder kernel `0x1c216d97`

@@ -158,6 +158,61 @@ impl MsV3PictureHeader {
 /// The v3 header (`MsV3PictureHeader`) carries extra per-frame table
 /// selector bits that v1 / v2 lack; using a separate type keeps the
 /// downstream wiring explicit about which version it's working with.
+///
+/// ## v3-only per-frame selectors do NOT exist in v1/v2
+///
+/// Per
+/// [`docs/video/msmpeg4/spec/01-bitstream-framing.md`][spec01]
+/// §1.4 (decision tree), the per-frame `ac_chroma_sel` (`[esi+0xad0]`),
+/// `ac_luma_sel` (`[esi+0xad4]`), `dc_size_sel` (`[esi+0x8bc]`), and
+/// `mv_table_sel` (`[esi+0x834]`) selector bits are only read for
+/// **version == 3** frames (`1c211fdd` / `1c21205a..1c2120aa`).
+/// v1 and v2 paths never consume these bits, so downstream code that
+/// shares logic with v3 must use the following defaults when running
+/// a v1 / v2 frame:
+///
+/// | Selector         | v1 / v2 default | Reason                                                |
+/// | ---------------- | --------------- | ----------------------------------------------------- |
+/// | `dc_size_sel`    | `0`             | Picks the *default* intra-DC VLC (primary luma/chroma pair); v3 binary slot `[esi+0x8bc]` is uninitialised → reads zero. |
+/// | `ac_chroma_sel`  | `0` (G4 default) | v1/v2 always use the G4 cluster for chroma + all-inter (spec/99 §5.2). |
+/// | `ac_luma_sel`    | `0` (G5 default) | v1/v2 always use the G5 cluster for intra-luma (spec/99 §5.2).        |
+/// | `mv_table_sel`   | `0` (default MV VLC) | The alternate MV VLC is v3-only and lives at `[esi+0x834]` (spec/99 §3.2). |
+///
+/// These defaults are surfaced by the
+/// [`MsV1V2PictureHeader::V1_COMPAT_DEFAULTS`] and
+/// [`MsV1V2PictureHeader::V2_COMPAT_DEFAULTS`] associated constants so
+/// callers can pin the contract in their own assertions.
+///
+/// ## v1 has no spatial DC predictor; v2 gains AC prediction only at
+/// intra-in-P macroblocks
+///
+/// Per
+/// [`docs/video/msmpeg4/spec/07-remaining-opens.md`][spec07] §1.6
+/// (v1 MCBPCY body `0x1c2171c7`), the v1 path "never loads a neighbour
+/// MCBPC or CBPY" and contains no patent-7,054,494-style spatial
+/// predictor — H.263 Annex B §5.3 specifies no spatial predictor for
+/// either field, and v1 follows H.263 verbatim there. v1 likewise has
+/// **no MB-level AC-prediction bit**: §1.4 calls out that the v1 body
+/// "does **not** read a post-VLC sign / AC-pred bit (no
+/// `call 0x1c215c9b` after the CBPY decode), consistent with v1
+/// lacking AC prediction".
+///
+/// v2 inherits the v1 frame-level shape but, per §2.4 (intra-in-P
+/// handling — "a v2 innovation"), adds a 1-bit AC-prediction read
+/// **only** when an MCBPC of 4..=7 selects MB-type 3 (intra-in-P);
+/// the bit lives at MB scope, not at picture scope.
+///
+/// Practical consequence for the consumer: when a v1 / v2 intra-block
+/// shares the [`crate::mb::decode_intra_block_full_v3`] entry point or
+/// the [`crate::picture::decode_picture_with_ac`] orchestrator, the
+/// `dc_size_sel` argument must be `0` and the AC-scan must default to
+/// [`crate::ac::Scan::Zigzag`] for the entire v1 frame (since there is
+/// no AC-prediction flag to flip the scan) and for any v2 inter
+/// macroblock (since v2 only sets the AC-prediction flag for
+/// intra-in-P, never for plain inter).
+///
+/// [spec01]: https://github.com/OxideAV/oxideav-docs/blob/master/video/msmpeg4/spec/01-bitstream-framing.md
+/// [spec07]: https://github.com/OxideAV/oxideav-docs/blob/master/video/msmpeg4/spec/07-remaining-opens.md
 #[derive(Clone, Debug)]
 pub struct MsV1V2PictureHeader {
     /// I or P. v1/v2 do not support B-frames either.
@@ -168,6 +223,68 @@ pub struct MsV1V2PictureHeader {
     /// stored at `[esi+0x88]`. Read on P-frames per spec/99 §2.4. Always
     /// `false` for v2 frames and for v1 I-frames.
     pub v1_umv_flag: bool,
+}
+
+/// The v3-only per-frame selector defaults that v1 / v2 consumers must
+/// substitute when sharing v3 decode paths.
+///
+/// See the struct-level doc comment on [`MsV1V2PictureHeader`] for the
+/// per-field rationale and the spec citations (`spec/01` §1.4 and
+/// `spec/07` §1.6 / §2.4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct V1V2V3CompatDefaults {
+    /// `dc_size_sel` for `decode_intra_dc_diff_v3` / `decode_intra_block_full_v3`.
+    pub dc_size_sel: u8,
+    /// `ac_chroma_sel` slot (`[esi+0xad0]`) — selects the chroma + all-inter
+    /// G-cluster. `0` = G4 = the v1/v2 default cluster.
+    pub ac_chroma_sel: u8,
+    /// `ac_luma_sel` slot (`[esi+0xad4]`) — selects the intra-luma
+    /// G-cluster. `0` = G5 = the v1/v2 default cluster.
+    pub ac_luma_sel: u8,
+    /// `mv_table_sel` slot (`[esi+0x834]`) — `0` = default MV VLC.
+    pub mv_table_sel: u8,
+    /// True iff this version has any kind of MB-level AC-prediction flag
+    /// in any macroblock. `false` for v1 (entirely absent), `true` for
+    /// v2 (intra-in-P MBs only — see §2.4).
+    pub has_ac_pred_anywhere: bool,
+    /// True iff this version has a frame-level spatial DC predictor /
+    /// patent-7,054,494 prediction path. `false` for v1; for v2 the
+    /// patent text says yes but the disassembly trace at `1c2171c7` does
+    /// **not** load the LUTs at `0x1c23a788 / 0x1c23a7b0`, so v2 also
+    /// reports `false` here pending an Extractor follow-up — see
+    /// `spec/07` §1.6 "Contrast with v3's patent-7,054,494 spatial-
+    /// prediction path … which is absent from v1".
+    pub has_spatial_dc_predictor: bool,
+}
+
+impl MsV1V2PictureHeader {
+    /// The v3-compat defaults to feed shared v3 entry points when running
+    /// a **v1** frame. Use [`Self::V2_COMPAT_DEFAULTS`] for v2 frames.
+    pub const V1_COMPAT_DEFAULTS: V1V2V3CompatDefaults = V1V2V3CompatDefaults {
+        dc_size_sel: 0,
+        ac_chroma_sel: 0, // G4
+        ac_luma_sel: 0,   // G5
+        mv_table_sel: 0,
+        has_ac_pred_anywhere: false,
+        has_spatial_dc_predictor: false,
+    };
+
+    /// The v3-compat defaults to feed shared v3 entry points when running
+    /// a **v2** frame. Use [`Self::V1_COMPAT_DEFAULTS`] for v1 frames.
+    pub const V2_COMPAT_DEFAULTS: V1V2V3CompatDefaults = V1V2V3CompatDefaults {
+        dc_size_sel: 0,
+        ac_chroma_sel: 0, // G4
+        ac_luma_sel: 0,   // G5
+        mv_table_sel: 0,
+        // v2 gains intra-in-P AC prediction per spec/07 §2.4 — the flag
+        // lives at MB scope, not picture scope, but the version IS capable.
+        has_ac_pred_anywhere: true,
+        // No spatial DC predictor trace evidence in `1c2171c7` (the v2
+        // MCBPCY body); patent text suggests it but the binary doesn't
+        // load `0x1c23a788 / 0x1c23a7b0`. Mark `false` until an Extractor
+        // round files spec evidence; safer default for downstream callers.
+        has_spatial_dc_predictor: false,
+    };
 }
 
 impl MsV1V2PictureHeader {
@@ -420,5 +537,200 @@ mod tests {
         let bytes = pack(&[(0, 2), (0, 5)]);
         let mut br = BitReader::new(&bytes);
         assert!(MsV1V2PictureHeader::parse_v2(&mut br).is_err());
+    }
+
+    // ---------------------------------------------------------------------
+    // v1 / v2 → v3-compat selector defaults (spec/01 §1.4, spec/07 §1.6 /
+    // §2.4). Round 129: documents that v1/v2 never consume the v3-only
+    // per-frame selector bits, so downstream consumers feeding shared v3
+    // entry points must use these defaults.
+    // ---------------------------------------------------------------------
+
+    // Compile-time pins on the compat-default constants — any future
+    // edit that flips one of these values without changing the const-
+    // table definition will fail the build, which is louder than a unit
+    // test regression. See the per-field rationale in the `V1V2V3CompatDefaults`
+    // doc-comment and the spec citations on each `Self::V*_COMPAT_DEFAULTS`.
+    const _: () = {
+        let v1 = MsV1V2PictureHeader::V1_COMPAT_DEFAULTS;
+        assert!(v1.dc_size_sel == 0, "v1 dc_size_sel default (spec/01 §1.4)");
+        assert!(v1.ac_chroma_sel == 0, "v1 ac_chroma_sel default (G4)");
+        assert!(v1.ac_luma_sel == 0, "v1 ac_luma_sel default (G5)");
+        assert!(v1.mv_table_sel == 0, "v1 mv_table_sel default");
+        assert!(!v1.has_ac_pred_anywhere, "v1 no AC pred (spec/07 §1.4)");
+        assert!(
+            !v1.has_spatial_dc_predictor,
+            "v1 no spatial DC pred (spec/07 §1.6)"
+        );
+
+        let v2 = MsV1V2PictureHeader::V2_COMPAT_DEFAULTS;
+        assert!(v2.dc_size_sel == 0, "v2 dc_size_sel default (spec/01 §1.4)");
+        assert!(v2.ac_chroma_sel == 0, "v2 ac_chroma_sel default (G4)");
+        assert!(v2.ac_luma_sel == 0, "v2 ac_luma_sel default (G5)");
+        assert!(v2.mv_table_sel == 0, "v2 mv_table_sel default");
+        assert!(
+            v2.has_ac_pred_anywhere,
+            "v2 has intra-in-P AC pred (spec/07 §2.4)"
+        );
+        assert!(
+            !v2.has_spatial_dc_predictor,
+            "v2 no spatial DC pred (spec/07 §2)"
+        );
+    };
+
+    /// Helper that defeats const-folding so the runtime test below sees
+    /// the actual struct, not the compiler's known-good copy.
+    fn black_box_defaults<T: Copy>(v: T) -> T {
+        // `std::hint::black_box` would also work, but it would also
+        // suppress the dead-code lint on the const block above. The
+        // identity closure is sufficient here.
+        let f: fn(T) -> T = std::convert::identity;
+        f(v)
+    }
+
+    #[test]
+    fn v1_compat_defaults_carry_v3_zero_initialisation_at_runtime() {
+        // Runtime cross-check on the same invariants the const block
+        // above pins at compile time — `black_box_defaults` defeats
+        // const-folding so the test exercises real struct field reads
+        // (catches a future `Copy` impl that silently zeros / aliases).
+        let d = black_box_defaults(MsV1V2PictureHeader::V1_COMPAT_DEFAULTS);
+        assert_eq!(d.dc_size_sel, 0, "v1 must default dc_size_sel = 0");
+        assert_eq!(d.ac_chroma_sel, 0, "v1 must default ac_chroma_sel = 0 (G4)");
+        assert_eq!(d.ac_luma_sel, 0, "v1 must default ac_luma_sel = 0 (G5)");
+        assert_eq!(d.mv_table_sel, 0, "v1 must default mv_table_sel = 0");
+    }
+
+    #[test]
+    fn v2_compat_defaults_carry_v3_zero_initialisation_at_runtime() {
+        let d = black_box_defaults(MsV1V2PictureHeader::V2_COMPAT_DEFAULTS);
+        assert_eq!(d.dc_size_sel, 0, "v2 must default dc_size_sel = 0");
+        assert_eq!(d.ac_chroma_sel, 0, "v2 must default ac_chroma_sel = 0 (G4)");
+        assert_eq!(d.ac_luma_sel, 0, "v2 must default ac_luma_sel = 0 (G5)");
+        assert_eq!(d.mv_table_sel, 0, "v2 must default mv_table_sel = 0");
+    }
+
+    #[test]
+    fn v1_has_no_ac_prediction_anywhere_at_runtime() {
+        // Per spec/07 §1.4: the v1 MCBPCY body `0x1c2171c7` "does NOT read
+        // a post-VLC sign / AC-pred bit (no `call 0x1c215c9b` after the
+        // CBPY decode), consistent with v1 lacking AC prediction".
+        // A v1-version frame's downstream AC-scan dispatcher must default
+        // to plain zigzag for every block.
+        let d = black_box_defaults(MsV1V2PictureHeader::V1_COMPAT_DEFAULTS);
+        assert!(
+            !d.has_ac_pred_anywhere,
+            "v1 has no AC-prediction flag at any scope (spec/07 §1.4 / §1.6)",
+        );
+    }
+
+    #[test]
+    fn v2_has_ac_prediction_only_at_intra_in_p_macroblocks_at_runtime() {
+        // Per spec/07 §2.4 (v2 innovation): v2 reads a 1-bit AC-prediction
+        // flag at MB scope when MCBPC selects intra-in-P (`ecx == 1` →
+        // mcbpc ∈ 4..=7). The flag is MB-scope, NOT picture-scope. The
+        // compat-defaults summary captures "this version is capable of
+        // AC prediction in some macroblock context".
+        let d = black_box_defaults(MsV1V2PictureHeader::V2_COMPAT_DEFAULTS);
+        assert!(
+            d.has_ac_pred_anywhere,
+            "v2 gains intra-in-P AC prediction at MB scope (spec/07 §2.4)",
+        );
+    }
+
+    #[test]
+    fn v1_v2_lack_spatial_dc_predictor_at_runtime() {
+        // Per spec/07 §1.6: v1's MCBPCY body "never loads a neighbour
+        // MCBPC or CBPY" and the patent-7,054,494 spatial-prediction LUTs
+        // at `0x1c23a788 / 0x1c23a7b0` are "absent from v1". v2's MCBPCY
+        // body `0x1c21729c` likewise does not load those LUTs in the
+        // trace; until an Extractor round files evidence to the contrary,
+        // both versions default to "no spatial DC predictor" — i.e.
+        // [`crate::dc_pred::predict_dc`] is a v3-only path.
+        let v1 = black_box_defaults(MsV1V2PictureHeader::V1_COMPAT_DEFAULTS);
+        let v2 = black_box_defaults(MsV1V2PictureHeader::V2_COMPAT_DEFAULTS);
+        assert!(
+            !v1.has_spatial_dc_predictor,
+            "v1 has no patent-7,054,494 spatial DC predictor (spec/07 §1.6)",
+        );
+        assert!(
+            !v2.has_spatial_dc_predictor,
+            "v2 trace at `1c21729c` does not load `0x1c23a788 / 0x1c23a7b0` (spec/07 §2)",
+        );
+    }
+
+    #[test]
+    fn v1_v2_compat_defaults_are_distinct_values() {
+        // The two const tables should not be silently aliased: while both
+        // currently agree on every numeric selector, they differ on the
+        // `has_ac_pred_anywhere` capability flag (per spec/07 §2.4 vs
+        // §1.4) — so the PartialEq must reject equality. This guards
+        // against a future copy-paste that flattens the two into a single
+        // const and erases the v2 → intra-in-P distinction.
+        let v1 = MsV1V2PictureHeader::V1_COMPAT_DEFAULTS;
+        let v2 = MsV1V2PictureHeader::V2_COMPAT_DEFAULTS;
+        assert_ne!(
+            v1, v2,
+            "v1 and v2 compat defaults must differ at least in has_ac_pred_anywhere",
+        );
+        // And the only field they differ on is has_ac_pred_anywhere — if
+        // a future refactor changes another field's default for one
+        // version but not the other, this assertion fires so the change
+        // is documented explicitly.
+        let v1_normalised = V1V2V3CompatDefaults {
+            has_ac_pred_anywhere: v2.has_ac_pred_anywhere,
+            ..v1
+        };
+        assert_eq!(
+            v1_normalised, v2,
+            "v1 and v2 compat defaults must differ ONLY in has_ac_pred_anywhere — \
+             any other delta needs a new spec citation in the doc-comment",
+        );
+    }
+
+    #[test]
+    fn v1_pframe_with_umv_clear_parses() {
+        // Companion to `v1_pframe_with_umv_flag_parses` covering the
+        // `umv_flag = 0` case explicitly — proves the bit is read (so
+        // subsequent MB bytes start at offset 32+5+2+5+1 = 45 from the
+        // packet head) and forwarded as `false`.
+        let bytes = pack(&[
+            (0, 32), // preamble lo
+            (0, 5),  // preamble hi
+            (1, 2),  // P
+            (16, 5), // quant
+            (0, 1),  // UMV flag = 0
+        ]);
+        let mut br = BitReader::new(&bytes);
+        let h = MsV1V2PictureHeader::parse_v1(&mut br).unwrap();
+        assert_eq!(h.picture_type, PictureType::P);
+        assert_eq!(h.quant, 16);
+        assert!(!h.v1_umv_flag, "umv = 0 must round-trip as false");
+        // Bit position is 37 (preamble) + 2 + 5 + 1 = 45.
+        assert_eq!(br.bit_position(), 45);
+    }
+
+    #[test]
+    fn v1_iframe_does_not_read_umv_bit() {
+        // Per parse_v1: the UMV bit is gated on `picture_type == P` —
+        // an I-frame must not consume a 38th bit. Verify by appending a
+        // canary 1-bit after the header and asserting it survives.
+        let bytes = pack(&[
+            (0, 32), // preamble lo
+            (0, 5),  // preamble hi
+            (0, 2),  // picture_type = I
+            (10, 5), // quant
+            (1, 1),  // canary bit — must NOT be consumed by parse_v1
+        ]);
+        let mut br = BitReader::new(&bytes);
+        let h = MsV1V2PictureHeader::parse_v1(&mut br).unwrap();
+        assert_eq!(h.picture_type, PictureType::I);
+        assert_eq!(h.quant, 10);
+        assert!(!h.v1_umv_flag);
+        // Bit position is 37 (preamble) + 2 + 5 = 44 — the canary is
+        // STILL available to the caller.
+        assert_eq!(br.bit_position(), 44);
+        let next = br.read_bit().unwrap();
+        assert!(next, "I-frame parser must not have consumed the canary bit");
     }
 }

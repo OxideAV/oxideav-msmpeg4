@@ -49,7 +49,7 @@ right decoder when a packet arrives.
 | P-frame MV VLC + half-pel MC (default table)   | complete              |
 | P-frame MV VLC alternate table                 | unsupported (truncated dump) |
 | Inter AC residual (G4 VLC → IDCT → add to MC)  | complete (round 123) |
-| V1 / V2 bitstream                              | header + MV + MCBPC done; AC OPEN |
+| V1 / V2 bitstream                              | header + MV + MCBPC done; AC OPEN; v3-compat defaults pinned (round 129) |
 | V1 / V2 shared CBPY VLC                        | binary cross-check vs H.263 (round 75) |
 | G0..G5 (count_A, count_B) provenance pin       | spec/15 §3 binary-derived (round 81) |
 
@@ -162,6 +162,36 @@ terminator, (2) zero-DC fast path (no sign bit consumed),
 (no AC bits consumed), (7) chroma DC-scaler routing
 (block_idx ≥ 4 uses `C_DC_SCALE_TABLE`), and (8) the DC ESC tier
 in the direct-value 120-entry intra-DC VLC.
+
+Round-129 pins the **v1 / v2 → v3-compat selector defaults** as
+two associated constants on `MsV1V2PictureHeader`
+(`V1_COMPAT_DEFAULTS` / `V2_COMPAT_DEFAULTS`). Per
+`docs/video/msmpeg4/spec/01-bitstream-framing.md` §1.4 the v1 and
+v2 paths never read the v3-only per-frame selectors
+`ac_chroma_sel` / `ac_luma_sel` / `dc_size_sel` / `mv_table_sel`
+(those reads gate on `version == 3` at `1c211fdd` and
+`1c21205a..1c2120aa`), so downstream code sharing a v3 entry
+point must use `dc_size_sel = 0` (primary intra-DC VLC pair) and
+the G4 + G5 default clusters for chroma + luma respectively. Per
+spec/07 §1.4 / §1.6 v1 also has **no MB-level AC-prediction bit**
+(`1c2171c7` body does not `call 0x1c215c9b` after the CBPY
+decode) and **no patent-7,054,494 spatial DC predictor**
+(`0x1c23a788 / 0x1c23a7b0` LUTs are not loaded); v2 adds the
+AC-prediction bit only at intra-in-P macroblocks (spec/07 §2.4).
+Eight new lib tests in `src/header.rs::tests` pin those facts at
+runtime (`v{1,2}_compat_defaults_carry_v3_zero_initialisation_at_runtime`,
+`v1_has_no_ac_prediction_anywhere_at_runtime`,
+`v2_has_ac_prediction_only_at_intra_in_p_macroblocks_at_runtime`,
+`v1_v2_lack_spatial_dc_predictor_at_runtime`,
+`v1_v2_compat_defaults_are_distinct_values`,
+`v1_pframe_with_umv_clear_parses`,
+`v1_iframe_does_not_read_umv_bit`) plus a const-block
+compile-time assertion that mirrors the runtime invariants so any
+silent drift in the constants fails the build. Test suite
+338 → 346 (+8). No runtime behavioural change; the consts are
+new public API that downstream consumers (oxideav-avi tag
+dispatch, oxideav-mkv codec resolver) can read to spell out the
+"v1/v2 share v3 decode paths but with these defaults" contract.
 
 ## License
 
