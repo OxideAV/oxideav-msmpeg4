@@ -143,6 +143,7 @@ pub mod ac;
 pub mod dc_pred;
 pub mod g_descriptor;
 pub mod g_enum;
+pub mod g_family;
 pub mod header;
 pub mod idct;
 pub mod iq;

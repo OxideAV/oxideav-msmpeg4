@@ -52,6 +52,7 @@ right decoder when a packet arrives.
 | V1 / V2 bitstream                              | header + MV + MCBPC done; AC OPEN; v3-compat defaults pinned (round 129) |
 | V1 / V2 shared CBPY VLC                        | binary cross-check vs H.263 (round 75) |
 | G0..G5 (count_A, count_B) provenance pin       | spec/15 §3 binary-derived (round 81) |
+| Unified `GFamily` dispatch surface (G0..G5)    | wired (round 174)     |
 
 ### What's still spec-OPEN for real-content decode
 
@@ -162,6 +163,30 @@ terminator, (2) zero-DC fast path (no sign bit consumed),
 (no AC bits consumed), (7) chroma DC-scaler routing
 (block_idx ≥ 4 uses `C_DC_SCALE_TABLE`), and (8) the DC ESC tier
 in the direct-value 120-entry intra-DC VLC.
+
+Round-174 (2026-05-29) lands a **unified [`g_family::GFamily`] dispatch
+surface** over all six MS-MPEG4 DCT-AC G-descriptors (G0..G5), closing
+the asymmetry between the existing `g_descriptor::g{4,5}_decode` and
+`g_enum::GExtended` surfaces that had evolved separately as the
+extraction work landed. The new enum exposes `const fn` accessors for
+`count_a()` / `count_b()` (per spec/15 §3), `subclass_a_size()` /
+`subclass_b_size()` (per spec/03 §4.4 / spec/15 §5.2),
+`descriptor_base_offset()` (per spec/15 §2.1 — G0=`0x9d8` through
+G5=`0xa8c` at 0x24-byte stride, ending at `+0xab0`), and `role()`
+classifying each as `ChromaAndInter` (G0/G2/G4) or `IntraLuma`
+(G1/G3/G5) per spec/14 §3.1. Two const dispatch fns
+`for_chroma_selector(sel)` / `for_luma_selector(sel)` resolve
+picture-header selector values ∈ {0,1,2} to the matching G-family per
+spec/14 §3.1 (`0 → G2, 1 → G0, 2 → G4` chroma; `0 → G3, 1 → G1,
+2 → G5` luma), with `sel == 2` doubling as the v1/v2 fallthrough so a
+v1/v2 dispatcher can write `for_chroma_selector(2)` /
+`for_luma_selector(2)` without a version-specific branch. `decode(idx)`
+and `iter()` instance methods delegate to the existing `g_descriptor` /
+`g_enum` plumbing — no new tables, no new decode logic, purely
+additive. 15 new tests pin every structural fact (counts, partition
+sizes, base offsets, role distribution, selector dispatch arms, and the
+`idx > count_b ⇔ last=true` partition invariant from spec/13 §2)
+across all six families. Test suite 253 → 268 (+15) lib tests.
 
 Round-129 pins the **v1 / v2 → v3-compat selector defaults** as
 two associated constants on `MsV1V2PictureHeader`

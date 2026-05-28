@@ -9,6 +9,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 174 — unified `GFamily` dispatch surface over G0..G5** (2026-05-29):
+  closes the long-standing asymmetry between the two parallel post-VLC
+  `(idx → (last, run, |level|))` surfaces — [`g_descriptor::g4_decode`] /
+  `g5_decode` (round 18/19) for the H.263-baseline pair, and
+  [`g_enum::GExtended`] (round 29) for the four MS-MPEG4-specific G0..G3
+  extended descriptors. Both surfaces evolved separately as the extraction
+  work landed and did not share a common Rust type; a caller that wanted
+  to iterate "every G-descriptor" had to special-case the G4/G5 split. The
+  new [`g_family::GFamily`] enum (6 variants `G0..G5`, `#[repr(u8)]` with
+  discriminants matching `G_COUNTS_SPEC15` / `G_SUBCLASS_SIZES_SPEC15`
+  indices) unifies all six behind a single dispatch surface with `const fn`
+  accessors for `count_a()` / `count_b()` / `subclass_a_size()` /
+  `subclass_b_size()` (per spec/15 §3 / §5.2) and `descriptor_base_offset()`
+  (per spec/15 §2.1's literal-immediate `mb_mv_struct_init` constructor
+  evidence: G0=`0x9d8` through G5=`0x9d8 + 5*0x24 = 0xa8c`, cluster
+  ending at `+0xab0`). A `role()` const fn classifies each as either
+  `GRole::ChromaAndInter` (G0/G2/G4) or `GRole::IntraLuma` (G1/G3/G5) per
+  spec/14 §3.1. Two const dispatch fns `for_chroma_selector(sel)` /
+  `for_luma_selector(sel)` resolve picture-header selector values ∈ {0,1,2}
+  to the matching G-family (`0 → G2, 1 → G0, 2 → G4` for chroma;
+  `0 → G3, 1 → G1, 2 → G5` for luma per spec/14 §3.1). The `v1/v2`
+  fallthrough (spec/14 §3.1) writes `[esi+0xab0] = G4` and
+  `[esi+0xab4] = G5` unconditionally — captured as the `sel == 2` cases
+  of the two const dispatch fns, so a v1/v2 dispatcher can write
+  `for_chroma_selector(2)` / `for_luma_selector(2)` without a
+  version-specific branch. `decode(idx)` and `iter()` instance methods
+  delegate to the existing `g_descriptor` / `g_enum` plumbing — this
+  module adds no new tables and no new decode logic. 15 new unit tests
+  in `src/g_family.rs::tests` pin every structural fact (counts,
+  partition sizes, base offsets / `0x24` stride, role distribution,
+  selector dispatch arms, partition invariant `idx > count_b ⇔
+  last=true` from spec/13 §2) across all six G-families. Test suite
+  grows from **253 → 268** lib tests (+15). Purely additive API; no
+  behavioural change, no rewiring of existing dispatch sites.
+
 - **Round 129 — v1 / v2 → v3-compat selector defaults pinned as public API**
   (2026-05-25): closes the docs-gap noted in r126 about "v1/v2 picture-level
   decode parameters" by surfacing the spec/01 §1.4 + spec/07 §1.4 / §1.6 /
