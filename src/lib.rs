@@ -151,6 +151,7 @@ pub mod mb;
 pub mod mc;
 pub mod mcbpcy;
 pub mod mv;
+pub mod mv_pred;
 pub mod picture;
 pub mod scan;
 pub mod tables;

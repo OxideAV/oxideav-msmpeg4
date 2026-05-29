@@ -9,6 +9,83 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 185 — MV-predictor candidate-neighbour walk (Figure 7-34)**
+  (2026-05-29): new module [`mv_pred`] wires the per-block candidate
+  layout for the 4-MV-per-MB median-of-3 motion-vector predictor as
+  defined by Figure 7-34 of ISO/IEC 14496-2:2004(E) §7.6.5 (MPEG-4
+  Visual). Pulls truth from the in-tree clean-room ASCII transcription
+  [`docs/video/mpeg4-visual/figure-7-34-mv-predictor-layout.md`] plus
+  the §7.6.5 prose in
+  [`docs/video/mpeg4-visual/ISO_IEC_14496-2-2004-3rd-edition.txt`].
+  New public surface:
+  - [`mv_pred::Block`] enum (`TopLeft` / `TopRight` / `BottomLeft` /
+    `BottomRight`) with `Block::ALL` const-array iteration order
+    matching Figure 6-8 raster (1, 2, 3, 4) and `Block::spec_index()`
+    for the spec block number.
+  - [`mv_pred::BlockCandidates`] — `Option<Mv>` cache covering the six
+    cells Figure 7-34 references across the four sub-diagrams: the
+    three neighbouring-MB MVs (`left_mb` / `above_mb` /
+    `above_right_mb`) and the three already-decoded within-MB block
+    MVs (`mb_block_1` / `mb_block_2` / `mb_block_3`). Default is all-
+    `None` (picture corner / all neighbours out-of-area).
+  - [`mv_pred::gather_candidates`] — pure block→`[Option<Mv>; 3]`
+    lookup driven by the four sub-diagrams of Figure 7-34. Each block
+    routes to its spec-mandated `(MV1, MV2, MV3)` cells:
+    * Block 1 (TL): left/above/above-right neighbour MBs (same as the
+      1-MV-per-MB case which Figure 7-34 explicitly designates as
+      using the top-left sub-diagram).
+    * Block 2 (TR): within-MB block 1, above neighbour MB, above-right
+      neighbour MB.
+    * Block 3 (BL): left neighbour MB, within-MB block 1, within-MB
+      block 2.
+    * Block 4 (BR): within-MB blocks 3, 1, 2 (all three from the
+      current MB).
+  - [`mv_pred::apply_validity_rules`] — implements the four candidate-
+    validity substitution rules of §7.6.5 verbatim from the
+    transcription:
+    1. `None` means "not valid" (transparent / outside VOP / outside
+       video packet / outside GOB).
+    2. Exactly one `None` → set to zero.
+    3. Exactly two `None` → both = the third valid candidate.
+    4. All three `None` → all zero.
+  - [`mv_pred::predict_block_mv`] — full pipeline: gather candidates
+    per block, apply validity rules, then per-component median-of-3.
+    The `Block::TopLeft` invocation with only-neighbour-MB candidates
+    is the 1-MV-per-MB single-MV-of-the-macroblock case explicitly
+    designated by §7.6.5 ("In the case of only one motion vector
+    present for the complete macroblock, the top-left case in Figure
+    7-34 is applied.").
+
+  Spec compliance vs. the older [`mv::median_predictor`]: 17 unit
+  tests pin the new behaviour, including a documented divergence in
+  the "exactly one neighbour valid" rule-3 corner. The old shortcut
+  zero-substitutes both missing neighbours then takes a median →
+  `median(only, 0, 0) = 0`; the spec-correct §7.6.5 rule 3 promotes
+  the lone valid candidate to all three slots → `median(only, only,
+  only) = only`. The new module returns the spec-correct result. The
+  shortcut still ships in [`mv::median_predictor`] and the picture
+  decoder still consumes it; routing `picture::decode_pframe_mb`
+  through [`mv_pred::predict_block_mv`] (which flips the corner-cell
+  result) is queued for the next round once the 4-MV-per-MB MCBPC
+  variant lands. The spec §7.6.5 worked example
+  (`MV1=(-2,3), MV2=(1,5), MV3=(-1,7) → (Px,Py)=(-1,5)`) is pinned in
+  [`mv_pred::tests::spec_7_6_5_worked_example_predictor_matches`].
+
+  17 new tests in `src/mv_pred.rs::tests`: per-block gather
+  (`top_left_pulls_from_neighbour_mbs`,
+  `top_right_pulls_block_1_then_neighbour_above_and_above_right`,
+  `bottom_left_pulls_left_neighbour_then_within_mb_blocks_1_and_2`,
+  `bottom_right_pulls_within_mb_blocks_3_then_1_then_2`), each
+  validity rule (`rule_2_exactly_one_invalid_substitutes_zero`,
+  `rule_3_exactly_two_invalid_both_become_third`,
+  `rule_4_all_invalid_all_zero`, `all_valid_passes_through_unchanged`),
+  the §7.6.5 worked example, the picture-corner zero predictor across
+  all four blocks, the rule-3 left-only short-row case, the
+  `Block::TopLeft` ↔ `mv::median_predictor` equivalence wherever ≥ 2
+  neighbours are valid, the documented rule-3 divergence, a
+  `Block::BottomRight` rule-3 instance, `Block::ALL` raster order,
+  `spec_index` uniqueness, and median order-independence.
+
 - **Round 181 — `GFamily` selector inverses + `subclass_of` partition
   classifier** (2026-05-29): extends the round-174
   [`g_family::GFamily`] surface with three new const-fn accessors that
