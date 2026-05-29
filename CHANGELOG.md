@@ -9,6 +9,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 181 — `GFamily` selector inverses + `subclass_of` partition
+  classifier** (2026-05-29): extends the round-174
+  [`g_family::GFamily`] surface with three new const-fn accessors that
+  close the structural API. (1) [`GFamily::subclass_of(idx)`] returns
+  `Option<GSubclass>` classifying every alphabet index into sub-A
+  (`[0, count_B]`, `last=0` per spec/13 §2 — non-terminating, kernel
+  continues scanning) or sub-B (`(count_B, count_A)`, `last=1` per
+  spec/13 §2 — clean exit), with `idx == count_A` (ESC sentinel) and
+  any `idx > count_A` returning `None`. Per `docs/video/msmpeg4/spec/
+  13-kernel-block-termination.md` §2 the kernel's partition test at
+  `1c216e2a..1c216e2f` (`inc eax; mov [ebp-0x8], eax`) sets the
+  sub-class flag purely from this `idx > count_B` predicate;
+  `subclass_of` is the table-free structural form of that test. The
+  new [`g_family::GSubclass`] enum (variants `A`/`B`) names the two
+  partition classes. (2) [`GFamily::chroma_selector()`] is the inverse
+  of [`for_chroma_selector`], returning the picture-header
+  `ac_chroma_sel` value ∈ {0,1,2} that dispatches to this G-family per
+  spec/14 §3.1 (`G2→0, G0→1, G4→2`) or `None` for the three intra-luma
+  descriptors (G1/G3/G5). (3) [`GFamily::luma_selector()`] is the
+  inverse of [`for_luma_selector`], returning the picture-header
+  `ac_luma_sel` value per spec/14 §3.1 (`G3→0, G1→1, G5→2`) or `None`
+  for the three chroma+all-inter descriptors (G0/G2/G4). Six new unit
+  tests in `src/g_family.rs::tests`:
+  `subclass_of_classifies_every_alphabet_index_per_spec_13` (every
+  in-range idx classifies; ESC and OOR return `None`),
+  `subclass_partition_sizes_match_subclass_of_counts` (iterating
+  `subclass_of` over `0..count_A` reproduces the spec/15 §5.2
+  subclass_a_size / subclass_b_size totals),
+  `subclass_of_agrees_with_decode_last_flag` (structural partition
+  matches every non-ESC token's `last` flag from the underlying
+  `g_descriptor` / `g_enum` decode dispatch),
+  `chroma_selector_inverts_for_chroma_selector` and
+  `luma_selector_inverts_for_luma_selector` (both bijections
+  round-trip with `for_chroma_selector` / `for_luma_selector`), and
+  `selector_inverses_are_role_exclusive` (`chroma_selector().is_some()
+  XOR luma_selector().is_some()` holds for every G-family, since each
+  fills exactly one role per spec/14 §3.1). Test suite grows from
+  **268 → 274** lib tests (+6). Purely additive API; no rewiring of
+  existing dispatch sites, no new tables, no new decode logic — every
+  accessor derives from the spec/13 §2 partition equation and the
+  spec/14 §3.1 bijection that already underlay the round-174 surface.
+
 - **Round 174 — unified `GFamily` dispatch surface over G0..G5** (2026-05-29):
   closes the long-standing asymmetry between the two parallel post-VLC
   `(idx → (last, run, |level|))` surfaces — [`g_descriptor::g4_decode`] /

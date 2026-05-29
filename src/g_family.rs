@@ -100,6 +100,32 @@ pub enum GRole {
     IntraLuma,
 }
 
+/// Which sub-class partition an alphabet index falls in, per spec/13 §2.
+///
+/// The MS-MPEG4 inner kernel routes every non-ESC symbol to one of two
+/// sub-classes based purely on its `idx` relative to `count_B` (per
+/// spec/13 §2 disassembly at `1c216e2a..1c216e2f`):
+///
+/// | Range | Size | Class | `last` flag | Kernel behaviour |
+/// | ----- | ---- | ----- | ----------- | ---------------- |
+/// | `[0, count_B]` | `count_B + 1` | **sub-A** | 0 | continue scan |
+/// | `(count_B, count_A)` | `count_A − count_B − 1` | **sub-B** | 1 | terminate |
+///
+/// This enum names the two classes. ESC (`idx == count_A`) is **not** a
+/// sub-class — it is a separate sentinel that triggers the 3-tier ESC
+/// body path; [`GFamily::subclass_of`] returns `None` for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum GSubclass {
+    /// Sub-class **A** — non-terminating tokens (`last=0`). Span
+    /// `[0, count_B]`, size `count_B + 1`. Per spec/13 §2 the inner
+    /// kernel continues scanning after a sub-A token.
+    A,
+    /// Sub-class **B** — terminating tokens (`last=1`). Span
+    /// `(count_B, count_A)`, size `count_A − count_B − 1`. Per spec/13
+    /// §2 a sub-B token is the clean-exit signal for the block loop.
+    B,
+}
+
 impl GFamily {
     /// All six G-families, in stable enumeration order (G0..G5).
     pub const ALL: [GFamily; 6] = [
@@ -189,6 +215,71 @@ impl GFamily {
             1 => Some(GFamily::G1),
             2 => Some(GFamily::G5),
             _ => None,
+        }
+    }
+
+    /// **Inverse** of [`for_chroma_selector`]: the picture-header
+    /// `ac_chroma_sel` value that dispatches to this G-family, or
+    /// `None` if this descriptor never fills the chroma+all-inter role.
+    /// Per spec/14 §3.1: `G2 → 0, G0 → 1, G4 → 2`; the three intra-luma
+    /// descriptors (G1/G3/G5) return `None`.
+    ///
+    /// [`for_chroma_selector`]: GFamily::for_chroma_selector
+    pub const fn chroma_selector(self) -> Option<u8> {
+        match self {
+            GFamily::G2 => Some(0),
+            GFamily::G0 => Some(1),
+            GFamily::G4 => Some(2),
+            // G1/G3/G5 fill the intra-luma role and have no chroma
+            // selector value per spec/14 §3.1.
+            GFamily::G1 | GFamily::G3 | GFamily::G5 => None,
+        }
+    }
+
+    /// **Inverse** of [`for_luma_selector`]: the picture-header
+    /// `ac_luma_sel` value that dispatches to this G-family, or `None`
+    /// if this descriptor never fills the intra-luma role. Per spec/14
+    /// §3.1: `G3 → 0, G1 → 1, G5 → 2`; the three chroma+all-inter
+    /// descriptors (G0/G2/G4) return `None`.
+    ///
+    /// [`for_luma_selector`]: GFamily::for_luma_selector
+    pub const fn luma_selector(self) -> Option<u8> {
+        match self {
+            GFamily::G3 => Some(0),
+            GFamily::G1 => Some(1),
+            GFamily::G5 => Some(2),
+            // G0/G2/G4 fill the chroma+all-inter role and have no luma
+            // selector value per spec/14 §3.1.
+            GFamily::G0 | GFamily::G2 | GFamily::G4 => None,
+        }
+    }
+
+    /// Classify an alphabet index into its [`GSubclass`] per spec/13 §2.
+    ///
+    /// Returns:
+    /// * `Some(GSubclass::A)` for `idx ∈ [0, count_B]` — non-terminating
+    ///   token (the inner kernel continues scanning).
+    /// * `Some(GSubclass::B)` for `idx ∈ (count_B, count_A)` —
+    ///   terminating token (clean exit from the block loop).
+    /// * `None` for `idx == count_A` (the ESC sentinel) and any `idx >
+    ///   count_A` (out of range). ESC is not a sub-class; it triggers
+    ///   the 3-tier ESC body path instead of the sub-A/sub-B split.
+    ///
+    /// This is the table-free, structural form of the
+    /// [`partition_invariant_holds_for_all_g_families`] test that
+    /// drives the kernel-side `last` flag in [`crate::g_descriptor`] /
+    /// [`crate::g_enum`].
+    pub const fn subclass_of(self, idx: usize) -> Option<GSubclass> {
+        let count_a = self.count_a();
+        let count_b = self.count_b();
+        if idx <= count_b {
+            Some(GSubclass::A)
+        } else if idx < count_a {
+            Some(GSubclass::B)
+        } else {
+            // idx == count_A is ESC; idx > count_A is OOR. Neither
+            // falls in a sub-class partition.
+            None
         }
     }
 
@@ -471,6 +562,162 @@ mod tests {
                     "{g:?} idx {idx}: last mismatch (count_B={})",
                     g.count_b()
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn subclass_of_classifies_every_alphabet_index_per_spec_13() {
+        // Per spec/13 §2 the partition is:
+        //   [0, count_B]            -> sub-A
+        //   (count_B, count_A)      -> sub-B
+        //   idx == count_A          -> ESC sentinel (None)
+        //   idx >  count_A          -> out of range (None)
+        for g in GFamily::ALL {
+            for idx in 0..g.count_a() {
+                let expected = if idx <= g.count_b() {
+                    Some(GSubclass::A)
+                } else {
+                    Some(GSubclass::B)
+                };
+                assert_eq!(
+                    g.subclass_of(idx),
+                    expected,
+                    "{g:?} idx={idx} (count_B={}, count_A={})",
+                    g.count_b(),
+                    g.count_a()
+                );
+            }
+            // ESC sentinel maps to None.
+            assert_eq!(
+                g.subclass_of(g.count_a()),
+                None,
+                "{g:?} ESC idx not a subclass"
+            );
+            // Out-of-range maps to None.
+            assert_eq!(
+                g.subclass_of(g.count_a() + 1),
+                None,
+                "{g:?} OOR not a subclass"
+            );
+            assert_eq!(
+                g.subclass_of(g.count_a() + 100),
+                None,
+                "{g:?} far-OOR not a subclass"
+            );
+        }
+    }
+
+    #[test]
+    fn subclass_partition_sizes_match_subclass_of_counts() {
+        // Cross-check that the partition produced by subclass_of
+        // matches the spec/15 §5.2 sub_A / sub_B sizes returned by
+        // subclass_a_size / subclass_b_size.
+        for g in GFamily::ALL {
+            let mut a = 0usize;
+            let mut b = 0usize;
+            for idx in 0..g.count_a() {
+                match g.subclass_of(idx) {
+                    Some(GSubclass::A) => a += 1,
+                    Some(GSubclass::B) => b += 1,
+                    None => panic!("{g:?} idx {idx} should classify as sub-A or sub-B"),
+                }
+            }
+            assert_eq!(a, g.subclass_a_size(), "{g:?} sub-A count");
+            assert_eq!(b, g.subclass_b_size(), "{g:?} sub-B count");
+        }
+    }
+
+    #[test]
+    fn subclass_of_agrees_with_decode_last_flag() {
+        // Every non-ESC token's `last` flag must match the sub-class
+        // returned by subclass_of (sub-A -> last=false, sub-B ->
+        // last=true). This is the structural form of the kernel's
+        // spec/13 §2 partition test.
+        for g in GFamily::ALL {
+            for idx in 0..g.count_a() {
+                let GSymbol::Token(t) = g.decode(idx).expect("non-ESC decode") else {
+                    panic!("{g:?} idx {idx} should be a token")
+                };
+                let cls = g.subclass_of(idx).expect("in-range idx classifies");
+                let expected_last = matches!(cls, GSubclass::B);
+                assert_eq!(
+                    t.last, expected_last,
+                    "{g:?} idx {idx}: subclass {cls:?} disagrees with decode().last"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn chroma_selector_inverts_for_chroma_selector() {
+        // Inverse of for_chroma_selector for the three chroma+inter
+        // descriptors per spec/14 §3.1.
+        assert_eq!(GFamily::G2.chroma_selector(), Some(0));
+        assert_eq!(GFamily::G0.chroma_selector(), Some(1));
+        assert_eq!(GFamily::G4.chroma_selector(), Some(2));
+        // Intra-luma descriptors have no chroma selector value.
+        assert_eq!(GFamily::G1.chroma_selector(), None);
+        assert_eq!(GFamily::G3.chroma_selector(), None);
+        assert_eq!(GFamily::G5.chroma_selector(), None);
+        // Round-trip: for each chroma+inter descriptor, the inverse must
+        // route back through for_chroma_selector to the same descriptor.
+        for g in [GFamily::G0, GFamily::G2, GFamily::G4] {
+            let sel = g.chroma_selector().expect("chroma+inter has selector");
+            assert_eq!(
+                GFamily::for_chroma_selector(sel),
+                Some(g),
+                "{g:?} chroma round-trip"
+            );
+        }
+    }
+
+    #[test]
+    fn luma_selector_inverts_for_luma_selector() {
+        // Inverse of for_luma_selector for the three intra-luma
+        // descriptors per spec/14 §3.1.
+        assert_eq!(GFamily::G3.luma_selector(), Some(0));
+        assert_eq!(GFamily::G1.luma_selector(), Some(1));
+        assert_eq!(GFamily::G5.luma_selector(), Some(2));
+        // Chroma+inter descriptors have no luma selector value.
+        assert_eq!(GFamily::G0.luma_selector(), None);
+        assert_eq!(GFamily::G2.luma_selector(), None);
+        assert_eq!(GFamily::G4.luma_selector(), None);
+        // Round-trip: for each intra-luma descriptor, the inverse must
+        // route back through for_luma_selector to the same descriptor.
+        for g in [GFamily::G1, GFamily::G3, GFamily::G5] {
+            let sel = g.luma_selector().expect("intra-luma has selector");
+            assert_eq!(
+                GFamily::for_luma_selector(sel),
+                Some(g),
+                "{g:?} luma round-trip"
+            );
+        }
+    }
+
+    #[test]
+    fn selector_inverses_are_role_exclusive() {
+        // A G-family fills exactly one role per spec/14 §3.1, so for
+        // any given descriptor exactly one of chroma_selector() /
+        // luma_selector() returns Some. The two inverses together form
+        // a total surjection from GFamily onto its role's selector value.
+        for g in GFamily::ALL {
+            let c = g.chroma_selector();
+            let l = g.luma_selector();
+            assert!(
+                c.is_some() ^ l.is_some(),
+                "{g:?}: exactly one of chroma_selector / luma_selector must be Some (got {c:?}/{l:?})"
+            );
+            // The Some-side selector must agree with the role.
+            match g.role() {
+                GRole::ChromaAndInter => {
+                    assert!(c.is_some(), "{g:?} ChromaAndInter role -> chroma selector");
+                    assert!(l.is_none(), "{g:?} ChromaAndInter role -> no luma selector");
+                }
+                GRole::IntraLuma => {
+                    assert!(l.is_some(), "{g:?} IntraLuma role -> luma selector");
+                    assert!(c.is_none(), "{g:?} IntraLuma role -> no chroma selector");
+                }
             }
         }
     }

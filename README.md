@@ -52,7 +52,7 @@ right decoder when a packet arrives.
 | V1 / V2 bitstream                              | header + MV + MCBPC done; AC OPEN; v3-compat defaults pinned (round 129) |
 | V1 / V2 shared CBPY VLC                        | binary cross-check vs H.263 (round 75) |
 | G0..G5 (count_A, count_B) provenance pin       | spec/15 §3 binary-derived (round 81) |
-| Unified `GFamily` dispatch surface (G0..G5)    | wired (round 174)     |
+| Unified `GFamily` dispatch surface (G0..G5)    | wired (round 174); selector inverses + `subclass_of` (round 181) |
 
 ### What's still spec-OPEN for real-content decode
 
@@ -187,6 +187,26 @@ additive. 15 new tests pin every structural fact (counts, partition
 sizes, base offsets, role distribution, selector dispatch arms, and the
 `idx > count_b ⇔ last=true` partition invariant from spec/13 §2)
 across all six families. Test suite 253 → 268 (+15) lib tests.
+
+Round-181 (2026-05-29) extends `GFamily` with three new const-fn
+accessors that complete the structural API: `subclass_of(idx)` returns
+`Option<GSubclass>` classifying every alphabet index into sub-A
+(`[0, count_B]`, `last=0`) or sub-B (`(count_B, count_A)`, `last=1`)
+per spec/13 §2's disassembly at `1c216e2a..1c216e2f`, with the ESC
+sentinel and out-of-range indices returning `None`; `chroma_selector()`
+and `luma_selector()` are the **inverses** of `for_chroma_selector` /
+`for_luma_selector` per spec/14 §3.1, returning the picture-header
+selector value ∈ {0,1,2} that dispatches to this G-family or `None`
+for the other role (`G2→0, G0→1, G4→2` for chroma; `G3→0, G1→1, G5→2`
+for luma). A new `GSubclass` enum (variants `A`/`B`) names the two
+partition classes documented through spec/13 §2 and §4.4. Six new
+tests pin the partition counts (subclass_of × count_a iteration
+matches `subclass_a_size` / `subclass_b_size`), agreement between
+`subclass_of` and `decode().last` for every non-ESC idx in every
+G-family, round-trip closure of both selector inverses, and the
+role-exclusive structural property `chroma_selector().is_some() XOR
+luma_selector().is_some()` from spec/14 §3.1. Test suite 268 → 274
+(+6) lib tests. Purely additive; no rewiring.
 
 Round-129 pins the **v1 / v2 → v3-compat selector defaults** as
 two associated constants on `MsV1V2PictureHeader`
