@@ -53,6 +53,7 @@ right decoder when a packet arrives.
 | V1 / V2 shared CBPY VLC                        | binary cross-check vs H.263 (round 75) |
 | G0..G5 (count_A, count_B) provenance pin       | spec/15 §3 binary-derived (round 81) |
 | Unified `GFamily` dispatch surface (G0..G5)    | wired (round 174); selector inverses + `subclass_of` (round 181) |
+| P-frame 1-MV predictor (Figure 7-34 top-left)  | routed through `mv_pred::predict_block_mv` (round 191) |
 
 ### What's still spec-OPEN for real-content decode
 
@@ -207,6 +208,34 @@ G-family, round-trip closure of both selector inverses, and the
 role-exclusive structural property `chroma_selector().is_some() XOR
 luma_selector().is_some()` from spec/14 §3.1. Test suite 268 → 274
 (+6) lib tests. Purely additive; no rewiring.
+
+Round-191 (2026-05-30) routes the P-frame **1-MV predictor** in
+[`picture::decode_pframe_mb`] through the round-185
+[`mv_pred::predict_block_mv(Block::TopLeft, …)`] surface, closing
+the queued integration item from r185's CHANGELOG. Per
+`docs/video/mpeg4-visual/figure-7-34-mv-predictor-layout.md` and
+ISO/IEC 14496-2:2004(E) §7.6.5 the 1-MV-per-MB case (the only mode
+the v3 picture decoder currently supports) is *explicitly* mapped to
+Figure 7-34's top-left sub-diagram, with the §7.6.5 four candidate-
+validity substitution rules applied to the three neighbouring-MB
+candidate cells (`left_mb`, `above_mb`, `above_right_mb`). The
+pre-r191 path consumed [`mv::median_predictor`], a pre-spec
+shortcut that zero-substitutes missing neighbours and then takes a
+median — producing the spec-correct answer when **two or three**
+neighbours are valid but diverging on the rule-3 case ("exactly two
+candidate predictors are not valid → both set to the third"). The
+rule-3 case fires when exactly **one** of `left`/`top`/`top_right`
+is valid: pre-r191 the predictor was `median(only, 0, 0) = 0`;
+r191 it is the lone valid neighbour itself. The equivalence on the
+≥ 2-valid path is pinned by
+[`mv_pred::tests::top_left_matches_existing_median_predictor_when_two_or_more_valid`]
+(5×5×5×4 sample sweep, all green); the divergence on the
+exactly-1-valid path is pinned by
+[`mv_pred::tests::top_left_diverges_from_old_shortcut_in_rule_3_case`].
+[`mv::median_predictor`] is retained for the v1/v2 test surface;
+no API removal. Future round (4-MV-per-MB MCBPC variant) grows
+this call site into a per-block loop over [`mv_pred::Block::ALL`],
+each invocation reading the same predict_block_mv API.
 
 Round-129 pins the **v1 / v2 → v3-compat selector defaults** as
 two associated constants on `MsV1V2PictureHeader`

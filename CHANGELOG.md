@@ -7,6 +7,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Round 191 — P-frame 1-MV predictor routed through `mv_pred`
+  (Figure 7-34 top-left case)** (2026-05-30):
+  [`picture::decode_pframe_mb`] now obtains its motion-vector
+  predictor from [`mv_pred::predict_block_mv`] with
+  [`mv_pred::Block::TopLeft`] (driven by a
+  [`mv_pred::BlockCandidates`] populated from the per-row `left` /
+  `top` / `top_right` neighbour MVs the existing call site already
+  computes), rather than the historical pre-spec
+  [`mv::median_predictor`] shortcut. Per `docs/video/mpeg4-visual/figure-7-34-mv-predictor-layout.md`
+  §"When only one motion vector is present for the whole macroblock,
+  the top-left case in Figure 7-34 is applied", and per ISO/IEC
+  14496-2:2004(E) §7.6.5 prose ("In the case of only one motion
+  vector present for the complete macroblock, the top-left case in
+  Figure 7-34 is applied."), `Block::TopLeft` is the spec-mandated
+  layout for the 1-MV-per-MB case which is the only mode the v3
+  picture decoder currently supports.
+
+  Behavioural delta (relative to the pre-r191 shortcut): the rule-3
+  corner of §7.6.5 ("If two and only two candidate predictors are not
+  valid, they are set to the third candidate predictor.") now fires
+  whenever exactly **one** of the three neighbours is valid. The
+  predictor becomes that lone valid neighbour itself rather than the
+  median of `(neighbour, 0, 0)` which the shortcut returned as zero.
+  In practice this affects two corner cases:
+
+  - The first inter MB in a row whose row-0 neighbours are all
+    intra-coded and whose left neighbour is the only valid one
+    (`left` Some, `top` and `top_right` both `None`). Pre-r191
+    predictor = `(0, 0)`; r191 predictor = `left.mv`.
+  - Symmetric cases where `top` or `top_right` is the sole valid
+    neighbour.
+
+  All other neighbour configurations (zero valid, two valid, three
+  valid) keep their pre-r191 behaviour bit-for-bit — the
+  [`mv_pred::tests::top_left_matches_existing_median_predictor_when_two_or_more_valid`]
+  test in r185 already pinned that equivalence over a 5×5×5×4 sample
+  space. The lone divergence is the rule-3 "exactly one valid" case
+  pinned by [`mv_pred::tests::top_left_diverges_from_old_shortcut_in_rule_3_case`].
+
+  This routing is what r185's CHANGELOG entry queued as "for the next
+  round once the 4-MV-per-MB MCBPC variant lands". Re-reading
+  Figure 7-34's caption and §7.6.5's prose this round shows that the
+  1-MV case is independent of the 4-MV decode path: the spec applies
+  the top-left sub-diagram unconditionally to the 1-MV mode (and to
+  every short-video-header stream), so wiring 1-MV through
+  `mv_pred::predict_block_mv(Block::TopLeft, …)` does not need the
+  4-MV MCBPC variant. When 4-MV lands in a future round the same
+  call site grows a per-block loop over `Block::ALL`, each
+  invocation reading the same `mv_pred::predict_block_mv` API.
+
+  [`mv::median_predictor`] is retained (still consumed by the v1/v2
+  MV test surface at `tests/v1_v2_mv.rs::median_predictor_chains_with_decode`
+  and the in-module mv tests) and deprecated only in documentation;
+  no API removal.
+
+  No new tests this round — the behavioural delta is already pinned
+  in `mv_pred::tests` (15 spec-7.6.5 + 2 divergence + boundary +
+  shortcut-equivalence tests, all green). Test suite unchanged at
+  291 lib + 113 integration tests.
+
 ### Added
 
 - **Round 185 — MV-predictor candidate-neighbour walk (Figure 7-34)**

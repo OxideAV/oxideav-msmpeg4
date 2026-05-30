@@ -552,7 +552,31 @@ fn decode_pframe_mb(
     // routes to a placeholder that returns Error::Unsupported with
     // the extractor-blocker diagnostic (see
     // `crate::mv::MvTable::Alternate`).
-    let predictor = crate::mv::median_predictor(left, top, top_right);
+    //
+    // The 1-MV-per-MB case (which is the only mode currently shipping
+    // for v3) is the Figure 7-34 top-left sub-diagram per
+    // `docs/video/mpeg4-visual/figure-7-34-mv-predictor-layout.md` §
+    // "When only one motion vector is present for the whole macroblock,
+    // the top-left case in Figure 7-34 is applied." The §7.6.5
+    // substitution rules then apply (`mv_pred::apply_validity_rules`).
+    // Routing through [`mv_pred::predict_block_mv`] replaces the
+    // pre-spec `mv::median_predictor` shortcut so the rule-3
+    // ("exactly one valid neighbour → promote to all three slots")
+    // corner is spec-correct: when only `left` (or only `top`, or only
+    // `top_right`) is valid, the predictor is now that neighbour itself
+    // instead of `median(neighbour, 0, 0) = 0`. This affects the first
+    // inter MB after a row of intra MBs at row 0 (`left` is the sole
+    // valid neighbour) and the analogous edge cases.
+    let cands = crate::mv_pred::BlockCandidates {
+        left_mb: left,
+        above_mb: top,
+        above_right_mb: top_right,
+        // 1-MV-per-MB mode has no within-MB block dependencies.
+        mb_block_1: None,
+        mb_block_2: None,
+        mb_block_3: None,
+    };
+    let predictor = crate::mv_pred::predict_block_mv(crate::mv_pred::Block::TopLeft, &cands);
     let mv = crate::mv::decode_mv_with_table(br, predictor, mv_table)?;
     mv_grid[mb_idx] = Some(mv);
 
