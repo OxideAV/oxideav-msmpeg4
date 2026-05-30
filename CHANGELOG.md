@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.7](https://github.com/OxideAV/oxideav-msmpeg4/compare/v0.0.6...v0.0.7) - 2026-05-30
+
+### Other
+
+- round 191: route P-frame 1-MV predictor through mv_pred (Figure 7-34 top-left)
+- round 185: MV-predictor candidate-neighbour walk per MPEG-4 Visual Figure 7-34
+- round 181: GFamily selector inverses + subclass_of partition classifier
+- round 174: unified GFamily dispatch surface over G0..G5
+- round 129: v1/v2 → v3-compat selector defaults pinned as public API
+- round 126: 3-tier ESC body integration tests + stale README row fix
+- round 123: inter (P-frame) AC residual decode wired
+- round 81: spec/15 §3 per-G (count_A, count_B) source-of-truth pin
+- round 75: v1/v2 shared CBPY VLC binary cross-check (region_053640)
+- round 7: G0..G3 LMAX/RMAX wired + synthetic-VLC pipeline
+
 ### Changed
 
 - **Round 191 — P-frame 1-MV predictor routed through `mv_pred`
