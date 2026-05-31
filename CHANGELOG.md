@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Round 196 — 4-MV-per-MB batch predictor surface** (2026-06-01):
+  Two new public APIs in [`mv_pred`] that thread the per-block
+  within-MB candidate cells per Figure 7-34 of ISO/IEC
+  14496-2:2004(E) across all four 8x8 luminance blocks in one
+  call. [`mv_pred::predict_macroblock_4mv_with_finals`] takes a
+  [`mv_pred::MacroblockCandidates`] (the three neighbour-MB MVs)
+  plus the already-decoded block-1/2/3 MVs and returns `[Mv; 4]`,
+  computed by calling [`mv_pred::predict_block_mv`] once per
+  [`mv_pred::Block::ALL`]. [`mv_pred::Macroblock4MvDecoder`] is
+  the closed-form helper for the predict-MVD-decode-reconstruct
+  loop a future `picture::decode_pframe_mb` 4-MV path will drive:
+  alternate `predictor_for(block)` (read the §7.6.5 spec
+  predictor given whatever has been committed so far) and
+  `commit_block(block, final_mv)` (record the post-MVD-add MV so
+  later blocks see it as the corresponding within-MB candidate).
+  Per `docs/video/mpeg4-visual/figure-7-34-mv-predictor-layout.md`
+  the four block sub-diagrams pin: block 1 takes left + above +
+  above-right neighbour MBs; block 2 takes block 1 + above +
+  above-right; block 3 takes left + block 1 + block 2; block 4
+  takes block 3 + block 1 + block 2 (all within-MB). Eight new
+  lib tests in `src/mv_pred.rs::tests` pin every structural fact
+  (batch-block-0 equivalence with direct TopLeft call, all-four-
+  blocks match per-block predicts, closed-form decoder agrees
+  with batch fn, picture-corner rule-4-then-rule-3 chain on block
+  1 → block 2, block 4 ignores neighbour MBs, decoder accepts
+  out-of-order commits without re-threading). Test suite 291 →
+  299 (+8) lib tests. Purely additive; the 1-MV call site in
+  `picture::decode_pframe_mb` is unchanged — wiring the 4-MV path
+  into the picture decoder waits on the MS-MPEG-4 v3 MCBPC bit
+  pattern signalling 1-MV vs 4-MV mode (open spec gap; see
+  README "Still lacks" tail).
+
 ## [0.0.7](https://github.com/OxideAV/oxideav-msmpeg4/compare/v0.0.6...v0.0.7) - 2026-05-30
 
 ### Other

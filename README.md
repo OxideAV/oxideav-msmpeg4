@@ -237,6 +237,37 @@ no API removal. Future round (4-MV-per-MB MCBPC variant) grows
 this call site into a per-block loop over [`mv_pred::Block::ALL`],
 each invocation reading the same predict_block_mv API.
 
+Round-196 (2026-06-01) adds the **4-MV-per-MB batch surface** that
+the r191 CHANGELOG queued: two new public APIs in
+[`mv_pred`] that thread the within-MB candidate cells per Figure 7-34
+across all four luminance blocks in a single call.
+[`mv_pred::predict_macroblock_4mv_with_finals`] takes a
+[`mv_pred::MacroblockCandidates`] (the three neighbour-MB MVs) plus
+the already-decoded block-1/2/3 MVs and returns a `[Mv; 4]` of
+per-block predictors, computed by calling
+[`mv_pred::predict_block_mv`] once per [`mv_pred::Block::ALL`].
+[`mv_pred::Macroblock4MvDecoder`] is the closed-form helper for
+the predict-MVD-decode-reconstruct loop a future
+`picture::decode_pframe_mb` 4-MV path will drive — caller
+alternates `predictor_for(block)` (read the §7.6.5 spec predictor
+given whatever is committed so far) and `commit_block(block,
+final_mv)` (record the post-MVD-add MV so later blocks see it as a
+within-MB candidate). Eight new lib tests pin: block-0-of-batch
+matches a direct `Block::TopLeft` call (regression guard); all
+four blocks match per-block `predict_block_mv` invocations under
+the figure's per-block neighbour layout; the closed-form decoder
+agrees with the batch function; the corner case where rule-4 fires
+for block 1 and rule-3 promotes block-1's MV to block 2's
+predictor when no neighbour MBs are available; block 4's
+predictor *ignores* the three neighbour-MB MVs (BR sub-diagram is
+all-within-MB per Figure 7-34); and out-of-order `commit_block` is
+allowed but doesn't retroactively affect later blocks'
+candidates. Test suite 291 → 299 (+8) lib tests. Purely additive;
+the existing 1-MV call site in `picture::decode_pframe_mb` is
+unchanged — wiring the 4-MV path into the picture decoder waits on
+the MS-MPEG-4 v3 MCBPC bit pattern that signals 1-MV vs 4-MV mode
+(an open spec gap; see "Still lacks" tail below).
+
 Round-129 pins the **v1 / v2 → v3-compat selector defaults** as
 two associated constants on `MsV1V2PictureHeader`
 (`V1_COMPAT_DEFAULTS` / `V2_COMPAT_DEFAULTS`). Per
