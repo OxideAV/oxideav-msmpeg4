@@ -237,6 +237,28 @@ no API removal. Future round (4-MV-per-MB MCBPC variant) grows
 this call site into a per-block loop over [`mv_pred::Block::ALL`],
 each invocation reading the same predict_block_mv API.
 
+Round-202 (2026-06-01) adds an **end-to-end bitstream exercise of
+the 4-MV-per-MB decoder**: a new integration file
+`tests/macroblock_4mv_bitstream.rs` drives `Macroblock4MvDecoder`
+through the full predict → joint-VLC-decode → commit loop for a single
+16x16 macroblock, using real codes from the v3 default joint-MV VLC
+(`MV_V3_RAW`, source at VMA `0x1c25cbc0`). Four tests pin: (1) the
+picture-corner case where block 1 fires §7.6.5 rule 4 (zero
+predictor) and blocks 2 / 3 / 4 pick up earlier-committed within-MB
+MVs via rules 2 / 3 — proving the decoder threads candidates
+correctly across a real bitstream and not just synthesised `Mv`
+values; (2) the all-neighbours case where every block exercises its
+distinct Figure 7-34 layout without firing a substitution rule; (3)
+a "rigid-motion" case where four zero-MVD codes against a non-zero
+predictor produce the same `left_mb` MV across all four blocks
+(every rule fires in turn and they all collapse to `left`); and
+(4) a parallel-reader cross-check that `Macroblock4MvDecoder`
+produces the same per-step predictor and decoded-MV as manual
+`predict_block_mv` calls fed the same bitstream — pinning the
+helper as a faithful sequencer over the public API. Test suite
+gains 4 integration tests (376 → 380); fully additive, no
+behavioural change in the 1-MV `picture::decode_pframe_mb` path.
+
 Round-196 (2026-06-01) adds the **4-MV-per-MB batch surface** that
 the r191 CHANGELOG queued: two new public APIs in
 [`mv_pred`] that thread the within-MB candidate cells per Figure 7-34

@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 202 — 4-MV-per-MB bitstream integration tests** (2026-06-01):
+  New `tests/macroblock_4mv_bitstream.rs` exercises
+  [`mv_pred::Macroblock4MvDecoder`] end-to-end through the full
+  predict → joint-VLC-decode → commit loop for a single 16x16
+  macroblock, streaming real codes from the v3 default joint-MV VLC
+  (`MV_V3_RAW`, source at VMA `0x1c25cbc0`). Four cases pin the
+  decoder against a real bitstream rather than synthesised `Mv`
+  values: the picture-corner where block 1 hits §7.6.5 rule 4 and
+  blocks 2 / 3 / 4 chain through within-MB candidates via rules 2 /
+  3; the all-neighbours case where every block exercises its
+  distinct Figure 7-34 layout without firing a substitution rule;
+  a "rigid-motion" zero-MVD case where four copies of the
+  `(MVDx_raw, MVDy_raw) = (32, 32)` joint code against a non-zero
+  `left_mb` predictor collapse all four blocks to the same MV; and
+  a parallel-reader cross-check proving
+  `Macroblock4MvDecoder::{predictor_for, commit_block}` is a
+  faithful sequencer of manual
+  [`mv_pred::predict_block_mv`] calls (every per-block predictor
+  and decoded MV agree; bit-consumption matches). The shared `pack`
+  helper + `canonical_code_for` builder are local to the integration
+  file so the new tests do not depend on private rebuilds of the
+  canonical-Huffman walker. Fully additive; the 1-MV
+  `picture::decode_pframe_mb` path is unchanged. Integration test
+  count grows by 4 (76 → 80 cross-file tests across the
+  `tests/` harness).
+
 - **Round 196 — 4-MV-per-MB batch predictor surface** (2026-06-01):
   Two new public APIs in [`mv_pred`] that thread the per-block
   within-MB candidate cells per Figure 7-34 of ISO/IEC
