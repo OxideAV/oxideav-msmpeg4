@@ -54,6 +54,7 @@ right decoder when a packet arrives.
 | G0..G5 (count_A, count_B) provenance pin       | spec/15 §3 binary-derived (round 81) |
 | Unified `GFamily` dispatch surface (G0..G5)    | wired (round 174); selector inverses + `subclass_of` (round 181) |
 | P-frame 1-MV predictor (Figure 7-34 top-left)  | routed through `mv_pred::predict_block_mv` (round 191) |
+| 4-MV-per-MB predictor batch surface             | `Macroblock4MvDecoder` + bitstream tests (rounds 196 / 202) |
 
 ### What's still spec-OPEN for real-content decode
 
