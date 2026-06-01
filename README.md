@@ -55,6 +55,7 @@ right decoder when a packet arrives.
 | Unified `GFamily` dispatch surface (G0..G5)    | wired (round 174); selector inverses + `subclass_of` (round 181) |
 | P-frame 1-MV predictor (Figure 7-34 top-left)  | routed through `mv_pred::predict_block_mv` (round 191) |
 | 4-MV-per-MB predictor batch surface             | `Macroblock4MvDecoder` + bitstream tests (rounds 196 / 202) |
+| 4-MV neighbour-MB bordering-cell picker         | `bordering_block_of_neighbour` + `pick_neighbour_mv_from_4mv` (round 208) |
 
 ### What's still spec-OPEN for real-content decode
 
@@ -320,6 +321,47 @@ silent drift in the constants fails the build. Test suite
 new public API that downstream consumers (oxideav-avi tag
 dispatch, oxideav-mkv codec resolver) can read to spell out the
 "v1/v2 share v3 decode paths but with these defaults" contract.
+
+Round-208 (2026-06-02) adds the **4-MV-per-MB neighbour-MB
+bordering-cell picker** — a purely additive const-fn surface that
+closes the "the caller is responsible for picking the right cell from
+the neighbouring MB" comment in
+[`mv_pred::MacroblockCandidates`]. When a current macroblock is
+predicted in 4-MV-per-MB mode and one of its neighbouring macroblocks
+(left, above, above-right) was *also* coded with K=4 motion vectors,
+ISO/IEC 14496-2:2004(E) §7.6.5 / Figure 7-34 pins which of the
+neighbour's 8x8 blocks sits adjacent to the current-MB block being
+predicted. Two new const-fn APIs in [`mv_pred`] resolve the lookup:
+[`mv_pred::bordering_block_of_neighbour(current, direction) ->
+Option<Block>`] returns the bordering [`mv_pred::Block`] cell of the
+indicated neighbour, and [`mv_pred::pick_neighbour_mv_from_4mv(current,
+direction, &[Mv; 4]) -> Option<Mv>`] composes that lookup with an
+index into the neighbour's `[Mv; 4]` raster-order array. A new
+[`mv_pred::NeighbourDirection`] enum (variants `Left` / `Above` /
+`AboveRight`) names the three neighbour-MB directions used by Figure
+7-34. The (current-block, direction) → bordering-block table has
+exactly six entries (block 1 takes left/above/above-right; block 2
+takes above + above-right; block 3 takes left; block 4 takes nothing —
+the BR sub-diagram is all-within-MB); the other six pairs return
+`None` and the caller must use the within-MB candidate slot instead.
+Adjacency facts come from the four Figure 7-34 sub-diagrams in
+`docs/video/mpeg4-visual/figure-7-34-mv-predictor-layout.md` cross-
+checked against the rendered `figure-7-34-render.png` (PDF page 302)
+— e.g. block 1's MV1 (left) sits in the right column / top row of the
+left-neighbour MB, i.e. that neighbour's block 2 (TR); block 3's MV1
+(left) sits in the right column / bottom row, i.e. that neighbour's
+block 4 (BR). Ten new lib tests in `src/mv_pred.rs::tests` pin every
+entry of the six-Some-six-None table per current-block sub-diagram,
+the `[Mv; 4]` indexing behaviour, the `None` cases, the
+`NeighbourDirection::ALL` enumeration, the const-fn property, and the
+composition with [`mv_pred::predict_block_mv`] for the block-1
+predict path. Test suite 299 → 309 (+10) lib tests. Purely additive;
+existing `picture::decode_pframe_mb` 1-MV path is unchanged. The
+helper is the public API a future 4-MV-mode picture decoder will use
+when threading 4-MV-coded neighbour MBs into the
+[`mv_pred::BlockCandidates`] / [`mv_pred::MacroblockCandidates`]
+slots; for 1-MV-coded neighbours no resolution is required (the
+neighbour's single MV is reported in every direction by definition).
 
 ## License
 

@@ -9,6 +9,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 208 — 4-MV neighbour-MB bordering-cell picker** (2026-06-02):
+  Two new public const-fn APIs in [`mv_pred`] that close the
+  "the caller is responsible for picking the right cell from the
+  neighbouring MB" doc comment in [`mv_pred::MacroblockCandidates`].
+  [`mv_pred::bordering_block_of_neighbour(current, direction) ->
+  Option<Block>`] resolves, per ISO/IEC 14496-2:2004(E) §7.6.5 /
+  Figure 7-34, which 8x8 sub-block of a **4-MV-coded** neighbouring
+  macroblock sits adjacent to the current-MB block being predicted.
+  [`mv_pred::pick_neighbour_mv_from_4mv(current, direction, &[Mv; 4])
+  -> Option<Mv>`] composes that lookup with an index into the
+  neighbour's `[Mv; 4]` raster-order MV array. A new
+  [`mv_pred::NeighbourDirection`] enum (variants `Left` / `Above` /
+  `AboveRight`, plus `NeighbourDirection::ALL`) names the three
+  neighbour-MB directions referenced by Figure 7-34. The
+  `(current-block, direction)` → bordering-block table has exactly six
+  Some entries (block 1 / TopLeft takes all three directions; block 2
+  / TopRight takes above + above-right; block 3 / BottomLeft takes
+  left only; block 4 / BottomRight takes nothing — its BR sub-diagram
+  is all-within-MB) and six None entries (where the within-MB
+  candidate slot of [`mv_pred::BlockCandidates`] is used instead).
+  Bordering positions are derived from the four sub-diagrams of
+  `docs/video/mpeg4-visual/figure-7-34-mv-predictor-layout.md`,
+  cross-checked against `docs/video/mpeg4-visual/figure-7-34-render.png`
+  (PDF page 302): block 1's MV1 (left) sits in the right-column /
+  top-row 8x8 of the left-neighbour MB = block 2 (TopRight) of the
+  left-neighbour; block 1's MV2 (above) and MV3 (above-right) sit in
+  the bottom-row / left-col 8x8 of those neighbours = block 3
+  (BottomLeft); block 2's MV2 (above) sits in the bottom-row /
+  right-col 8x8 = block 4 (BottomRight) of the above-neighbour;
+  block 3's MV1 (left) sits in the right-col / bottom-row 8x8 of the
+  left-neighbour = block 4 (BottomRight). Ten new lib tests in
+  `src/mv_pred.rs::tests` pin every per-current-block sub-diagram
+  (`bordering_block_for_{top_left,top_right,bottom_left,bottom_right}_…`),
+  the documented six-Some / six-None split
+  (`bordering_block_count_matches_documented_table`), the const-fn
+  property (`bordering_block_is_const_evaluable`), the `[Mv; 4]`
+  indexing behaviour for the six Some-returning pairs
+  (`pick_neighbour_mv_uses_bordering_block_as_index`), the six
+  None-returning pairs (`pick_neighbour_mv_returns_none_when_no_bordering_block`),
+  the `NeighbourDirection::ALL` enumeration, and the
+  predictor-composition for the block-1 case
+  (`pick_neighbour_mv_composes_with_predict_block_mv_for_block_1`).
+  Test suite 299 → 309 (+10) lib tests. Purely additive; no
+  rewiring of `picture::decode_pframe_mb` or any existing call site;
+  the helper is the API a future 4-MV-mode picture decoder will
+  consult when populating [`mv_pred::BlockCandidates`] /
+  [`mv_pred::MacroblockCandidates`] from 4-MV-coded neighbours.
+
 - **Round 202 — 4-MV-per-MB bitstream integration tests** (2026-06-01):
   New `tests/macroblock_4mv_bitstream.rs` exercises
   [`mv_pred::Macroblock4MvDecoder`] end-to-end through the full

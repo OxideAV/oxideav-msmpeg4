@@ -451,6 +451,170 @@ impl Macroblock4MvDecoder {
     }
 }
 
+/// Direction of a neighbouring macroblock relative to the current MB.
+///
+/// Used by [`bordering_block_of_neighbour`] to resolve which 8x8
+/// sub-block of a **4-MV-coded neighbouring macroblock** sits adjacent
+/// to a given current-MB block per Figure 7-34. The three directions
+/// match the three neighbour-MB fields of [`BlockCandidates`] /
+/// [`MacroblockCandidates`]: `Left` ↔ `left_mb`, `Above` ↔ `above_mb`,
+/// `AboveRight` ↔ `above_right_mb`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NeighbourDirection {
+    /// Macroblock immediately to the left of the current MB.
+    Left,
+    /// Macroblock immediately above the current MB.
+    Above,
+    /// Macroblock diagonally above-right of the current MB.
+    AboveRight,
+}
+
+impl NeighbourDirection {
+    /// Const-fn enumeration of every direction. Useful for test loops.
+    pub const ALL: [NeighbourDirection; 3] = [
+        NeighbourDirection::Left,
+        NeighbourDirection::Above,
+        NeighbourDirection::AboveRight,
+    ];
+}
+
+/// Per ISO/IEC 14496-2:2004(E) §7.6.5 / Figure 7-34, when the
+/// neighbouring macroblock indicated by `direction` is coded with K=4
+/// motion vectors (one per 8x8 luminance block per Figure 6-8), this
+/// returns the [`Block`] of that neighbour whose 8x8 sub-block sits
+/// **adjacent to the current-MB block being predicted** (`current`).
+///
+/// The mapping is taken directly from the four sub-diagrams of
+/// Figure 7-34, observing which cell of the *neighbouring* MB box
+/// borders the current `MV` cell:
+///
+/// | `current` | `direction`  | bordering block of neighbour MB    |
+/// | --------- | ------------ | ---------------------------------- |
+/// | TopLeft   | Left         | TopRight (block 2 of left MB)      |
+/// | TopLeft   | Above        | BottomLeft (block 3 of above MB)   |
+/// | TopLeft   | AboveRight   | BottomLeft (block 3 of AR MB)      |
+/// | TopRight  | Above        | BottomRight (block 4 of above MB)  |
+/// | TopRight  | AboveRight   | BottomLeft (block 3 of AR MB)      |
+/// | BottomLeft| Left         | BottomRight (block 4 of left MB)   |
+///
+/// Returns `None` when no neighbour-MB candidate is required for the
+/// given `(current, direction)` pair — this covers the **block 4
+/// (`BottomRight`) case in full** (Figure 7-34's BR sub-diagram uses
+/// only within-MB candidates), the `(TopRight, Left)` slot (block 2's
+/// MV1 comes from the within-MB block 1, not the left-neighbour MB),
+/// the `(BottomLeft, Above)` and `(BottomLeft, AboveRight)` slots
+/// (block 3's MV2 / MV3 come from within-MB blocks 1 / 2), and any
+/// other neighbour-direction combination that does not appear in
+/// Figure 7-34.
+///
+/// # When to use
+///
+/// A caller decoding a current MB whose left / above / above-right
+/// neighbour was 4-MV-coded already holds those neighbours' `[Mv; 4]`
+/// arrays (one MV per Figure 6-8 block of the neighbour). To populate
+/// [`BlockCandidates`] for a current-block predict, the caller picks
+/// the neighbour's bordering MV via
+///
+/// ```ignore
+/// use oxideav_msmpeg4::mv_pred::{bordering_block_of_neighbour, Block,
+///     NeighbourDirection};
+///
+/// let left_neighbour_mvs: [Mv; 4] = …; // from previous MB decode
+/// let cell = bordering_block_of_neighbour(Block::TopLeft, NeighbourDirection::Left)
+///     .expect("TL/Left always borders one of left-MB's blocks");
+/// let left_candidate: Mv = left_neighbour_mvs[cell.spec_index() as usize - 1];
+/// ```
+///
+/// For a 1-MV-coded neighbour the caller passes that single MV in the
+/// corresponding [`BlockCandidates`] slot directly — no resolution is
+/// required (this helper is only consulted when the neighbour is
+/// 4-MV-coded). [`pick_neighbour_mv_from_4mv`] wraps this lookup +
+/// `[Mv; 4]` indexing in one call.
+///
+/// # Source
+///
+/// - `docs/video/mpeg4-visual/figure-7-34-mv-predictor-layout.md`
+///   §"ASCII transcription of Figure 7-34" — the four per-block
+///   sub-diagrams plus the convention that "thin (non-bold) boxes are
+///   neighbouring macroblocks; cells inside the bold box are 8x8
+///   blocks of the current MB". The bordering-cell positions in this
+///   table are read off the relative position of MV1/MV2/MV3 cells
+///   within each direction's neighbouring-MB outline.
+/// - `docs/video/mpeg4-visual/ISO_IEC_14496-2-2004-3rd-edition.txt`
+///   §7.6.5 — "vector candidate predictors (MV1, MV2, MV3) from the
+///   spatial neighbourhood macroblocks or blocks already decoded".
+/// - `docs/video/mpeg4-visual/figure-7-34-render.png` — rendered
+///   original page 302 of the PDF, used as the visual cross-check
+///   for the cell positions transcribed above.
+pub const fn bordering_block_of_neighbour(
+    current: Block,
+    direction: NeighbourDirection,
+) -> Option<Block> {
+    match (current, direction) {
+        // Block 1 (TL) takes all three candidates from neighbouring MBs.
+        // MV1 = left-neighbour's right-column / top-row 8x8  → block 2.
+        // MV2 = above-neighbour's bottom-row / left-col 8x8  → block 3.
+        // MV3 = AR-neighbour's bottom-row / left-col 8x8     → block 3.
+        (Block::TopLeft, NeighbourDirection::Left) => Some(Block::TopRight),
+        (Block::TopLeft, NeighbourDirection::Above) => Some(Block::BottomLeft),
+        (Block::TopLeft, NeighbourDirection::AboveRight) => Some(Block::BottomLeft),
+
+        // Block 2 (TR) takes MV1 from within-MB block 1 — no left-MB
+        // candidate is consulted. MV2 = above-neighbour's bottom-row /
+        // right-col 8x8 → block 4 (current block 2 is at the right
+        // column of the current MB, so the directly-above cell is the
+        // right-column / bottom-row block of the above-neighbour).
+        // MV3 = AR-neighbour's bottom-left 8x8 → block 3.
+        (Block::TopRight, NeighbourDirection::Left) => None,
+        (Block::TopRight, NeighbourDirection::Above) => Some(Block::BottomRight),
+        (Block::TopRight, NeighbourDirection::AboveRight) => Some(Block::BottomLeft),
+
+        // Block 3 (BL) takes MV2/MV3 from within-MB blocks 1/2 — no
+        // above-MB / above-right-MB candidate is consulted. MV1 =
+        // left-neighbour's right-column / bottom-row 8x8 → block 4
+        // (current block 3 is at the bottom row of the current MB, so
+        // the directly-left cell is the right-column / bottom-row
+        // block of the left-neighbour).
+        (Block::BottomLeft, NeighbourDirection::Left) => Some(Block::BottomRight),
+        (Block::BottomLeft, NeighbourDirection::Above) => None,
+        (Block::BottomLeft, NeighbourDirection::AboveRight) => None,
+
+        // Block 4 (BR) consumes only within-MB candidates per Figure
+        // 7-34's BR sub-diagram — no neighbour-MB MV is ever consulted
+        // for any direction.
+        (Block::BottomRight, _) => None,
+    }
+}
+
+/// Pick the bordering MV of a **4-MV-coded** neighbouring macroblock,
+/// given that neighbour's `[Mv; 4]` (one MV per Figure 6-8 block of
+/// the neighbour, ordered `[block 1, block 2, block 3, block 4]`).
+///
+/// Resolves the bordering block via [`bordering_block_of_neighbour`]
+/// and indexes into the neighbour's MV array. Returns `None` when the
+/// `(current, direction)` pair has no neighbour-MB candidate per
+/// Figure 7-34 (i.e. the same `None` cases as
+/// [`bordering_block_of_neighbour`]).
+///
+/// For a **1-MV-coded** neighbour the caller does not need this
+/// helper: the same single MV is reported in every direction by
+/// definition, so the caller passes it directly into the relevant
+/// [`BlockCandidates`] field.
+///
+/// # Source
+///
+/// Same as [`bordering_block_of_neighbour`].
+pub const fn pick_neighbour_mv_from_4mv(
+    current: Block,
+    direction: NeighbourDirection,
+    neighbour_mvs: &[Mv; 4],
+) -> Option<Mv> {
+    match bordering_block_of_neighbour(current, direction) {
+        Some(b) => Some(neighbour_mvs[b.spec_index() as usize - 1]),
+        None => None,
+    }
+}
+
 /// Per-component median of three MVs. Same formula as the existing
 /// `mv::median_predictor`: `median(a, b, c) = a + b + c - min - max`,
 /// computed independently per component. Factored here so the
@@ -958,6 +1122,230 @@ mod tests {
         // three valid so no substitution → median(b3, b1, b2)).
         let expected_bw = median_of_three(b3, b1, b2);
         assert_eq!(o1[3], expected_bw);
+    }
+
+    // ---------- 4-MV neighbour-MB bordering-cell helper tests ----------
+
+    /// Figure 7-34 block 1 (TL) sub-diagram pins all three
+    /// bordering-cell positions: MV1 at TR of left-neighbour, MV2 at
+    /// BL of above-neighbour, MV3 at BL of above-right neighbour.
+    #[test]
+    fn bordering_block_for_top_left_matches_figure_7_34_tl_subdiagram() {
+        assert_eq!(
+            bordering_block_of_neighbour(Block::TopLeft, NeighbourDirection::Left),
+            Some(Block::TopRight),
+        );
+        assert_eq!(
+            bordering_block_of_neighbour(Block::TopLeft, NeighbourDirection::Above),
+            Some(Block::BottomLeft),
+        );
+        assert_eq!(
+            bordering_block_of_neighbour(Block::TopLeft, NeighbourDirection::AboveRight),
+            Some(Block::BottomLeft),
+        );
+    }
+
+    /// Block 2 (TR) sub-diagram: no left-MB candidate (MV1 is within-MB
+    /// block 1); MV2 in BR of above-neighbour (column directly above
+    /// current block 2, bottom row of the above MB); MV3 in BL of
+    /// above-right neighbour.
+    #[test]
+    fn bordering_block_for_top_right_matches_figure_7_34_tr_subdiagram() {
+        assert_eq!(
+            bordering_block_of_neighbour(Block::TopRight, NeighbourDirection::Left),
+            None,
+        );
+        assert_eq!(
+            bordering_block_of_neighbour(Block::TopRight, NeighbourDirection::Above),
+            Some(Block::BottomRight),
+        );
+        assert_eq!(
+            bordering_block_of_neighbour(Block::TopRight, NeighbourDirection::AboveRight),
+            Some(Block::BottomLeft),
+        );
+    }
+
+    /// Block 3 (BL) sub-diagram: only the left-neighbour contributes
+    /// (block 4 / BR of the left-neighbour); MV2 / MV3 come from
+    /// within-MB blocks 1 / 2 so the above / above-right directions
+    /// return `None`.
+    #[test]
+    fn bordering_block_for_bottom_left_matches_figure_7_34_bl_subdiagram() {
+        assert_eq!(
+            bordering_block_of_neighbour(Block::BottomLeft, NeighbourDirection::Left),
+            Some(Block::BottomRight),
+        );
+        assert_eq!(
+            bordering_block_of_neighbour(Block::BottomLeft, NeighbourDirection::Above),
+            None,
+        );
+        assert_eq!(
+            bordering_block_of_neighbour(Block::BottomLeft, NeighbourDirection::AboveRight),
+            None,
+        );
+    }
+
+    /// Block 4 (BR) sub-diagram: every candidate is within-MB, so
+    /// every neighbour direction returns `None`.
+    #[test]
+    fn bordering_block_for_bottom_right_returns_none_for_every_direction() {
+        for direction in NeighbourDirection::ALL {
+            assert_eq!(
+                bordering_block_of_neighbour(Block::BottomRight, direction),
+                None,
+                "BR/{direction:?} must be None per Figure 7-34 BR sub-diagram",
+            );
+        }
+    }
+
+    /// Across all 12 `(current, direction)` pairs, exactly six map to a
+    /// neighbour-MB cell — the six entries enumerated in the doc
+    /// comment table. The other six must be `None`. Cross-check the
+    /// count to guard against silent table drift.
+    #[test]
+    fn bordering_block_count_matches_documented_table() {
+        let mut some_count = 0;
+        let mut none_count = 0;
+        for current in Block::ALL {
+            for direction in NeighbourDirection::ALL {
+                match bordering_block_of_neighbour(current, direction) {
+                    Some(_) => some_count += 1,
+                    None => none_count += 1,
+                }
+            }
+        }
+        assert_eq!(some_count, 6, "documented table has six Some(...) entries");
+        assert_eq!(none_count, 6, "documented table has six None entries");
+    }
+
+    /// `bordering_block_of_neighbour` is `const fn`; verify by using
+    /// it in a constant initialiser.
+    #[test]
+    fn bordering_block_is_const_evaluable() {
+        const TL_LEFT: Option<Block> =
+            bordering_block_of_neighbour(Block::TopLeft, NeighbourDirection::Left);
+        assert_eq!(TL_LEFT, Some(Block::TopRight));
+    }
+
+    /// `pick_neighbour_mv_from_4mv` indexes the supplied `[Mv; 4]`
+    /// in Figure 6-8 raster order. Pin the six Some-returning cases
+    /// against a synthetic `[Mv; 4]` whose values encode the block
+    /// number, so a mis-indexing would be visible.
+    #[test]
+    fn pick_neighbour_mv_uses_bordering_block_as_index() {
+        // Encode block N as Mv { x: N, y: 10*N }.
+        let nb: [Mv; 4] = [
+            Mv { x: 1, y: 10 },
+            Mv { x: 2, y: 20 },
+            Mv { x: 3, y: 30 },
+            Mv { x: 4, y: 40 },
+        ];
+        // (current, direction) → bordering block N → expected Mv from nb.
+        let cases: [(Block, NeighbourDirection, Mv); 6] = [
+            (Block::TopLeft, NeighbourDirection::Left, nb[1]), // → block 2
+            (Block::TopLeft, NeighbourDirection::Above, nb[2]), // → block 3
+            (Block::TopLeft, NeighbourDirection::AboveRight, nb[2]), // → block 3
+            (Block::TopRight, NeighbourDirection::Above, nb[3]), // → block 4
+            (Block::TopRight, NeighbourDirection::AboveRight, nb[2]), // → block 3
+            (Block::BottomLeft, NeighbourDirection::Left, nb[3]), // → block 4
+        ];
+        for (current, direction, expected) in cases {
+            assert_eq!(
+                pick_neighbour_mv_from_4mv(current, direction, &nb),
+                Some(expected),
+                "{current:?} / {direction:?}",
+            );
+        }
+    }
+
+    /// `pick_neighbour_mv_from_4mv` returns `None` for every
+    /// `(current, direction)` pair where the bordering-block table
+    /// has no entry — six pairs total.
+    #[test]
+    fn pick_neighbour_mv_returns_none_when_no_bordering_block() {
+        let nb: [Mv; 4] = [Mv::default(); 4];
+        let none_cases: [(Block, NeighbourDirection); 6] = [
+            (Block::TopRight, NeighbourDirection::Left),
+            (Block::BottomLeft, NeighbourDirection::Above),
+            (Block::BottomLeft, NeighbourDirection::AboveRight),
+            (Block::BottomRight, NeighbourDirection::Left),
+            (Block::BottomRight, NeighbourDirection::Above),
+            (Block::BottomRight, NeighbourDirection::AboveRight),
+        ];
+        for (current, direction) in none_cases {
+            assert_eq!(
+                pick_neighbour_mv_from_4mv(current, direction, &nb),
+                None,
+                "{current:?} / {direction:?}",
+            );
+        }
+    }
+
+    /// `NeighbourDirection::ALL` enumerates every variant exactly once.
+    #[test]
+    fn neighbour_direction_all_lists_every_variant_once() {
+        let all = NeighbourDirection::ALL;
+        assert_eq!(all.len(), 3);
+        assert!(all.contains(&NeighbourDirection::Left));
+        assert!(all.contains(&NeighbourDirection::Above));
+        assert!(all.contains(&NeighbourDirection::AboveRight));
+    }
+
+    /// End-to-end: build a `BlockCandidates` for Block 1 (TL) by
+    /// resolving each neighbour direction through the 4-MV picker, and
+    /// confirm the predictor matches the single-call result obtained
+    /// by feeding the same three picked MVs straight into the
+    /// canonical `predict_block_mv` API. Pins that the helper composes
+    /// cleanly with the existing predict surface.
+    #[test]
+    fn pick_neighbour_mv_composes_with_predict_block_mv_for_block_1() {
+        // Left-neighbour 4-MV array: distinct values per block.
+        let left_nb: [Mv; 4] = [
+            Mv { x: 1, y: 0 },
+            Mv { x: 2, y: 0 }, // <- block 2 borders current block 1
+            Mv { x: 3, y: 0 },
+            Mv { x: 4, y: 0 },
+        ];
+        // Above-neighbour 4-MV array.
+        let above_nb: [Mv; 4] = [
+            Mv { x: 0, y: 1 },
+            Mv { x: 0, y: 2 },
+            Mv { x: 0, y: 3 }, // <- block 3 borders current block 1
+            Mv { x: 0, y: 4 },
+        ];
+        // Above-right-neighbour 4-MV array.
+        let ar_nb: [Mv; 4] = [
+            Mv { x: 10, y: 10 },
+            Mv { x: 20, y: 20 },
+            Mv { x: 30, y: 30 }, // <- block 3 borders current block 1
+            Mv { x: 40, y: 40 },
+        ];
+
+        let left_pick =
+            pick_neighbour_mv_from_4mv(Block::TopLeft, NeighbourDirection::Left, &left_nb)
+                .expect("TL/Left has a bordering block");
+        let above_pick =
+            pick_neighbour_mv_from_4mv(Block::TopLeft, NeighbourDirection::Above, &above_nb)
+                .expect("TL/Above has a bordering block");
+        let ar_pick =
+            pick_neighbour_mv_from_4mv(Block::TopLeft, NeighbourDirection::AboveRight, &ar_nb)
+                .expect("TL/AboveRight has a bordering block");
+
+        assert_eq!(left_pick, Mv { x: 2, y: 0 });
+        assert_eq!(above_pick, Mv { x: 0, y: 3 });
+        assert_eq!(ar_pick, Mv { x: 30, y: 30 });
+
+        // Feed the picked MVs into BlockCandidates and predict.
+        let cands = BlockCandidates {
+            left_mb: Some(left_pick),
+            above_mb: Some(above_pick),
+            above_right_mb: Some(ar_pick),
+            ..BlockCandidates::default()
+        };
+        let predictor = predict_block_mv(Block::TopLeft, &cands);
+        // Compare against a manual median of the same three MVs.
+        let expected = median_of_three(left_pick, above_pick, ar_pick);
+        assert_eq!(predictor, expected);
     }
 
     /// Driving the decoder out of raster order: committing block 4
