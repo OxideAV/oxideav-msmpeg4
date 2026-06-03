@@ -9,6 +9,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 227 — picture-wide MV grid → `NeighbourSet` builder
+  (`mv_pred::MvGrid` + `mv_pred::MvGridCell`)** (2026-06-04): two
+  additive public APIs in [`mv_pred`] that lift r214's per-MB
+  [`NeighbourSet`] to a per-picture grid the P-VOP driver can
+  consult by `(mb_x, mb_y)`. [`mv_pred::MvGridCell`] is a per-MB
+  cell variant (`Absent` / `OneMv(Mv)` / `FourMv([Mv; 4])`) with
+  `From<MvGridCell> for NeighbourMvKind` so a grid cell promotes
+  directly into a [`NeighbourSet`] field. [`mv_pred::MvGrid`] is a
+  `width × height` raster-ordered `Vec<MvGridCell>` with `new`
+  (all-Absent initial state), `width` / `height` accessors,
+  `cell_at(mb_x, mb_y)` / `set_cell(mb_x, mb_y, cell)` (out-of-bounds
+  reads return `Absent` per the picture-edge substitution rule;
+  out-of-bounds writes are a no-op), and `neighbour_set_for(mb_x,
+  mb_y)` — the load-bearing method that builds a [`NeighbourSet`]
+  from the grid's three neighbour positions per Figure 7-34: left
+  = `(mb_x - 1, mb_y)`, above = `(mb_x, mb_y - 1)`, above-right
+  = `(mb_x + 1, mb_y - 1)`, with picture-edge cells (`mb_x == 0` /
+  `mb_y == 0` / `mb_x + 1 == width`) substituted to `Absent` per
+  the §7.6.5 rule 1 "outside the current VOP → not valid"
+  boundary handling. The resulting [`NeighbourSet`] feeds straight
+  into [`mv_pred::Macroblock4MvDecoderNeighbours::new`] or
+  [`mv_pred::resolve_block_candidates`] so a P-VOP decoder can drive
+  the r214/r221 predictor pipeline without reimplementing the
+  picture-edge lookup each per-MB. Twelve new lib tests in
+  `src/mv_pred.rs::tests` pin: `MvGridCell::default()` is `Absent`;
+  the three `From<MvGridCell>` round-trips into `NeighbourMvKind`;
+  `MvGrid::new(w, h)` starts all-Absent; out-of-bounds `cell_at`
+  returns `Absent`; `set_cell` / `cell_at` round-trip with
+  out-of-bounds-write no-op; the picture-corner `(0, 0)` yielding
+  `NeighbourSet::ABSENT` regardless of grid contents; the
+  top-edge case `(mb_x, 0)` for `mb_x > 0` with only `left`
+  non-`Absent`; the left-edge case `(0, mb_y)` for `mb_y > 0` with
+  `above` and `above_right` from row `mb_y - 1`; the right-edge
+  case `(width - 1, mb_y)` with `above_right` substituted to
+  `Absent`; the interior case with all three neighbours present
+  including a `FourMv` neighbour promoted intact; a grid →
+  [`Macroblock4MvDecoderNeighbours`] composition check including
+  the bordering-cell pick for a 4-MV left neighbour; and the
+  top-edge case threading through
+  [`predict_macroblock_4mv_with_4mv_neighbours`] (block 1's
+  predictor = the left neighbour MV per rule 3). Test suite 331 →
+  343 (+12) lib tests; integration + doc tests unchanged. Purely
+  additive; the existing `picture::decode_pframe_mb` 1-MV path's
+  hand-built `BlockCandidates` is unchanged. Source —
+  `docs/video/mpeg4-visual/figure-7-34-mv-predictor-layout.md`
+  §"Boundary substitution" (verbatim wording of the rule-1
+  "outside the current VOP / video packet / GOB → transparent"
+  cases) plus `docs/video/mpeg4-visual/ISO_IEC_14496-2-2004-3rd-edition.txt`
+  §7.6.5 rule 1. No new tables, no new decode logic; the grid
+  composes the r214 `NeighbourSet` API over the picture-edge
+  substitution rule the spec already mandates.
+
 - **Round 221 — 4-MV stateful predict/commit driver with
   `NeighbourSet`-aware bordering** (2026-06-03): adds
   [`mv_pred::Macroblock4MvDecoderNeighbours`], the

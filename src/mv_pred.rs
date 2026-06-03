@@ -1014,6 +1014,171 @@ impl Default for Macroblock4MvDecoderNeighbours {
     }
 }
 
+/// Per-MB cell of a picture-wide MV grid. Each macroblock position in a
+/// P-VOP stores one of three states that maps directly to
+/// [`NeighbourMvKind`]:
+///
+/// - [`MvGridCell::Absent`] for skipped MBs (whose stored MV is zero but
+///   are treated as "no contribution" by the neighbour-lookup path —
+///   the H.263 convention threaded through `picture::decode_pframe_mb`)
+///   and for grid positions whose MB has not yet been decoded.
+/// - [`MvGridCell::OneMv(mv)`] for the 1-MV-per-MB case (always for
+///   `short_video_header == '1'` and for 1-MV-coded MBs in 4-MV-enabled
+///   pictures).
+/// - [`MvGridCell::FourMv([mv1, mv2, mv3, mv4])`] for 4-MV-coded MBs,
+///   storing one MV per Figure 6-8 luminance block.
+///
+/// `From<MvGridCell> for NeighbourMvKind` is provided so the grid cell
+/// can be promoted directly into a [`NeighbourSet`] field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum MvGridCell {
+    /// No stored MV (undecoded, or "no contribution" per H.263 boundary
+    /// substitution). Maps to [`NeighbourMvKind::Absent`].
+    #[default]
+    Absent,
+    /// A 1-MV-coded macroblock with a single 16x16 MV.
+    OneMv(Mv),
+    /// A 4-MV-coded macroblock with one MV per 8x8 luminance block in
+    /// Figure 6-8 raster order: `[block 1, block 2, block 3, block 4]`.
+    FourMv([Mv; 4]),
+}
+
+impl From<MvGridCell> for NeighbourMvKind {
+    fn from(cell: MvGridCell) -> Self {
+        match cell {
+            MvGridCell::Absent => NeighbourMvKind::Absent,
+            MvGridCell::OneMv(mv) => NeighbourMvKind::OneMv(mv),
+            MvGridCell::FourMv(mvs) => NeighbourMvKind::FourMv(mvs),
+        }
+    }
+}
+
+/// Picture-wide MV grid: one [`MvGridCell`] per macroblock position in
+/// raster order (`y * width + x`). This is the data structure a P-VOP
+/// decoder fills in as it walks MBs in raster order, and that the
+/// per-MB predictor wants to consult to build a [`NeighbourSet`] for
+/// the current MB.
+///
+/// # Boundary handling
+///
+/// Per Figure 7-34 + §7.6.5 rule 1, neighbours that lie **outside the
+/// picture** are "not valid" and the [`NeighbourMvKind::Absent`] state
+/// is reported. This grid handles **picture-edge** substitution
+/// transparently in [`MvGrid::neighbour_set_for`]:
+///
+/// - At `mb_x == 0` the left neighbour is `Absent`.
+/// - At `mb_y == 0` the above neighbour is `Absent`.
+/// - At `mb_y == 0` OR at `mb_x + 1 == width` (right edge) the
+///   above-right neighbour is `Absent` (the latter because the
+///   above-right cell would lie in a column past the picture).
+///
+/// **Video-packet / GOB boundary substitution** is **not** modelled
+/// here — those boundaries are stream-format-dependent and must be
+/// applied by the caller by writing [`MvGridCell::Absent`] into the
+/// grid positions on the far side of the boundary before consulting
+/// [`MvGrid::neighbour_set_for`].
+///
+/// # Source
+///
+/// `docs/video/mpeg4-visual/figure-7-34-mv-predictor-layout.md`
+/// §"Boundary substitution" + `docs/video/mpeg4-visual/ISO_IEC_14496-2-2004-3rd-edition.txt`
+/// §7.6.5 rule 1.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MvGrid {
+    width: usize,
+    height: usize,
+    cells: Vec<MvGridCell>,
+}
+
+impl MvGrid {
+    /// New `width × height` grid with every cell `Absent`. This is the
+    /// initial state at picture start.
+    pub fn new(width: usize, height: usize) -> Self {
+        Self {
+            width,
+            height,
+            cells: vec![MvGridCell::Absent; width * height],
+        }
+    }
+
+    /// Grid width in macroblocks.
+    pub const fn width(&self) -> usize {
+        self.width
+    }
+
+    /// Grid height in macroblocks.
+    pub const fn height(&self) -> usize {
+        self.height
+    }
+
+    /// Return the cell at `(mb_x, mb_y)`. Out-of-bounds positions
+    /// return [`MvGridCell::Absent`] per the picture-edge substitution
+    /// rule.
+    pub fn cell_at(&self, mb_x: usize, mb_y: usize) -> MvGridCell {
+        if mb_x >= self.width || mb_y >= self.height {
+            return MvGridCell::Absent;
+        }
+        self.cells[mb_y * self.width + mb_x]
+    }
+
+    /// Store a cell at `(mb_x, mb_y)`. Out-of-bounds positions are a
+    /// no-op (the caller is responsible for staying within the grid).
+    pub fn set_cell(&mut self, mb_x: usize, mb_y: usize, cell: MvGridCell) {
+        if mb_x >= self.width || mb_y >= self.height {
+            return;
+        }
+        self.cells[mb_y * self.width + mb_x] = cell;
+    }
+
+    /// Build the [`NeighbourSet`] for the current MB at `(mb_x, mb_y)`
+    /// from the grid's already-decoded cells.
+    ///
+    /// Neighbour positions are:
+    ///
+    /// - `left = (mb_x - 1, mb_y)` (`Absent` when `mb_x == 0`).
+    /// - `above = (mb_x, mb_y - 1)` (`Absent` when `mb_y == 0`).
+    /// - `above_right = (mb_x + 1, mb_y - 1)` (`Absent` when
+    ///   `mb_y == 0` or `mb_x + 1 == width`).
+    ///
+    /// Each neighbour cell is promoted to a [`NeighbourMvKind`] via
+    /// `From<MvGridCell> for NeighbourMvKind`. The result can be fed
+    /// straight into [`Macroblock4MvDecoderNeighbours::new`] or into
+    /// [`resolve_block_candidates`] to obtain per-current-block
+    /// [`BlockCandidates`].
+    ///
+    /// # Picture-corner / edge cases (Figure 7-34 boundary rule)
+    ///
+    /// - `(0, 0)`: all three neighbours `Absent`.
+    /// - `(mb_x, 0)` for `mb_x > 0`: only `left` is non-`Absent`.
+    /// - `(0, mb_y)` for `mb_y > 0`: `left` is `Absent`; the other
+    ///   two are read from row `mb_y - 1`.
+    /// - `(width - 1, mb_y)` for `mb_y > 0`: `above_right` is
+    ///   `Absent` because the column `mb_x + 1` is past the picture.
+    pub fn neighbour_set_for(&self, mb_x: usize, mb_y: usize) -> NeighbourSet {
+        let left = if mb_x > 0 {
+            self.cell_at(mb_x - 1, mb_y)
+        } else {
+            MvGridCell::Absent
+        };
+        let (above, above_right) = if mb_y > 0 {
+            let above = self.cell_at(mb_x, mb_y - 1);
+            let above_right = if mb_x + 1 < self.width {
+                self.cell_at(mb_x + 1, mb_y - 1)
+            } else {
+                MvGridCell::Absent
+            };
+            (above, above_right)
+        } else {
+            (MvGridCell::Absent, MvGridCell::Absent)
+        };
+        NeighbourSet {
+            left: left.into(),
+            above: above.into(),
+            above_right: above_right.into(),
+        }
+    }
+}
+
 /// Per-component median of three MVs. Same formula as the existing
 /// `mv::median_predictor`: `median(a, b, c) = a + b + c - min - max`,
 /// computed independently per component. Factored here so the
@@ -2363,5 +2528,226 @@ mod tests {
         // pin the surface equivalence on the all-`None` within-MB entry.
         let batch = predict_macroblock_4mv_with_4mv_neighbours(set, [None; 3]);
         assert_eq!(batch[0], stateful_finals[0]);
+    }
+
+    // ---------- MvGrid / MvGridCell tests ----------
+
+    /// `MvGridCell::default()` is `Absent` — pinning the documented
+    /// "initial state at picture start" behaviour for grids built via
+    /// `MvGrid::new`.
+    #[test]
+    fn mv_grid_cell_default_is_absent() {
+        assert_eq!(MvGridCell::default(), MvGridCell::Absent);
+    }
+
+    /// `From<MvGridCell> for NeighbourMvKind` round-trips each of the
+    /// three cell variants to the corresponding `NeighbourMvKind`
+    /// constructor — same payload, no transformation.
+    #[test]
+    fn mv_grid_cell_promotes_to_neighbour_mv_kind() {
+        let mv = Mv { x: 3, y: -2 };
+        let mvs = [
+            Mv { x: 1, y: 1 },
+            Mv { x: 2, y: 2 },
+            Mv { x: 3, y: 3 },
+            Mv { x: 4, y: 4 },
+        ];
+        assert_eq!(
+            NeighbourMvKind::from(MvGridCell::Absent),
+            NeighbourMvKind::Absent,
+        );
+        assert_eq!(
+            NeighbourMvKind::from(MvGridCell::OneMv(mv)),
+            NeighbourMvKind::OneMv(mv),
+        );
+        assert_eq!(
+            NeighbourMvKind::from(MvGridCell::FourMv(mvs)),
+            NeighbourMvKind::FourMv(mvs),
+        );
+    }
+
+    /// A fresh grid has every cell `Absent` and its `width()` / `height()`
+    /// match the constructor args.
+    #[test]
+    fn mv_grid_new_is_all_absent() {
+        let grid = MvGrid::new(4, 3);
+        assert_eq!(grid.width(), 4);
+        assert_eq!(grid.height(), 3);
+        for y in 0..3 {
+            for x in 0..4 {
+                assert_eq!(grid.cell_at(x, y), MvGridCell::Absent);
+            }
+        }
+    }
+
+    /// `cell_at` for any out-of-bounds `(mb_x, mb_y)` returns `Absent`
+    /// per the picture-edge substitution rule.
+    #[test]
+    fn mv_grid_out_of_bounds_cell_at_is_absent() {
+        let grid = MvGrid::new(2, 2);
+        // Both axes past the bound.
+        assert_eq!(grid.cell_at(2, 0), MvGridCell::Absent);
+        assert_eq!(grid.cell_at(0, 2), MvGridCell::Absent);
+        assert_eq!(grid.cell_at(2, 2), MvGridCell::Absent);
+        // Way past.
+        assert_eq!(grid.cell_at(100, 100), MvGridCell::Absent);
+    }
+
+    /// `set_cell` writes the cell; `cell_at` reads it back; out-of-bounds
+    /// writes are a no-op (they don't grow the grid or panic).
+    #[test]
+    fn mv_grid_set_cell_round_trips() {
+        let mut grid = MvGrid::new(3, 3);
+        let mv = Mv { x: 7, y: -3 };
+        grid.set_cell(1, 2, MvGridCell::OneMv(mv));
+        assert_eq!(grid.cell_at(1, 2), MvGridCell::OneMv(mv));
+        // Untouched cells stay `Absent`.
+        assert_eq!(grid.cell_at(0, 0), MvGridCell::Absent);
+        assert_eq!(grid.cell_at(2, 2), MvGridCell::Absent);
+        // Out-of-bounds set is a no-op (no panic).
+        grid.set_cell(99, 99, MvGridCell::OneMv(mv));
+        assert_eq!(grid.cell_at(99, 99), MvGridCell::Absent);
+    }
+
+    /// Picture-corner `(0, 0)`: all three neighbours are `Absent`
+    /// regardless of grid contents — picture-edge substitution per
+    /// Figure 7-34 boundary rule.
+    #[test]
+    fn mv_grid_corner_yields_absent_neighbour_set() {
+        let mut grid = MvGrid::new(4, 4);
+        // Even if we (incorrectly) wrote MVs to grid positions, the
+        // neighbour lookup for the top-left corner must report all-Absent.
+        let mv = Mv { x: 1, y: 1 };
+        grid.set_cell(0, 0, MvGridCell::OneMv(mv));
+        let set = grid.neighbour_set_for(0, 0);
+        assert_eq!(set, NeighbourSet::ABSENT);
+    }
+
+    /// Top-edge `(mb_x, 0)` for `mb_x > 0`: only `left` is non-`Absent`.
+    /// `above` and `above_right` would lie in row `-1` (outside the
+    /// picture).
+    #[test]
+    fn mv_grid_top_edge_only_left_is_present() {
+        let mut grid = MvGrid::new(4, 4);
+        let l = Mv { x: 5, y: 5 };
+        grid.set_cell(1, 0, MvGridCell::OneMv(l)); // the left neighbour for (2, 0)
+        let set = grid.neighbour_set_for(2, 0);
+        assert_eq!(set.left, NeighbourMvKind::OneMv(l));
+        assert_eq!(set.above, NeighbourMvKind::Absent);
+        assert_eq!(set.above_right, NeighbourMvKind::Absent);
+    }
+
+    /// Left-edge `(0, mb_y)` for `mb_y > 0`: `left` is `Absent`;
+    /// `above` and `above_right` are read from row `mb_y - 1`.
+    #[test]
+    fn mv_grid_left_edge_left_is_absent_others_from_above_row() {
+        let mut grid = MvGrid::new(4, 4);
+        let a = Mv { x: 2, y: 2 };
+        let ar = Mv { x: 3, y: 3 };
+        grid.set_cell(0, 0, MvGridCell::OneMv(a)); // above of (0, 1)
+        grid.set_cell(1, 0, MvGridCell::OneMv(ar)); // above-right of (0, 1)
+        let set = grid.neighbour_set_for(0, 1);
+        assert_eq!(set.left, NeighbourMvKind::Absent);
+        assert_eq!(set.above, NeighbourMvKind::OneMv(a));
+        assert_eq!(set.above_right, NeighbourMvKind::OneMv(ar));
+    }
+
+    /// Right-edge `(width - 1, mb_y)` for `mb_y > 0`: `above_right`
+    /// is `Absent` because column `mb_x + 1` is past the picture, even
+    /// though row `mb_y - 1` is in range.
+    #[test]
+    fn mv_grid_right_edge_above_right_is_absent() {
+        let mut grid = MvGrid::new(3, 3);
+        let l = Mv { x: 1, y: 1 };
+        let a = Mv { x: 2, y: 2 };
+        grid.set_cell(1, 1, MvGridCell::OneMv(l)); // left of (2, 1)
+        grid.set_cell(2, 0, MvGridCell::OneMv(a)); // above of (2, 1)
+        let set = grid.neighbour_set_for(2, 1);
+        assert_eq!(set.left, NeighbourMvKind::OneMv(l));
+        assert_eq!(set.above, NeighbourMvKind::OneMv(a));
+        assert_eq!(set.above_right, NeighbourMvKind::Absent);
+    }
+
+    /// Interior position: all three neighbour MBs are present in the
+    /// grid; the resulting `NeighbourSet` carries each neighbour's
+    /// `MvGridCell` promoted to `NeighbourMvKind` at the matching slot.
+    #[test]
+    fn mv_grid_interior_position_carries_all_three_neighbours() {
+        let mut grid = MvGrid::new(4, 4);
+        let l = Mv { x: 1, y: 1 };
+        let a_mvs = [
+            Mv { x: 2, y: 2 },
+            Mv { x: 3, y: 3 },
+            Mv { x: 4, y: 4 },
+            Mv { x: 5, y: 5 },
+        ];
+        let ar = Mv { x: 6, y: 6 };
+        // Current MB = (2, 2). Neighbours at (1, 2), (2, 1), (3, 1).
+        grid.set_cell(1, 2, MvGridCell::OneMv(l));
+        grid.set_cell(2, 1, MvGridCell::FourMv(a_mvs));
+        grid.set_cell(3, 1, MvGridCell::OneMv(ar));
+        let set = grid.neighbour_set_for(2, 2);
+        assert_eq!(set.left, NeighbourMvKind::OneMv(l));
+        assert_eq!(set.above, NeighbourMvKind::FourMv(a_mvs));
+        assert_eq!(set.above_right, NeighbourMvKind::OneMv(ar));
+    }
+
+    /// Composability with the per-MB decoder: drive
+    /// `Macroblock4MvDecoderNeighbours` from a grid-built `NeighbourSet`
+    /// and confirm the resulting per-block predictors match what
+    /// `resolve_block_candidates` would produce directly. This pins
+    /// the grid → decoder pipeline as a no-information-loss surface.
+    #[test]
+    fn mv_grid_feeds_macroblock_4mv_decoder_neighbours() {
+        let mut grid = MvGrid::new(3, 3);
+        let l_mvs = [
+            Mv { x: 0, y: 0 },
+            Mv { x: 10, y: 0 }, // TR cell — borders current block 1
+            Mv { x: 0, y: 0 },
+            Mv { x: -10, y: 0 }, // BR cell — borders current block 3
+        ];
+        let a = Mv { x: 2, y: 2 };
+        let ar = Mv { x: 4, y: -1 };
+        grid.set_cell(0, 1, MvGridCell::FourMv(l_mvs)); // left of (1, 1)
+        grid.set_cell(1, 0, MvGridCell::OneMv(a)); // above of (1, 1)
+        grid.set_cell(2, 0, MvGridCell::OneMv(ar)); // above-right of (1, 1)
+        let set = grid.neighbour_set_for(1, 1);
+        let decoder = Macroblock4MvDecoderNeighbours::new(set);
+        // Block 1 (TL): MV1 = left.block2 (TR cell of left = (10, 0)),
+        // MV2 = above MB, MV3 = above-right MB.
+        let pred_tl = decoder.predictor_for(Block::TopLeft);
+        let cands_tl = resolve_block_candidates(Block::TopLeft, set, [None; 3]);
+        let expected_tl = predict_block_mv(Block::TopLeft, &cands_tl);
+        assert_eq!(pred_tl, expected_tl);
+        // And the same pipeline yields the exact bordering-cell pick:
+        // MV1 came from left's block 2 (the TR cell).
+        let cands_check = resolve_block_candidates(Block::TopLeft, set, [None; 3]);
+        assert_eq!(cands_check.left_mb, Some(l_mvs[1]));
+    }
+
+    /// `(1, 0)` (top-edge, `mb_x > 0`) reduces the grid's
+    /// `NeighbourSet` to "left only" — and feeding that into
+    /// [`predict_macroblock_4mv_with_4mv_neighbours`] reproduces the
+    /// `Macroblock4MvDecoder` semantics for a 1-MV left + Absent
+    /// above + Absent above-right, regardless of what (if anything) is
+    /// stored in row 0's other cells.
+    #[test]
+    fn mv_grid_top_edge_routes_through_predict_macroblock_4mv() {
+        let mut grid = MvGrid::new(4, 4);
+        let l = Mv { x: 7, y: -2 };
+        // Write the left neighbour at (0, 0); the current MB is (1, 0).
+        grid.set_cell(0, 0, MvGridCell::OneMv(l));
+        // And write some other MVs in row 0 to confirm they don't leak in.
+        grid.set_cell(2, 0, MvGridCell::OneMv(Mv { x: 99, y: 99 }));
+        grid.set_cell(3, 0, MvGridCell::OneMv(Mv { x: 88, y: 88 }));
+        let set = grid.neighbour_set_for(1, 0);
+        assert_eq!(set.left, NeighbourMvKind::OneMv(l));
+        assert_eq!(set.above, NeighbourMvKind::Absent);
+        assert_eq!(set.above_right, NeighbourMvKind::Absent);
+        // Driving the batch through the resulting set: block 1's
+        // candidates are (Some(l), None, None) → rule 3 fires →
+        // predictor = l.
+        let finals = predict_macroblock_4mv_with_4mv_neighbours(set, [None; 3]);
+        assert_eq!(finals[0], l);
     }
 }

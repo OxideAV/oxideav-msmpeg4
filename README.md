@@ -58,6 +58,7 @@ right decoder when a packet arrives.
 | 4-MV neighbour-MB bordering-cell picker         | `bordering_block_of_neighbour` + `pick_neighbour_mv_from_4mv` (round 208) |
 | 4-MV neighbour-state resolver (1-MV vs 4-MV)    | `NeighbourMvKind` + `NeighbourSet` + `resolve_block_candidates` (round 214) |
 | 4-MV stateful predict / commit driver           | `Macroblock4MvDecoderNeighbours` (round 221) |
+| Picture-wide MV grid → `NeighbourSet` builder    | `MvGrid` + `MvGridCell` (round 227)          |
 
 ### What's still spec-OPEN for real-content decode
 
