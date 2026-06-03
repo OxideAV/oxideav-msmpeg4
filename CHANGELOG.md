@@ -9,6 +9,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 221 — 4-MV stateful predict/commit driver with
+  `NeighbourSet`-aware bordering** (2026-06-03): adds
+  [`mv_pred::Macroblock4MvDecoderNeighbours`], the
+  [`mv_pred::NeighbourSet`]-driven analogue of r196's
+  [`mv_pred::Macroblock4MvDecoder`]. Same shape (`new(neighbours)`,
+  `predictor_for(block)`, `commit_block(block, final_mv)`,
+  `neighbours()`, `finalise() -> [Mv; 4]`, `Default` =
+  `NeighbourSet::ABSENT`, `new` is `const fn`) but the predictor
+  calls route through [`mv_pred::resolve_block_candidates`] so a
+  4-MV-coded neighbour's bordering 8x8 cell is picked **per
+  current-MB block** per ISO/IEC 14496-2:2004(E) §7.6.5 /
+  Figure 7-34 (`docs/video/mpeg4-visual/figure-7-34-mv-predictor-layout.md`).
+  Compared with r196's [`Macroblock4MvDecoder`] (which collapses
+  neighbours to one `Option<Mv>` per direction via
+  [`mv_pred::MacroblockCandidates`] and is correct only when every
+  neighbour is 1-MV-coded), the new decoder picks the right
+  bordering MV per current block — e.g. when a 4-MV left
+  neighbour has distinct MVs at its TR cell (block 2, borders
+  current block 1) and its BR cell (block 4, borders current
+  block 3), the new decoder reads each correctly, whereas the
+  old surface could only pick one. Both shapes co-exist;
+  1-MV-only neighbours can keep using the original decoder. Ten
+  new lib tests in `src/mv_pred.rs::tests` pin: the absent-neighbour
+  predictor chain (block 1 = (0, 0) by rule 4; blocks 2/3/4 pick
+  up earlier-committed within-MB MVs by rules 2/3); equivalence
+  with [`Macroblock4MvDecoder`] when every neighbour is `OneMv`
+  (same per-block predictors, same finals); the same equivalence
+  when every neighbour is `Absent`; the distinct-cell divergence
+  with a 4-MV left neighbour (block 1 picks left's block 2 cell,
+  block 3 picks left's block 4 cell); `neighbours()` accessor
+  round-trip; `Default::default()` resolves to
+  `NeighbourSet::ABSENT`; the const-fn property of `new`; the
+  out-of-order block-4-then-block-1 commit independence (block 4's
+  MV is never read as a within-MB candidate so committing it early
+  doesn't affect block 1's predictor); `finalise`'s
+  `Mv::default()` substitution for uncommitted blocks; and the
+  surface equivalence with
+  [`mv_pred::predict_macroblock_4mv_with_4mv_neighbours`] for the
+  block-1 entry. Test suite 321 → 331 (+10) lib tests; integration
+  + doc tests unchanged. Purely additive; the existing 1-MV
+  `picture::decode_pframe_mb` call site is unchanged. Source —
+  `docs/video/mpeg4-visual/figure-7-34-mv-predictor-layout.md`
+  §"What the figure shows" + four per-block sub-diagrams, plus
+  `docs/video/mpeg4-visual/ISO_IEC_14496-2-2004-3rd-edition.txt`
+  §7.6.5 (the four substitution rules + median + worked example),
+  same source set as r214's `resolve_block_candidates`. No new
+  tables, no new decode logic; the additive surface is wholly the
+  stateful wrapper around r214's primitive.
+
 - **Round 214 — 4-MV neighbour-state resolver (1-MV vs 4-MV per
   neighbour)** (2026-06-03): three additive public APIs in
   [`mv_pred`] that close the gap between r208's per-pair

@@ -57,6 +57,7 @@ right decoder when a packet arrives.
 | 4-MV-per-MB predictor batch surface             | `Macroblock4MvDecoder` + bitstream tests (rounds 196 / 202) |
 | 4-MV neighbour-MB bordering-cell picker         | `bordering_block_of_neighbour` + `pick_neighbour_mv_from_4mv` (round 208) |
 | 4-MV neighbour-state resolver (1-MV vs 4-MV)    | `NeighbourMvKind` + `NeighbourSet` + `resolve_block_candidates` (round 214) |
+| 4-MV stateful predict / commit driver           | `Macroblock4MvDecoderNeighbours` (round 221) |
 
 ### What's still spec-OPEN for real-content decode
 
@@ -406,6 +407,39 @@ MS-MPEG-4 v3 MCBPC 1-MV-vs-4-MV bit will build its current-MB
 predictors by calling `resolve_block_candidates` or the batch wrapper
 once per MB, transparently handling any mix of 1-MV and 4-MV
 neighbours through the same surface.
+
+Round-221 (2026-06-03) adds [`mv_pred::Macroblock4MvDecoderNeighbours`],
+the [`NeighbourSet`]-driven analogue of r196's
+[`mv_pred::Macroblock4MvDecoder`]. It exposes the same predict /
+commit / finalise shape — a future `picture::decode_pframe_mb` 4-MV
+path will drive it from the bitstream — but routes every
+`predictor_for(block)` call through [`mv_pred::resolve_block_candidates`]
+so the bordering 8x8 cell of a 4-MV-coded neighbour is picked **per
+current-MB block** per Figure 7-34. Compared with r196's
+[`Macroblock4MvDecoder`] (which holds a flat
+[`mv_pred::MacroblockCandidates`] = one `Option<Mv>` per direction
+and therefore reports the same neighbour MV for every current block),
+the new decoder carries the full [`mv_pred::NeighbourSet`]: when a
+4-MV-coded left neighbour has distinct MVs at its TR (block 2,
+borders current block 1) and BR (block 4, borders current block 3)
+cells, the new decoder picks the correct one for each current block,
+whereas the old surface can only pick one of them. Both shapes
+co-exist: 1-MV-only neighbours can keep using the older decoder for
+back-compat. Ten new lib tests in `src/mv_pred.rs::tests` pin: the
+absent-neighbour predictor chain (block 1 = (0, 0) per rule 4;
+blocks 2/3/4 pick up earlier within-MB MVs per rules 2/3); the
+documented equivalence with [`Macroblock4MvDecoder`] when every
+neighbour is `OneMv` (same predictors, same finals); the same
+equivalence when every neighbour is `Absent`; the distinct-cell
+divergence with a 4-MV left neighbour; the `neighbours()` accessor
+round-trip; `Default` resolving to `NeighbourSet::ABSENT`; the
+const-fn property of `new`; the out-of-order block-4-then-block-1
+commit independence; `finalise`'s `Mv::default()` substitution for
+uncommitted blocks; and the surface equivalence with
+[`mv_pred::predict_macroblock_4mv_with_4mv_neighbours`] for the
+block-1 entry. Test suite 321 → 331 (+10) lib tests; integration +
+doc tests unchanged. Purely additive; the existing 1-MV
+`picture::decode_pframe_mb` call site is unchanged.
 
 ## License
 
