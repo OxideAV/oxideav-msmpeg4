@@ -9,6 +9,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 214 — 4-MV neighbour-state resolver (1-MV vs 4-MV per
+  neighbour)** (2026-06-03): three additive public APIs in
+  [`mv_pred`] that close the gap between r208's per-pair
+  bordering-cell picker and a real-stream 4-MV picture decoder.
+  [`mv_pred::NeighbourMvKind`] tags each neighbouring MB's MV mode
+  for the current frame: `Absent` (outside picture / video packet /
+  GOB → §7.6.5 rule-1 invalid), `OneMv(Mv)` (1-MV-coded), or
+  `FourMv([Mv; 4])` (4-MV-coded with one MV per Figure-6-8 block).
+  [`mv_pred::NeighbourSet`] bundles the three directions (`left`,
+  `above`, `above_right`) into a single per-current-MB context with
+  a `NeighbourSet::ABSENT` const for the picture-corner case and a
+  `NeighbourSet::candidate_for(current, direction) -> Option<Mv>`
+  method that routes `OneMv` straight through and routes `FourMv`
+  via [`mv_pred::bordering_block_of_neighbour`] to pick the
+  bordering cell. [`mv_pred::resolve_block_candidates(current,
+  neighbours, within_mb) -> BlockCandidates`] composes
+  `NeighbourSet::candidate_for` over the three directions with the
+  within-MB-block threading [`mv_pred::BlockCandidates`] expects, so
+  callers can build a per-current-MB-block predictor input in one
+  call regardless of how each neighbour was coded. The higher-level
+  [`mv_pred::predict_macroblock_4mv_with_4mv_neighbours(neighbours,
+  finals) -> [Mv; 4]`] drives the predict loop over
+  [`mv_pred::Block::ALL`] internally; compared to r196's
+  [`mv_pred::predict_macroblock_4mv_with_finals`] (which collapses
+  neighbours to a single `MacroblockCandidates` MV per direction
+  and is therefore correct only when every neighbour is 1-MV-coded),
+  the new batch picks the bordering cell per current-MB block —
+  pinning the divergence on the `current=BottomLeft` case where
+  the left neighbour's block 4 (BR cell) is the candidate but
+  `current=TopLeft` picks the left neighbour's block 2 (TR cell).
+  When every neighbour is `OneMv` or `Absent` the two batch APIs
+  produce identical output (one of the ten new lib tests pins this).
+  Twelve new lib tests in `src/mv_pred.rs::tests` cover: the
+  `Absent` rule-1 short-circuit on all 12 `(current, direction)`
+  pairs; `OneMv`'s 6-Some / 6-None symmetry against the
+  bordering-cell table; `FourMv`'s indexing on every direction; the
+  concrete Figure 7-34 TL/Left worked example (left=FourMv →
+  block 2 of left neighbour); `resolve_block_candidates` threading
+  neighbour and within-MB fields; the documented equivalence with
+  `predict_macroblock_4mv_with_finals` when all neighbours are
+  `OneMv`; the corner-case equivalence when all neighbours are
+  `Absent`; the per-block divergence with a distinct-cells `FourMv`
+  left neighbour; the `NeighbourMvKind::is_absent` predicate; and
+  the const-fn property of `NeighbourSet::ABSENT` plus
+  `resolve_block_candidates`. Test suite 309 → 321 (+12) lib tests.
+  Purely additive; the existing 1-MV
+  `picture::decode_pframe_mb` call site is unchanged. The future
+  picture-decoder rewrite that wires the MS-MPEG-4 v3 MCBPC
+  1-MV-vs-4-MV bit will build its current-MB predictors by calling
+  `resolve_block_candidates` or the batch wrapper once per MB,
+  transparently handling any mix of 1-MV and 4-MV neighbours through
+  the same surface. Source citations:
+  `docs/video/mpeg4-visual/figure-7-34-mv-predictor-layout.md`
+  §"What the figure shows" + the four per-block sub-diagrams;
+  `docs/video/mpeg4-visual/ISO_IEC_14496-2-2004-3rd-edition.txt`
+  §7.6.5 (substitution rules + bordering-cell-of-4MV-neighbour
+  prose); `docs/video/msmpeg4/spec/06-mv-decoder.md` §3 (v3 inherits
+  §7.6.5 unchanged).
+
 - **Round 208 — 4-MV neighbour-MB bordering-cell picker** (2026-06-02):
   Two new public const-fn APIs in [`mv_pred`] that close the
   "the caller is responsible for picking the right cell from the

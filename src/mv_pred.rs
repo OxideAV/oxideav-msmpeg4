@@ -615,6 +615,259 @@ pub const fn pick_neighbour_mv_from_4mv(
     }
 }
 
+/// Mode tag for a neighbouring macroblock's motion-vector state.
+///
+/// A neighbour macroblock in an MS-MPEG-4 P-VOP can be in one of three
+/// states from the perspective of the current macroblock's MV predictor:
+///
+/// - **`Absent`** — the neighbour is outside the picture / video packet /
+///   GOB (or, for v1/v2, in a not-yet-decoded portion of the stream).
+///   Per Figure 7-34 rule 1 the corresponding candidate is *not valid*.
+/// - **`OneMv(mv)`** — the neighbour was coded with a single MV for the
+///   whole 16x16 macroblock (1-MV mode, the most common case in v3).
+///   That single MV is the same regardless of which bordering 8x8 cell
+///   of the neighbour borders the current MB block being predicted.
+/// - **`FourMv([mv1, mv2, mv3, mv4])`** — the neighbour was coded with
+///   four MVs (one per 8x8 luminance block, Figure 6-8 ordering). The
+///   §7.6.5 normative text requires the **adjacent** 8x8 block's MV
+///   (i.e. the cell on the side of the neighbour that physically borders
+///   the current block) to be used as the candidate — see
+///   [`bordering_block_of_neighbour`].
+///
+/// `FourMv` carries the neighbour's four MVs in the same Figure 6-8
+/// raster order that [`Macroblock4MvDecoder::finalise`] / the public
+/// `pick_neighbour_mv_from_4mv` API use: `[block 1, block 2, block 3,
+/// block 4]`.
+///
+/// # Source
+///
+/// - `docs/video/mpeg4-visual/figure-7-34-mv-predictor-layout.md`
+///   §"What the figure shows" — the bordering-cell rule for
+///   4-MV-neighbours is the visual content of the four sub-diagrams.
+/// - `docs/video/mpeg4-visual/ISO_IEC_14496-2-2004-3rd-edition.txt`
+///   §7.6.5 — "vector candidate predictors (MV1, MV2, MV3) from the
+///   spatial neighbourhood macroblocks or blocks already decoded".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NeighbourMvKind {
+    /// Neighbour is outside the picture / packet / GOB; candidate is
+    /// "not valid" per Figure 7-34 rule 1.
+    Absent,
+    /// Neighbour was coded with one MV per 16x16 MB. That single MV is
+    /// the candidate regardless of which border cell would otherwise
+    /// apply.
+    OneMv(Mv),
+    /// Neighbour was coded with four MVs per 16x16 MB (one per 8x8
+    /// luminance block). The MVs are in Figure 6-8 raster order:
+    /// `[block 1, block 2, block 3, block 4]`. The bordering-cell rule
+    /// picks one of them per `(current_block, direction)` pair — see
+    /// [`bordering_block_of_neighbour`].
+    FourMv([Mv; 4]),
+}
+
+impl NeighbourMvKind {
+    /// True iff this neighbour is `Absent`.
+    pub const fn is_absent(self) -> bool {
+        matches!(self, NeighbourMvKind::Absent)
+    }
+}
+
+/// The three neighbouring macroblocks' MV states for the current MB.
+///
+/// Combined with [`resolve_block_candidates`] this expresses the figure's
+/// per-(current-block, neighbour-direction) cell rule in one place,
+/// so callers can pass a single `NeighbourSet` (sized once per current
+/// MB) and have each block of that MB receive the correct
+/// [`BlockCandidates`] without manually rebuilding the bordering-cell
+/// table per block.
+///
+/// `left`, `above`, and `above_right` correspond, in that order, to the
+/// three [`NeighbourDirection`] variants and to the three neighbour-MB
+/// fields of [`BlockCandidates`] / [`MacroblockCandidates`].
+///
+/// # When to use
+///
+/// A picture decoder that mixes 1-MV and 4-MV MBs in a P-VOP builds one
+/// `NeighbourSet` per current MB by looking up the previously-decoded
+/// neighbour MBs (left / above / above-right) in its per-MB MV grid:
+///
+/// - If the neighbour was skip / out-of-picture, store
+///   [`NeighbourMvKind::Absent`].
+/// - If the neighbour was 1-MV-coded, store
+///   [`NeighbourMvKind::OneMv(mv)`].
+/// - If the neighbour was 4-MV-coded, store
+///   [`NeighbourMvKind::FourMv([mv1, mv2, mv3, mv4])`].
+///
+/// The decoder then drives [`resolve_block_candidates`] for each
+/// [`Block`] of the current MB to produce that block's
+/// [`BlockCandidates`]. For a 4-MV current MB the four
+/// [`BlockCandidates`] are fed in turn into [`predict_block_mv`]; for a
+/// 1-MV current MB only [`Block::TopLeft`] is resolved and the result
+/// matches the existing 1-MV path bit-for-bit when every neighbour is
+/// `OneMv` or `Absent`.
+///
+/// # Source
+///
+/// - `docs/video/mpeg4-visual/figure-7-34-mv-predictor-layout.md`
+///   §"ASCII transcription of Figure 7-34" — the four per-block
+///   sub-diagrams identify, per current block, which neighbour cell
+///   borders it. This struct combined with [`resolve_block_candidates`]
+///   automates that picking step.
+/// - `docs/video/mpeg4-visual/ISO_IEC_14496-2-2004-3rd-edition.txt`
+///   §7.6.5 — neighbour-cell rule for 4-MV neighbours; validity rule 1
+///   for `Absent`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NeighbourSet {
+    /// State of the left-neighbour MB (or `Absent` if outside picture /
+    /// packet / GOB).
+    pub left: NeighbourMvKind,
+    /// State of the above-neighbour MB.
+    pub above: NeighbourMvKind,
+    /// State of the above-right-neighbour MB.
+    pub above_right: NeighbourMvKind,
+}
+
+impl Default for NeighbourSet {
+    fn default() -> Self {
+        Self {
+            left: NeighbourMvKind::Absent,
+            above: NeighbourMvKind::Absent,
+            above_right: NeighbourMvKind::Absent,
+        }
+    }
+}
+
+impl NeighbourSet {
+    /// All-absent neighbour set — the picture-corner state used at
+    /// `(mb_x=0, mb_y=0)`.
+    pub const ABSENT: NeighbourSet = NeighbourSet {
+        left: NeighbourMvKind::Absent,
+        above: NeighbourMvKind::Absent,
+        above_right: NeighbourMvKind::Absent,
+    };
+
+    /// Pick the candidate MV contributed by the neighbour in the given
+    /// `direction` for the predictor of `current` (a block of the
+    /// **current** MB). Returns `None` when the neighbour is `Absent`
+    /// (rule-1 invalid) OR when no neighbour-MB candidate is required
+    /// for the given `(current, direction)` pair per Figure 7-34
+    /// (the same `None` cases as [`bordering_block_of_neighbour`]).
+    ///
+    /// For a `OneMv` neighbour the picker returns that single MV
+    /// whenever the `(current, direction)` pair has a bordering cell;
+    /// for a `FourMv` neighbour it indexes the neighbour's `[Mv; 4]` by
+    /// the bordering block per Figure 7-34.
+    pub const fn candidate_for(self, current: Block, direction: NeighbourDirection) -> Option<Mv> {
+        let kind = match direction {
+            NeighbourDirection::Left => self.left,
+            NeighbourDirection::Above => self.above,
+            NeighbourDirection::AboveRight => self.above_right,
+        };
+        // Out-of-picture / packet / GOB is rule-1 invalid regardless of
+        // whether the figure would otherwise consult the neighbour.
+        if let NeighbourMvKind::Absent = kind {
+            return None;
+        }
+        match bordering_block_of_neighbour(current, direction) {
+            Some(cell) => match kind {
+                NeighbourMvKind::Absent => None,
+                NeighbourMvKind::OneMv(mv) => Some(mv),
+                NeighbourMvKind::FourMv(mvs) => Some(mvs[cell.spec_index() as usize - 1]),
+            },
+            None => None,
+        }
+    }
+}
+
+/// Build the per-block [`BlockCandidates`] for `current` (a block of
+/// the current MB) from a [`NeighbourSet`] (the three neighbour-MB
+/// states) and the already-committed within-MB MVs of the same current
+/// MB.
+///
+/// The within-MB candidates are passed verbatim (their figure-mapping
+/// per current block is the responsibility of [`gather_candidates`] —
+/// each `Block`'s sub-diagram consumes a different subset). The
+/// neighbour-MB candidates are resolved through [`NeighbourSet::candidate_for`]
+/// so the bordering-cell rule for 4-MV neighbours is applied
+/// transparently.
+///
+/// This is the composition layer above [`pick_neighbour_mv_from_4mv`]
+/// that wraps the three-direction picker + the within-MB threading in
+/// one call. The output is suitable for [`predict_block_mv`].
+///
+/// `within_mb` is a `[Option<Mv>; 3]` carrying the already-decoded MVs
+/// of `[block 1, block 2, block 3]` of the current MB (in Figure 6-8
+/// raster order). For block 1 (the first decode) the caller passes
+/// `[None; 3]`; subsequent blocks pass the previously-committed finals.
+///
+/// # Equivalence with the 1-MV path
+///
+/// When every `NeighbourSet` field is `OneMv` or `Absent` (i.e. no
+/// 4-MV neighbour is present) and `current == Block::TopLeft`,
+/// [`resolve_block_candidates`] produces the same [`BlockCandidates`]
+/// the existing 1-MV `picture::decode_pframe_mb` path constructs by
+/// hand — see the test below for the pinned equivalence.
+///
+/// # Source
+///
+/// Same as [`NeighbourSet`]:
+/// `docs/video/mpeg4-visual/figure-7-34-mv-predictor-layout.md` and
+/// `docs/video/mpeg4-visual/ISO_IEC_14496-2-2004-3rd-edition.txt`
+/// §7.6.5.
+pub const fn resolve_block_candidates(
+    current: Block,
+    neighbours: NeighbourSet,
+    within_mb: [Option<Mv>; 3],
+) -> BlockCandidates {
+    BlockCandidates {
+        left_mb: neighbours.candidate_for(current, NeighbourDirection::Left),
+        above_mb: neighbours.candidate_for(current, NeighbourDirection::Above),
+        above_right_mb: neighbours.candidate_for(current, NeighbourDirection::AboveRight),
+        mb_block_1: within_mb[0],
+        mb_block_2: within_mb[1],
+        mb_block_3: within_mb[2],
+    }
+}
+
+/// 4-MV-per-MB predictor batch that correctly handles **4-MV
+/// neighbours**. For each of the four blocks of the current macroblock,
+/// the bordering cell of each 4-MV neighbour is picked per Figure 7-34
+/// before feeding it into [`predict_block_mv`].
+///
+/// Compared to [`predict_macroblock_4mv_with_finals`], which assumes
+/// every neighbour contributes the **same** MV regardless of which
+/// current-MB block is being predicted (correct only when every
+/// neighbour is 1-MV-coded), this batch resolves the neighbour-cell
+/// per-block per spec §7.6.5. When every neighbour is `OneMv` or
+/// `Absent`, the two functions produce identical output — see the
+/// equivalence test below.
+///
+/// `final_block_mvs` are the post-MVD-add final MVs of blocks 1 / 2 / 3
+/// of the **current** macroblock, supplied in raster order. Use
+/// [`Macroblock4MvDecoder`] for the predict → decode-MVD → commit loop
+/// when driving from a bitstream.
+///
+/// # Source
+///
+/// Same as [`NeighbourSet`]:
+/// `docs/video/mpeg4-visual/figure-7-34-mv-predictor-layout.md` §"What
+/// the figure shows" + the four per-block sub-diagrams;
+/// `docs/video/mpeg4-visual/ISO_IEC_14496-2-2004-3rd-edition.txt`
+/// §7.6.5 substitution rules + median.
+pub fn predict_macroblock_4mv_with_4mv_neighbours(
+    neighbours: NeighbourSet,
+    final_block_mvs: [Option<Mv>; 3],
+) -> [Mv; 4] {
+    let mut out = [Mv::default(); 4];
+    let mut i = 0;
+    while i < Block::ALL.len() {
+        let block = Block::ALL[i];
+        let cands = resolve_block_candidates(block, neighbours, final_block_mvs);
+        out[i] = predict_block_mv(block, &cands);
+        i += 1;
+    }
+    out
+}
+
 /// Per-component median of three MVs. Same formula as the existing
 /// `mv::median_predictor`: `median(a, b, c) = a + b + c - min - max`,
 /// computed independently per component. Factored here so the
@@ -1371,5 +1624,322 @@ mod tests {
         // actually rule-3 with the left_mb valid → median(l, l, l) = l.
         let p3 = dec.predictor_for(Block::BottomLeft);
         assert_eq!(p3, neighbours.left_mb.unwrap());
+    }
+
+    // ---------- NeighbourSet / NeighbourMvKind resolution tests ----------
+
+    /// `Absent` is rule-1-invalid: the candidate for that direction is
+    /// `None` regardless of `current_block` or whether a bordering cell
+    /// would otherwise apply.
+    #[test]
+    fn absent_neighbour_yields_none_for_every_current_block_and_direction() {
+        let set = NeighbourSet::ABSENT;
+        for current in Block::ALL {
+            for direction in NeighbourDirection::ALL {
+                assert_eq!(
+                    set.candidate_for(current, direction),
+                    None,
+                    "{current:?} / {direction:?}",
+                );
+            }
+        }
+    }
+
+    /// `OneMv(mv)` reports the same `mv` for every `(current, direction)`
+    /// pair that has a bordering cell, and `None` for every pair that
+    /// does not (the six `None` pairs in the bordering-cell table).
+    #[test]
+    fn one_mv_neighbour_reports_same_mv_for_every_bordering_pair() {
+        let mv = Mv { x: 7, y: -3 };
+        let set = NeighbourSet {
+            left: NeighbourMvKind::OneMv(mv),
+            above: NeighbourMvKind::OneMv(mv),
+            above_right: NeighbourMvKind::OneMv(mv),
+        };
+        let mut bordering_some = 0;
+        let mut bordering_none = 0;
+        for current in Block::ALL {
+            for direction in NeighbourDirection::ALL {
+                let bordering = bordering_block_of_neighbour(current, direction);
+                let got = set.candidate_for(current, direction);
+                match bordering {
+                    Some(_) => {
+                        bordering_some += 1;
+                        assert_eq!(got, Some(mv), "{current:?} / {direction:?}");
+                    }
+                    None => {
+                        bordering_none += 1;
+                        assert_eq!(got, None, "{current:?} / {direction:?}");
+                    }
+                }
+            }
+        }
+        // Cross-check against the documented 6/6 split.
+        assert_eq!(bordering_some, 6);
+        assert_eq!(bordering_none, 6);
+    }
+
+    /// `FourMv([…])` indexes the neighbour's `[Mv; 4]` by the bordering
+    /// cell per Figure 7-34. Pin the six `Some(_)` cases against a
+    /// synthetic `[Mv; 4]` whose values encode the block number.
+    #[test]
+    fn four_mv_neighbour_indexes_bordering_block() {
+        // Encode block N as Mv { x: N, y: 10*N }.
+        let mvs: [Mv; 4] = [
+            Mv { x: 1, y: 10 },
+            Mv { x: 2, y: 20 },
+            Mv { x: 3, y: 30 },
+            Mv { x: 4, y: 40 },
+        ];
+        // For each direction, put the FourMv array on that direction and
+        // Absent on the others so we know which contribution came from
+        // where.
+        for direction in NeighbourDirection::ALL {
+            let mut set = NeighbourSet::ABSENT;
+            match direction {
+                NeighbourDirection::Left => set.left = NeighbourMvKind::FourMv(mvs),
+                NeighbourDirection::Above => set.above = NeighbourMvKind::FourMv(mvs),
+                NeighbourDirection::AboveRight => set.above_right = NeighbourMvKind::FourMv(mvs),
+            }
+            for current in Block::ALL {
+                let got = set.candidate_for(current, direction);
+                match bordering_block_of_neighbour(current, direction) {
+                    Some(cell) => {
+                        let expected = mvs[cell.spec_index() as usize - 1];
+                        assert_eq!(got, Some(expected), "{current:?} / {direction:?}");
+                    }
+                    None => assert_eq!(got, None, "{current:?} / {direction:?}"),
+                }
+            }
+        }
+    }
+
+    /// Concrete worked example: a `FourMv` left-neighbour and a current
+    /// block 1 (TL) pick the neighbour's **block 2** (top-right cell) as
+    /// the candidate — matching the Figure 7-34 TL sub-diagram where
+    /// MV1 sits at the right column / top row of the left neighbour MB.
+    #[test]
+    fn four_mv_left_neighbour_picks_block_2_for_current_top_left() {
+        let left_mvs: [Mv; 4] = [
+            Mv { x: 1, y: 1 },
+            Mv { x: 2, y: 2 }, // <-- block 2 (TR) of left-MB
+            Mv { x: 3, y: 3 },
+            Mv { x: 4, y: 4 },
+        ];
+        let set = NeighbourSet {
+            left: NeighbourMvKind::FourMv(left_mvs),
+            above: NeighbourMvKind::Absent,
+            above_right: NeighbourMvKind::Absent,
+        };
+        assert_eq!(
+            set.candidate_for(Block::TopLeft, NeighbourDirection::Left),
+            Some(Mv { x: 2, y: 2 }),
+        );
+    }
+
+    /// `resolve_block_candidates` produces a `BlockCandidates` whose
+    /// neighbour-MB fields match `NeighbourSet::candidate_for` and whose
+    /// within-MB fields equal the passed-in array.
+    #[test]
+    fn resolve_block_candidates_threads_neighbour_and_within_mb() {
+        let mv = Mv { x: 5, y: -2 };
+        let set = NeighbourSet {
+            left: NeighbourMvKind::OneMv(mv),
+            above: NeighbourMvKind::OneMv(mv),
+            above_right: NeighbourMvKind::Absent,
+        };
+        let within = [Some(Mv { x: 11, y: 11 }), None, Some(Mv { x: 13, y: 13 })];
+        for current in Block::ALL {
+            let cands = resolve_block_candidates(current, set, within);
+            assert_eq!(
+                cands.left_mb,
+                set.candidate_for(current, NeighbourDirection::Left),
+            );
+            assert_eq!(
+                cands.above_mb,
+                set.candidate_for(current, NeighbourDirection::Above),
+            );
+            assert_eq!(
+                cands.above_right_mb,
+                set.candidate_for(current, NeighbourDirection::AboveRight),
+            );
+            assert_eq!(cands.mb_block_1, within[0]);
+            assert_eq!(cands.mb_block_2, within[1]);
+            assert_eq!(cands.mb_block_3, within[2]);
+        }
+    }
+
+    /// When every neighbour is `OneMv` (the 1-MV-neighbour case),
+    /// `predict_macroblock_4mv_with_4mv_neighbours` agrees with
+    /// `predict_macroblock_4mv_with_finals` driven by the equivalent
+    /// `MacroblockCandidates`. This pins the documented equivalence
+    /// between the new and the older batch APIs.
+    #[test]
+    fn predict_with_4mv_neighbours_matches_existing_batch_when_all_one_mv() {
+        let l = Mv { x: 1, y: 2 };
+        let a = Mv { x: 3, y: 4 };
+        let ar = Mv { x: 5, y: 6 };
+        let set = NeighbourSet {
+            left: NeighbourMvKind::OneMv(l),
+            above: NeighbourMvKind::OneMv(a),
+            above_right: NeighbourMvKind::OneMv(ar),
+        };
+        let mb_candidates = MacroblockCandidates {
+            left_mb: Some(l),
+            above_mb: Some(a),
+            above_right_mb: Some(ar),
+        };
+        let b1 = Mv { x: -2, y: 1 };
+        let b2 = Mv { x: -3, y: 2 };
+        let b3 = Mv { x: -4, y: 3 };
+        let finals = [Some(b1), Some(b2), Some(b3)];
+
+        let new_path = predict_macroblock_4mv_with_4mv_neighbours(set, finals);
+        let old_path = predict_macroblock_4mv_with_finals(&mb_candidates, finals);
+        assert_eq!(new_path, old_path);
+    }
+
+    /// When every neighbour is `Absent`, both batch APIs collapse to
+    /// the same all-zero behaviour for block 1 (rule 4) and the same
+    /// rule-3 promotion of decoded within-MB MVs for later blocks. Pin
+    /// the equivalence here as a regression guard on the all-corner
+    /// path.
+    #[test]
+    fn predict_with_4mv_neighbours_matches_existing_batch_at_corner() {
+        let set = NeighbourSet::ABSENT;
+        let mb_candidates = MacroblockCandidates::default();
+        let b1 = Mv { x: 2, y: -3 };
+        let finals = [Some(b1), None, None];
+
+        let new_path = predict_macroblock_4mv_with_4mv_neighbours(set, finals);
+        let old_path = predict_macroblock_4mv_with_finals(&mb_candidates, finals);
+        assert_eq!(new_path, old_path);
+        // And in concrete numbers: block 1 = zero, block 2 = block 1's
+        // MV (rule 3 promotes the lone valid candidate).
+        assert_eq!(new_path[0], Mv::default());
+        assert_eq!(new_path[1], b1);
+    }
+
+    /// With at least one **4-MV** neighbour and distinct cells in its
+    /// `[Mv; 4]`, the new batch produces predictors that **differ** from
+    /// the older batch (which would consult a single MV per neighbour
+    /// regardless of current-block). Pin the divergence by constructing
+    /// a left-neighbour `FourMv` whose block 2 (TR cell, bordering
+    /// current block 1) differs from its block 4 (BR cell, bordering
+    /// current block 3) and showing block 1 vs block 3 see different
+    /// left-cell MVs.
+    #[test]
+    fn predict_with_4mv_neighbours_distinguishes_bordering_cells_for_left_4mv_neighbour() {
+        // Block 2 (borders current block 1) and block 4 (borders current
+        // block 3) carry distinct MVs; blocks 1 / 3 of the neighbour are
+        // never picked by any (current, Left) pair so set them to other
+        // values to make sure they're not consulted.
+        let left_mvs: [Mv; 4] = [
+            Mv { x: 50, y: 50 },
+            Mv { x: 1, y: 0 }, // <- block 2 → current block 1 sees this
+            Mv { x: 60, y: 60 },
+            Mv { x: 2, y: 0 }, // <- block 4 → current block 3 sees this
+        ];
+        // Single MV for every other position so the rest of the
+        // candidate set is well-defined.
+        let other = Mv { x: 10, y: 10 };
+        let set = NeighbourSet {
+            left: NeighbourMvKind::FourMv(left_mvs),
+            above: NeighbourMvKind::OneMv(other),
+            above_right: NeighbourMvKind::OneMv(other),
+        };
+        // No within-MB blocks decoded yet — irrelevant for block 1,
+        // matters for block 3.
+        let finals = [Some(Mv { x: -7, y: 4 }), Some(Mv { x: 8, y: -3 }), None];
+        let preds = predict_macroblock_4mv_with_4mv_neighbours(set, finals);
+
+        // Block 1 (TL): left-cell = neighbour-block 2 = (1, 0).
+        let cands_b1 = resolve_block_candidates(Block::TopLeft, set, finals);
+        assert_eq!(cands_b1.left_mb, Some(Mv { x: 1, y: 0 }));
+        assert_eq!(preds[0], predict_block_mv(Block::TopLeft, &cands_b1));
+
+        // Block 3 (BL): left-cell = neighbour-block 4 = (2, 0).
+        let cands_b3 = resolve_block_candidates(Block::BottomLeft, set, finals);
+        assert_eq!(cands_b3.left_mb, Some(Mv { x: 2, y: 0 }));
+        assert_eq!(preds[2], predict_block_mv(Block::BottomLeft, &cands_b3));
+
+        // And the divergence with the older batch is observable: the old
+        // batch with a single MacroblockCandidates can only pick one
+        // left-neighbour MV for both blocks 1 and 3, so for any choice
+        // of `left_mb` the resulting predictor for at least one of
+        // blocks 1 or 3 differs from the new one.
+        let mb_candidates_pick_2 = MacroblockCandidates {
+            left_mb: Some(Mv { x: 1, y: 0 }), // matches new block 1
+            above_mb: Some(other),
+            above_right_mb: Some(other),
+        };
+        let old_pick_2 = predict_macroblock_4mv_with_finals(&mb_candidates_pick_2, finals);
+        // Block 1 agrees, block 3 must differ (old uses (1,0), new uses (2,0)).
+        assert_eq!(old_pick_2[0], preds[0]);
+        assert_ne!(
+            old_pick_2[2], preds[2],
+            "old batch with neighbour-block-2's MV must diverge from new on current block 3",
+        );
+    }
+
+    /// `NeighbourMvKind::is_absent` returns `true` only for `Absent`.
+    #[test]
+    fn neighbour_mv_kind_is_absent_predicate() {
+        assert!(NeighbourMvKind::Absent.is_absent());
+        assert!(!NeighbourMvKind::OneMv(Mv::default()).is_absent());
+        assert!(!NeighbourMvKind::FourMv([Mv::default(); 4]).is_absent());
+    }
+
+    /// `NeighbourSet::ABSENT` is the all-absent state and is `const`.
+    /// Verify by using it in a constant initialiser.
+    #[test]
+    fn neighbour_set_absent_constant_compiles() {
+        const _S: NeighbourSet = NeighbourSet::ABSENT;
+        assert!(NeighbourSet::ABSENT.left.is_absent());
+        assert!(NeighbourSet::ABSENT.above.is_absent());
+        assert!(NeighbourSet::ABSENT.above_right.is_absent());
+    }
+
+    /// `resolve_block_candidates` is `const fn`; use it in a constant
+    /// initialiser as a compile-time check.
+    #[test]
+    fn resolve_block_candidates_is_const_evaluable() {
+        const CANDS: BlockCandidates =
+            resolve_block_candidates(Block::TopLeft, NeighbourSet::ABSENT, [None; 3]);
+        // The ABSENT-everywhere case has no valid neighbour-MB MVs.
+        assert_eq!(CANDS.left_mb, None);
+        assert_eq!(CANDS.above_mb, None);
+        assert_eq!(CANDS.above_right_mb, None);
+        assert_eq!(CANDS.mb_block_1, None);
+    }
+
+    /// A `OneMv` neighbour fed into `resolve_block_candidates` for
+    /// `current=Block::TopLeft` produces the SAME `BlockCandidates`
+    /// the existing 1-MV `picture::decode_pframe_mb` path constructs by
+    /// hand — this is the equivalence that lets a future picture
+    /// decoder switch over without behavioural drift.
+    #[test]
+    fn one_mv_neighbour_resolve_matches_manual_block_candidates_for_top_left() {
+        let l = Mv { x: 1, y: 2 };
+        let a = Mv { x: 3, y: 4 };
+        let ar = Mv { x: 5, y: 6 };
+        let set = NeighbourSet {
+            left: NeighbourMvKind::OneMv(l),
+            above: NeighbourMvKind::OneMv(a),
+            above_right: NeighbourMvKind::OneMv(ar),
+        };
+        let new = resolve_block_candidates(Block::TopLeft, set, [None; 3]);
+        let manual = BlockCandidates {
+            left_mb: Some(l),
+            above_mb: Some(a),
+            above_right_mb: Some(ar),
+            ..BlockCandidates::default()
+        };
+        assert_eq!(new, manual);
+        // And the predictor matches as well.
+        assert_eq!(
+            predict_block_mv(Block::TopLeft, &new),
+            predict_block_mv(Block::TopLeft, &manual),
+        );
     }
 }

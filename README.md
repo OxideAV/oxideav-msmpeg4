@@ -56,6 +56,7 @@ right decoder when a packet arrives.
 | P-frame 1-MV predictor (Figure 7-34 top-left)  | routed through `mv_pred::predict_block_mv` (round 191) |
 | 4-MV-per-MB predictor batch surface             | `Macroblock4MvDecoder` + bitstream tests (rounds 196 / 202) |
 | 4-MV neighbour-MB bordering-cell picker         | `bordering_block_of_neighbour` + `pick_neighbour_mv_from_4mv` (round 208) |
+| 4-MV neighbour-state resolver (1-MV vs 4-MV)    | `NeighbourMvKind` + `NeighbourSet` + `resolve_block_candidates` (round 214) |
 
 ### What's still spec-OPEN for real-content decode
 
@@ -362,6 +363,49 @@ when threading 4-MV-coded neighbour MBs into the
 [`mv_pred::BlockCandidates`] / [`mv_pred::MacroblockCandidates`]
 slots; for 1-MV-coded neighbours no resolution is required (the
 neighbour's single MV is reported in every direction by definition).
+
+Round-214 (2026-06-03) closes the gap between r208's per-pair
+bordering-cell picker and a real-stream 4-MV picture decoder by
+adding a **neighbour-state resolver** that consumes the three
+neighbour-MB MV states (each `Absent` / 1-MV / 4-MV) and produces a
+spec-correct [`mv_pred::BlockCandidates`] per current-MB block in one
+call. The new public surface is three additive pieces in
+[`mv_pred`]: a [`NeighbourMvKind`] enum (`Absent` / `OneMv(Mv)` /
+`FourMv([Mv; 4])`) tagging each neighbour-MB's MV mode for that frame,
+a [`NeighbourSet`] struct (`left` / `above` / `above_right`) bundling
+the three directions, and a const-fn [`resolve_block_candidates`]
+that composes [`NeighbourSet::candidate_for`] (which routes through
+r208's [`bordering_block_of_neighbour`] internally) with the
+within-MB-block threading [`BlockCandidates`] expects. A higher-level
+[`predict_macroblock_4mv_with_4mv_neighbours`] batch wraps the
+predict-loop over [`Block::ALL`]; unlike r196's
+[`predict_macroblock_4mv_with_finals`] (which treats every neighbour
+as 1-MV-coded by collapsing it to a single `MacroblockCandidates` MV
+per direction), the new batch resolves the bordering-cell **per
+current-MB block** — so when a 4-MV-coded left neighbour has distinct
+MVs at its block 2 (TR, borders current block 1) and its block 4 (BR,
+borders current block 3), the new path picks the correct one for each
+current block, whereas r196's path can only pick one of them. Twelve
+new lib tests in `src/mv_pred.rs::tests` pin: the `Absent` rule-1
+short-circuit across every `(current, direction)` pair (12 cases);
+the `OneMv` "same MV for every bordering pair" symmetry with the
+documented 6-Some / 6-None split; the `FourMv` indexing by Figure 6-8
+spec index per direction; the concrete worked example
+(`current=TopLeft`, `left=FourMv` → picks block-2/TR cell of the left
+neighbour); `resolve_block_candidates`'s neighbour-vs-within-MB
+threading; bit-identical equivalence with `predict_macroblock_4mv_with_finals`
+when every neighbour is `OneMv` or `Absent`; the corner-case
+equivalence when every neighbour is `Absent`; the per-block divergence
+when a distinct-cells `FourMv` left neighbour is present; the
+`NeighbourMvKind::is_absent` predicate; and the const-fn property of
+both `NeighbourSet::ABSENT` and `resolve_block_candidates`. Test suite
+309 → 321 (+12) lib tests.
+Purely additive; the existing 1-MV `picture::decode_pframe_mb` call
+site is unchanged. The future picture-decoder rewrite that wires the
+MS-MPEG-4 v3 MCBPC 1-MV-vs-4-MV bit will build its current-MB
+predictors by calling `resolve_block_candidates` or the batch wrapper
+once per MB, transparently handling any mix of 1-MV and 4-MV
+neighbours through the same surface.
 
 ## License
 
