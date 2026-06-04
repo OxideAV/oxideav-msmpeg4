@@ -44,7 +44,7 @@ right decoder when a packet arrives.
 | G4 / G5 canonical-Huffman primary VLC          | wired (round 26)      |
 | G0..G3 `(idx → (run, level, last))` enumeration | wired (round 29)     |
 | G0..G3 LMAX / RMAX (ESC-extension offsets)     | wired (round 7, 2026-05-17) |
-| G0..G3 canonical-Huffman primary VLC           | OPEN — extraction blocked (spec/99 §10) |
+| G0..G3 canonical-Huffman primary VLC           | wired (round 234, spec/11 §5 row 1-4) |
 | MS-MPEG4v3 3-tier ESC body                     | wired (rounds 7 + 27 + 126: G5 LMAX/RMAX + tier 1/2/3 walk; integration-tested through `decode_intra_block_full_v3`) |
 | P-frame MV VLC + half-pel MC (default table)   | complete              |
 | P-frame MV VLC alternate table                 | unsupported (truncated dump) |
@@ -59,6 +59,7 @@ right decoder when a packet arrives.
 | 4-MV neighbour-state resolver (1-MV vs 4-MV)    | `NeighbourMvKind` + `NeighbourSet` + `resolve_block_candidates` (round 214) |
 | 4-MV stateful predict / commit driver           | `Macroblock4MvDecoderNeighbours` (round 221) |
 | Picture-wide MV grid → `NeighbourSet` builder    | `MvGrid` + `MvGridCell` (round 227)          |
+| G0..G3 packed-Huffman primary VLC                | wired (round 234, all 4 sources Kraft=1)     |
 
 ### What's still spec-OPEN for real-content decode
 
@@ -441,6 +442,46 @@ uncommitted blocks; and the surface equivalence with
 block-1 entry. Test suite 321 → 331 (+10) lib tests; integration +
 doc tests unchanged. Purely additive; the existing 1-MV
 `picture::decode_pframe_mb` call site is unchanged.
+
+Round-234 (2026-06-04) closes the **G0..G3 canonical-Huffman primary
+VLC** OPEN item that has gated real-content v3 intra-luma + chroma AC
+decode since round 7. Per `docs/video/msmpeg4/spec/11-walker-format-
+resolved.md` §5 row 1-4 the four packed-Huffman sources for the
+extended-alphabet G-descriptors live at file `0x57a30 / 0x57f80 /
+0x58558 / 0x58a08` (VMAs `0x1c258630 / 0x1c258b80 / 0x1c259158 /
+0x1c259608`), each in the same `(code, bl)` u32-pair format that
+spec/11 §4 established for G4 / G5 / MCBPCY / intra-DC. The
+`region_*_full.hex` slices were copied into `crates/oxideav-msmpeg4/
+tables/`; a new `emit_packed_huffman_g_extended` build.rs emitter
+parses each source (header u32-LE count, then `count × (code:u32-LE,
+bl:u32-LE)` records, with the `0xFFFFFFFF` hole-sentinel branch
+mirroring helper A from spec/11 §3) and enforces three build-time
+invariants per source: file length `>= 4 + count * 8`, header count
+matches the spec/15 §3 alphabet shape (169 / 186 / 149 / 133), and
+Kraft sum is exactly `2^32` (saturated — unlike G4 / G5 which reserve
+one bl=9 codeword for ESC at Kraft `1 - 2/1024`, G0..G3 use a regular
+bit-length slot at `idx == count_A` per spec/09 §2). The four
+emitted `G{0,1,2,3}_PRIMARY_RAW` arrays flow through the same
+`build_g_primary` builder the G4 / G5 wiring uses; the `GTable` enum
+now has six variants and each non-ESC idx is resolved to its
+`(last, run, level)` triple via `g_enum::GExtended::decode` (round
+29). `AcVlcTable::v3_intra_g{0,1,2,3}` now return non-empty entries
+(169 / 186 / 149 / 133 each) — the `_synthetic` variants are kept
+for diagnostic regression baselines. Two new lib tests pin (a) the
+alphabet size + Kraft saturation per source, and (b) per-idx
+agreement between the wired entries and `g_enum::GExtended::decode`
+for the full count_A + 1 alphabet of every source; one additional
+round-trip test runs a `decode_token` for idx 0 (always
+`(last=false, run=0, level=1)` per spec/09 §2) and confirms the ESC
+sentinel surfaces at the expected position. Lib tests 343 → 345
+(+2); the integration test `g0_g1_g2_g3_carry_lmax_and_rmax_post_round_7`
+was renamed and updated to assert non-empty entries
+(`expected_entries = count_A + 1` per source). The mp43.wmv I-frame
+luma DC-only-fallback observed in the round-5 implementer's static
+analysis is now unblocked: `picture::AcSelection::FromHeader` plus
+`for_luma_selector(0)` dispatches v3 intra-luma blocks through G3's
+133-entry canonical-Huffman walker (instead of the empty placeholder
+the round-7..233 path returned).
 
 ## License
 

@@ -79,19 +79,24 @@ fn assert_run_range_uniform(row: &[u8; 64], lo: usize, hi: usize, val: u8, tag: 
 // =====================================================================
 
 #[test]
-fn g0_g1_g2_g3_carry_lmax_and_rmax_post_round_7() {
-    // Round 7 promoted these from PLACEHOLDER to LMAX/RMAX-bearing
-    // placeholders. The `entries` slice stays empty until the bit-length
-    // extraction lands, but the ESC walk now has its extension offsets.
-    for table in [
-        AcVlcTable::v3_intra_g0(),
-        AcVlcTable::v3_intra_g1(),
-        AcVlcTable::v3_intra_g2(),
-        AcVlcTable::v3_intra_g3(),
+fn g0_g1_g2_g3_carry_lmax_and_rmax_post_round_234() {
+    // Round 234 (2026-06-04) wires the G0..G3 packed-Huffman primary
+    // VLC sources at file 0x57a30 / 0x57f80 / 0x58558 / 0x58a08
+    // (spec/11 §5 row 1-4), replacing the empty-entries placeholder
+    // from rounds 0 - 233. LMAX / RMAX stay routed through the round-29
+    // enumeration. Per-table alphabet sizes (count_A + 1) are pinned
+    // below; the +1 is the ESC sentinel at idx == count_A per spec/09 §2.
+    for (table, expected_entries) in [
+        (AcVlcTable::v3_intra_g0(), 169usize),
+        (AcVlcTable::v3_intra_g1(), 186),
+        (AcVlcTable::v3_intra_g2(), 149),
+        (AcVlcTable::v3_intra_g3(), 133),
     ] {
-        assert!(
-            table.entries.is_empty(),
-            "primary VLC entries still spec-OPEN (round 7 only wires LMAX/RMAX)"
+        assert_eq!(
+            table.entries.len(),
+            expected_entries,
+            "primary VLC must carry count_A + 1 entries post round 234 \
+             (spec/11 §5)"
         );
         assert!(table.lmax.is_some(), "lmax must be wired post round 7");
         assert!(table.rmax.is_some(), "rmax must be wired post round 7");

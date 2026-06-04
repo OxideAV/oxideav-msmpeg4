@@ -9,6 +9,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 234 — G0..G3 packed-Huffman primary VLC wired** (2026-06-04):
+  closes the OPEN status the README has carried for the four extended
+  G-descriptor (G0..G3) canonical-Huffman primary VLCs. Per
+  `docs/video/msmpeg4/spec/11-walker-format-resolved.md` §5 row 1-4
+  the four packed-Huffman sources live at file `0x57a30` (G0, VMA
+  `0x1c258630`, count 169), `0x57f80` (G1, VMA `0x1c258b80`, count
+  186), `0x58558` (G2, VMA `0x1c259158`, count 149), and `0x58a08`
+  (G3, VMA `0x1c259608`, count 133), each in the same `(code, bl)`
+  u32-pair format that spec/11 §4 established for G4 / G5 / MCBPCY /
+  intra-DC. The `region_*_full.hex` slices are copied into
+  `crates/oxideav-msmpeg4/tables/`; a new
+  `emit_packed_huffman_g_extended` build.rs emitter parses each
+  source (header u32-LE count, then `count × (code:u32-LE,
+  bl:u32-LE)` records, with the `0xFFFFFFFF` hole-sentinel branch
+  mirroring helper A from spec/11 §3) and enforces three build-time
+  invariants per source: file length `>= 4 + count * 8`, header count
+  matches the spec/15 §3 alphabet shape, and Kraft sum is exactly
+  `2^32` (saturated — unlike G4 / G5 which reserve one bl=9
+  codeword for ESC at Kraft `1 - 2/1024`, G0..G3 use a regular
+  bit-length slot at `idx == count_A` per spec/09 §2). The four
+  emitted `G{0,1,2,3}_PRIMARY_RAW` arrays flow through the same
+  `build_g_primary` builder the G4 / G5 wiring uses; the `GTable`
+  enum now has six variants and each non-ESC idx is resolved to its
+  `(last, run, level)` triple via `g_enum::GExtended::decode`
+  (round 29). `AcVlcTable::v3_intra_g{0,1,2,3}` now return non-empty
+  entries (169 / 186 / 149 / 133 each); the `_synthetic` variants
+  are kept for diagnostic regression baselines. Two new lib tests
+  pin (a) per-source alphabet size and Kraft saturation
+  (`g0_g3_constructors_wire_packed_huffman_round_234`) and (b)
+  per-idx agreement between the wired entries and `GExtended::decode`
+  for the full `count_A + 1` alphabet of every source
+  (`g0_g3_entries_agree_with_g_enum_decode`); a third
+  (`g0_g3_round_trip_first_and_esc_entries`) runs `decode_token` for
+  idx 0 (always `(last=false, run=0, level=1)` per spec/09 §2) and
+  confirms the ESC sentinel surfaces at the expected position. The
+  integration test
+  `g0_g1_g2_g3_carry_lmax_and_rmax_post_round_7` (in
+  `tests/g0_g3_extended.rs`) was renamed to
+  `g0_g1_g2_g3_carry_lmax_and_rmax_post_round_234` and updated to
+  assert non-empty entries (`expected_entries = count_A + 1` per
+  source). The mp43.wmv I-frame luma DC-only-fallback observed in
+  the round-5 implementer's static analysis is now unblocked:
+  `picture::AcSelection::FromHeader` plus `for_luma_selector(0)`
+  dispatches v3 intra-luma blocks through G3's 133-entry
+  canonical-Huffman walker instead of the empty placeholder the
+  round-7..233 path returned. Lib tests 343 → 345 (+2);
+  integration tests unchanged in count.
 - **Round 227 — picture-wide MV grid → `NeighbourSet` builder
   (`mv_pred::MvGrid` + `mv_pred::MvGridCell`)** (2026-06-04): two
   additive public APIs in [`mv_pred`] that lift r214's per-MB

@@ -236,6 +236,65 @@ fn main() {
         0x1c259d78,
     );
 
+    // G0..G3 packed-Huffman PRIMARY VLC sources (round 234 — spec/11
+    // §5 row 1-4). Each source has the same `(code, bl)` record layout
+    // as G4/G5 but a different alphabet size (count = count_A + 1, with
+    // the +1 being the ESC sentinel at idx == count_A per spec/09 §2):
+    //
+    //   G0  region_057a30 (VMA 0x1c258630)  count 169 (= 168 + 1 ESC)
+    //   G1  region_057f80 (VMA 0x1c258b80)  count 186 (= 185 + 1 ESC)
+    //   G2  region_058558 (VMA 0x1c259158)  count 149 (= 148 + 1 ESC)
+    //   G3  region_058a08 (VMA 0x1c259608)  count 133 (= 132 + 1 ESC)
+    //
+    // Unlike G4/G5 (which reserve one bl=9 codeword for ESC, Kraft sum
+    // 0.998047), all four G0..G3 sources saturate Kraft to exactly 1
+    // (spec/11 §5 "G0..G3 Kraft 1.00000"); the ESC entry occupies a
+    // regular bit-length slot.
+    //
+    // FROM: docs/video/msmpeg4/spec/11-walker-format-resolved.md §5
+    // FROM: docs/video/msmpeg4/spec/03-corrections.md §3.1 (slot → G mapping)
+    // FROM: docs/video/msmpeg4/spec/15-count-ab-per-g-family.md §3 (count_A per G)
+    let g0_packed_hex = tables_dir.join("region_057a30_full.hex");
+    let g1_packed_hex = tables_dir.join("region_057f80_full.hex");
+    let g2_packed_hex = tables_dir.join("region_058558_full.hex");
+    let g3_packed_hex = tables_dir.join("region_058a08_full.hex");
+    println!("cargo:rerun-if-changed={}", g0_packed_hex.display());
+    println!("cargo:rerun-if-changed={}", g1_packed_hex.display());
+    println!("cargo:rerun-if-changed={}", g2_packed_hex.display());
+    println!("cargo:rerun-if-changed={}", g3_packed_hex.display());
+    emit_packed_huffman_g_extended(
+        &g0_packed_hex,
+        &out_dir.join("g0_primary.rs"),
+        "G0",
+        169,
+        0x57a30,
+        0x1c258630,
+    );
+    emit_packed_huffman_g_extended(
+        &g1_packed_hex,
+        &out_dir.join("g1_primary.rs"),
+        "G1",
+        186,
+        0x57f80,
+        0x1c258b80,
+    );
+    emit_packed_huffman_g_extended(
+        &g2_packed_hex,
+        &out_dir.join("g2_primary.rs"),
+        "G2",
+        149,
+        0x58558,
+        0x1c259158,
+    );
+    emit_packed_huffman_g_extended(
+        &g3_packed_hex,
+        &out_dir.join("g3_primary.rs"),
+        "G3",
+        133,
+        0x58a08,
+        0x1c259608,
+    );
+
     // Intra-DC custom direct-value VLCs (round 28 — spec/07 §5.4 +
     // spec/11 §3 / §4). MS-MPEG4v3 does NOT use the MPEG-4 Part 2
     // §6.3.8 (size category VLC + magnitude bits) intra-DC scheme.
@@ -1579,6 +1638,142 @@ fn emit_packed_huffman_primary(
          pub const {label}_PRIMARY_RAW: &[(u32, u32)] = &[",
         label = label,
         label_lc_digit = label_lc.trim_start_matches('g'),
+        file_off = file_off,
+        vma = vma,
+    )
+    .unwrap();
+    for &(bl, code) in &records {
+        writeln!(f, "    ({bl}, {code}),").unwrap();
+    }
+    writeln!(f, "];").unwrap();
+}
+
+/// Parse a G0..G3 packed-Huffman primary-VLC source (round 234).
+///
+/// Identical record layout to [`emit_packed_huffman_primary`] (G4/G5)
+/// per `docs/video/msmpeg4/spec/11-walker-format-resolved.md` §3 / §4:
+///
+/// ```text
+/// +0x00 : count : u32-LE                    ; alphabet size (incl. ESC at idx = count-1)
+/// +0x04 : records[0..count] : 8 B each      ; (a:u32-LE, b:u32-LE)
+///           a == 0xFFFFFFFF → hole sentinel: stored as (0,0); 8 B still consumed
+///           otherwise       → (a, b) = (code_value, bit_length)
+/// ```
+///
+/// Differences from the G4/G5 emitter:
+///
+/// * `count` is a per-table caller-supplied invariant (169 / 186 / 149 / 133)
+///   rather than a hard-coded 103 — the spec/11 §5 table pins each.
+/// * The Kraft sum is verified to be **exactly 1** (saturated, no ESC
+///   codeword reserved) — spec/11 §5 reports "Kraft = 1.00000" for the
+///   four G-extended sources (vs G4/G5's 0.998047 = 1 - 2/1024).
+/// * The source file may include trailing alignment padding (the
+///   binary's per-slot region is aligned to 4 B; some sources have 4
+///   trailing bytes past the last record). The emitter consumes exactly
+///   `4 + count * 8` bytes and ignores any trailing padding.
+///
+/// Build-time invariants enforced:
+///   * file length >= `4 + count * 8`
+///   * header count == caller-supplied `expected_count`
+///   * each bl in `[0, 16]` (the binary's max-bitlen budget; spec/11 §5
+///     reports max_bl values 13..15 for the four sources)
+///   * Kraft sum over the bls equals `1` exactly in 2^-bl arithmetic
+fn emit_packed_huffman_g_extended(
+    hex_path: &Path,
+    out_path: &Path,
+    label: &str,
+    expected_count: u32,
+    file_off: u32,
+    vma: u32,
+) {
+    let bytes = parse_xxd(hex_path);
+    let needed = 4 + (expected_count as usize) * 8;
+    if bytes.len() < needed {
+        panic!(
+            "{label}: expected at least {needed} bytes in {} (4-byte count + {expected_count} * 8 records), got {}",
+            hex_path.display(),
+            bytes.len()
+        );
+    }
+    let count = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    if count != expected_count {
+        panic!(
+            "{label}: header count {count} != {expected_count} (expected per spec/11 §5 row for {label})",
+        );
+    }
+    let mut records: Vec<(u32, u32)> = Vec::with_capacity(count as usize);
+    for i in 0..count as usize {
+        let off = 4 + i * 8;
+        let a = u32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]]);
+        let b = u32::from_le_bytes([
+            bytes[off + 4],
+            bytes[off + 5],
+            bytes[off + 6],
+            bytes[off + 7],
+        ]);
+        let (a, b) = if a == 0xFFFF_FFFF {
+            (0u32, 0u32)
+        } else {
+            (a, b)
+        };
+        if b > 16 {
+            panic!(
+                "{label}: record {i} has bit_length {b} > 16 — exceeds the binary's max-bitlen \
+                 budget; extraction misalignment suspected"
+            );
+        }
+        records.push((b, a)); // store as (bit_length, code_value)
+    }
+
+    // Kraft sum check. Per spec/11 §5 G0..G3 all saturate to exactly 1
+    // (no ESC codeword reservation — the ESC entry occupies a regular
+    // bit-length slot at idx = count - 1).
+    let max_bl_for_kraft: u32 = 32;
+    let target: u64 = 1u64 << max_bl_for_kraft;
+    let sum: u64 = records
+        .iter()
+        .filter(|&&(bl, _)| bl > 0)
+        .map(|&(bl, _)| 1u64 << (max_bl_for_kraft - bl))
+        .sum();
+    if sum != target {
+        panic!(
+            "{label}: Kraft sum {sum} != expected {target} (= 1.0 in 2^-bl fixed point) — \
+             {label} packed-Huffman source is not a saturated prefix code; spec/11 §5 \
+             reports Kraft=1.00000 for {label}"
+        );
+    }
+
+    let esc_index = (count - 1) as usize;
+    let mut f = fs::File::create(out_path)
+        .unwrap_or_else(|e| panic!("failed to create {}: {e}", out_path.display()));
+    writeln!(
+        f,
+        "// Auto-generated by build.rs from \
+         crates/oxideav-msmpeg4/tables/region_{file_off:06x}_full.hex.\n\
+         // DO NOT EDIT.\n\
+         // Source binary: mpg4c32.dll SHA-256 \
+         aedb4cf3d33c8554ab8acf04afe2d936eaa7c49107c5fefe163bca2e94b3c099\n\
+         // Region: file offset 0x{file_off:06x}, VMA 0x{vma:08x}, {} bytes (4 + {count} * 8).\n\
+         // Format (per docs/video/msmpeg4/spec/11-walker-format-resolved.md §4):\n\
+         //   u32-LE count = {count}, then {count} * (a:u32-LE = code_value, b:u32-LE = bit_length).\n\
+         // Role: {label} primary VLC source for the DCT AC TCOEF (run, level, last) walk.\n\
+         // ESC index {esc_index} occupies a regular Kraft-saturated codeword slot (Kraft = 1).\n\
+         \n\
+         pub const {label}_PRIMARY_ALPHABET: usize = {count};\n\
+         pub const {label}_PRIMARY_ESC_INDEX: usize = {esc_index};\n\
+         \n\
+         /// {count} * (bit_length, code_value) pairs for the {label} primary VLC.\n\
+         /// Index in the array == symbol index passed to the post-VLC\n\
+         /// `(idx -> (last, run, level))` map (spec/04 §1.3 step 3 / spec/09).\n\
+         /// Symbol {esc_index} is ESC; the canonical-Huffman builder emits it as\n\
+         /// a regular leaf and the consumer maps the decoded idx == {esc_index} to the\n\
+         /// escape body via [`g_enum::g{label_lc_digit}_decode`].\n\
+         pub const {label}_PRIMARY_RAW: &[(u32, u32)] = &[",
+        4 + count * 8,
+        count = count,
+        esc_index = esc_index,
+        label = label,
+        label_lc_digit = label.to_lowercase().trim_start_matches('g'),
         file_off = file_off,
         vma = vma,
     )
