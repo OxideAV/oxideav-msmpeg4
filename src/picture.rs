@@ -423,10 +423,22 @@ fn decode_pframe(
     // single mag/bias pair for all six blocks).
     let inter_ac = crate::ac::AcVlcTable::g4_inter();
 
-    // MV grid: one (MVx, MVy) entry per MB. Skipped / intra MBs use
-    // (0, 0) so the predictor's zero-substitution semantics match
-    // spec/06 §3.4 (boundary zero-out).
-    let mut mv_grid: Vec<Option<crate::mv::Mv>> = vec![None; mb_w * mb_h];
+    // MV grid: one [`crate::mv_pred::MvGridCell`] per MB. Round 240
+    // (2026-06-06) replaces the previous parallel `Vec<Option<Mv>>`
+    // book-keeping with the picture-wide grid surface introduced by
+    // round 227. The grid's
+    // [`crate::mv_pred::MvGrid::neighbour_set_for`] folds the three
+    // §7.6.5-relevant neighbour positions (`left`, `above`,
+    // `above_right`) into a [`crate::mv_pred::NeighbourSet`] —
+    // out-of-bounds and corner cells are substituted with
+    // [`crate::mv_pred::MvGridCell::Absent`] per
+    // `docs/video/mpeg4-visual/figure-7-34-mv-predictor-layout.md`'s
+    // "Boundary substitution". Skip / inter MBs store
+    // [`MvGridCell::OneMv`] (the 1-MV-per-MB v3 mode is the only
+    // codepath currently exercised); intra-in-P MBs leave the cell
+    // `Absent` so downstream neighbours treat that column as zero per
+    // the existing semantics in `decode_pframe_mb`.
+    let mut mv_grid = crate::mv_pred::MvGrid::new(mb_w, mb_h);
 
     // Spec/06 §2.1: per-frame `mv_table_sel` ∈ {0, 1} picks between
     // the default and alternate v3 MV VLC sources. Default is fully
@@ -448,7 +460,6 @@ fn decode_pframe(
                 reference,
                 mx,
                 my,
-                mb_w,
                 quant,
                 hdr.dc_size_sel,
                 &luma_ac,
@@ -464,16 +475,31 @@ fn decode_pframe(
 
 /// Decode one P-frame MB: skip-bit + MCBPCY + (if coded) per-block
 /// decode + MV/MC if inter.
+///
+/// Round 240 (2026-06-06): the parallel `Vec<Option<Mv>>` book-keeping
+/// for the per-MB MV cache is replaced by a [`crate::mv_pred::MvGrid`].
+/// Neighbour lookup goes through
+/// [`crate::mv_pred::MvGrid::neighbour_set_for`], producing a
+/// [`crate::mv_pred::NeighbourSet`] that folds the picture-edge
+/// substitution rule (corner / top-row / left-edge / right-edge cells
+/// are surfaced as [`crate::mv_pred::MvGridCell::Absent`]) into the
+/// caller without any per-axis range arithmetic at this layer. The
+/// 1-MV-per-MB v3 mode currently shipping consumes that
+/// [`crate::mv_pred::NeighbourSet`] as a
+/// [`crate::mv_pred::BlockCandidates`] for [`crate::mv_pred::Block::TopLeft`],
+/// then writes [`crate::mv_pred::MvGridCell::OneMv`] back into the
+/// grid via [`crate::mv_pred::MvGrid::set_cell`] — intra-in-P MBs
+/// leave the cell `Absent` so downstream median predictors treat that
+/// column as zero per the existing semantics.
 #[allow(clippy::too_many_arguments)]
 fn decode_pframe_mb(
     br: &mut BitReader<'_>,
     pic: &mut Picture,
     dc_cache: &mut DcCache,
-    mv_grid: &mut [Option<crate::mv::Mv>],
+    mv_grid: &mut crate::mv_pred::MvGrid,
     reference: &Picture,
     mb_x: usize,
     mb_y: usize,
-    mb_w: usize,
     quant: u32,
     dc_size_sel: u8,
     luma_ac: &AcVlcTable,
@@ -483,27 +509,36 @@ fn decode_pframe_mb(
 ) -> Result<()> {
     use crate::mcbpcy::{decode_mcbpcy_pframe, PFrameMcbpcy};
 
-    let mb_idx = mb_y * mb_w + mb_x;
     let (skip, mb_info) = match decode_mcbpcy_pframe(br)? {
         PFrameMcbpcy::Skip => (true, None),
         PFrameMcbpcy::Coded { decode, ac_pred } => (false, Some((decode, ac_pred))),
     };
 
-    // Neighbour MV lookup for median predictor (spec/06 §3.4).
-    let left = if mb_x > 0 {
-        mv_grid[mb_y * mb_w + (mb_x - 1)]
-    } else {
-        None
+    // Picture-edge-aware neighbour lookup (spec/06 §3.4 +
+    // `docs/video/mpeg4-visual/figure-7-34-mv-predictor-layout.md` §
+    // "Boundary substitution"). The grid surfaces missing neighbours
+    // as [`crate::mv_pred::NeighbourMvKind::Absent`] which threads
+    // through the [`crate::mv_pred::BlockCandidates`] fields below as
+    // `None`, then via [`crate::mv_pred::predict_block_mv`] applies
+    // the four §7.6.5 candidate-validity substitution rules.
+    let nset = mv_grid.neighbour_set_for(mb_x, mb_y);
+    let left = match nset.left {
+        crate::mv_pred::NeighbourMvKind::Absent => None,
+        crate::mv_pred::NeighbourMvKind::OneMv(mv) => Some(mv),
+        // 1-MV-per-MB v3 path: neighbours are always OneMv or Absent.
+        // 4-MV-coded neighbours would land here once the 4-MV-per-MB
+        // bitstream signalling is wired (round 240+, depth follow-up).
+        crate::mv_pred::NeighbourMvKind::FourMv(mvs) => Some(mvs[1]),
     };
-    let top = if mb_y > 0 {
-        mv_grid[(mb_y - 1) * mb_w + mb_x]
-    } else {
-        None
+    let top = match nset.above {
+        crate::mv_pred::NeighbourMvKind::Absent => None,
+        crate::mv_pred::NeighbourMvKind::OneMv(mv) => Some(mv),
+        crate::mv_pred::NeighbourMvKind::FourMv(mvs) => Some(mvs[2]),
     };
-    let top_right = if mb_y > 0 && mb_x + 1 < mb_w {
-        mv_grid[(mb_y - 1) * mb_w + (mb_x + 1)]
-    } else {
-        None
+    let top_right = match nset.above_right {
+        crate::mv_pred::NeighbourMvKind::Absent => None,
+        crate::mv_pred::NeighbourMvKind::OneMv(mv) => Some(mv),
+        crate::mv_pred::NeighbourMvKind::FourMv(mvs) => Some(mvs[2]),
     };
 
     if skip {
@@ -511,7 +546,11 @@ fn decode_pframe_mb(
         // missing neighbours are zero-subbed; skipped MBs themselves
         // contribute zero MV too per H.263 convention). Copy the MC
         // prediction at MV=(0,0).
-        mv_grid[mb_idx] = Some(crate::mv::Mv::default());
+        mv_grid.set_cell(
+            mb_x,
+            mb_y,
+            crate::mv_pred::MvGridCell::OneMv(crate::mv::Mv::default()),
+        );
         apply_mc_to_mb(pic, reference, mb_x, mb_y, (0, 0));
         return Ok(());
     }
@@ -578,7 +617,7 @@ fn decode_pframe_mb(
     };
     let predictor = crate::mv_pred::predict_block_mv(crate::mv_pred::Block::TopLeft, &cands);
     let mv = crate::mv::decode_mv_with_table(br, predictor, mv_table)?;
-    mv_grid[mb_idx] = Some(mv);
+    mv_grid.set_cell(mb_x, mb_y, crate::mv_pred::MvGridCell::OneMv(mv));
 
     // Lay down the motion-compensated prediction first; the residual
     // (decoded below) is added on top of it.
@@ -1821,5 +1860,133 @@ mod tests {
             msg.contains("reference") || msg.contains("P-frame"),
             "expected missing-reference error; got: {msg}"
         );
+    }
+
+    /// Round 240 (2026-06-06) regression pin: the MV-grid neighbour
+    /// resolution that [`decode_pframe_mb`] now performs through
+    /// [`crate::mv_pred::MvGrid::neighbour_set_for`] must produce the
+    /// same `(left, top, top_right)` triple that the pre-round-240
+    /// `Vec<Option<Mv>>` raster-index arithmetic produced for every MB
+    /// position on a small grid populated with both `OneMv` and
+    /// `Absent` cells.
+    ///
+    /// This exercises the
+    /// `MvGridCell::OneMv → NeighbourMvKind::OneMv → BlockCandidates.left_mb`
+    /// chain (and the analogous `Absent → None` chain for intra-in-P
+    /// MBs and picture-edge substitution) at the same fan-out the
+    /// pframe MB loop uses, so the wiring is anchored against the
+    /// historical baseline without re-coding the pre-round-240 path.
+    #[test]
+    fn round_240_mv_grid_neighbour_lookup_matches_legacy_arithmetic() {
+        use crate::mv::Mv;
+        use crate::mv_pred::{MvGrid, MvGridCell, NeighbourMvKind};
+
+        // 4x3 grid with a mix of OneMv (inter / skip MBs) and Absent
+        // (intra-in-P MBs at column 1 throughout, plus the all-Absent
+        // row 0 first cell to pin the picture-corner case).
+        let mb_w: usize = 4;
+        let mb_h: usize = 3;
+        let mut legacy: Vec<Option<Mv>> = vec![None; mb_w * mb_h];
+        let mut grid = MvGrid::new(mb_w, mb_h);
+        for y in 0..mb_h {
+            for x in 0..mb_w {
+                // Column 1 is intra-in-P (Absent in both views).
+                if x == 1 {
+                    continue;
+                }
+                // Skip the picture-corner (0,0) — leave it Absent to
+                // pin the corner substitution.
+                if x == 0 && y == 0 {
+                    continue;
+                }
+                let mv = Mv {
+                    x: (x as i8) - 1,
+                    y: (y as i8) + 2,
+                };
+                legacy[y * mb_w + x] = Some(mv);
+                grid.set_cell(x, y, MvGridCell::OneMv(mv));
+            }
+        }
+
+        // For every MB position in raster order, the new MvGrid route
+        // must agree with the legacy `mv_grid[idx]` lookups on the
+        // three Figure 7-34 neighbour positions.
+        for my in 0..mb_h {
+            for mx in 0..mb_w {
+                let legacy_left = if mx > 0 {
+                    legacy[my * mb_w + (mx - 1)]
+                } else {
+                    None
+                };
+                let legacy_top = if my > 0 {
+                    legacy[(my - 1) * mb_w + mx]
+                } else {
+                    None
+                };
+                let legacy_top_right = if my > 0 && mx + 1 < mb_w {
+                    legacy[(my - 1) * mb_w + (mx + 1)]
+                } else {
+                    None
+                };
+
+                let nset = grid.neighbour_set_for(mx, my);
+                let grid_left = match nset.left {
+                    NeighbourMvKind::Absent => None,
+                    NeighbourMvKind::OneMv(mv) => Some(mv),
+                    NeighbourMvKind::FourMv(mvs) => Some(mvs[1]),
+                };
+                let grid_top = match nset.above {
+                    NeighbourMvKind::Absent => None,
+                    NeighbourMvKind::OneMv(mv) => Some(mv),
+                    NeighbourMvKind::FourMv(mvs) => Some(mvs[2]),
+                };
+                let grid_top_right = match nset.above_right {
+                    NeighbourMvKind::Absent => None,
+                    NeighbourMvKind::OneMv(mv) => Some(mv),
+                    NeighbourMvKind::FourMv(mvs) => Some(mvs[2]),
+                };
+
+                assert_eq!(grid_left, legacy_left, "left mismatch at ({mx},{my})");
+                assert_eq!(grid_top, legacy_top, "top mismatch at ({mx},{my})");
+                assert_eq!(
+                    grid_top_right, legacy_top_right,
+                    "top_right mismatch at ({mx},{my})"
+                );
+            }
+        }
+    }
+
+    /// Round 240 (2026-06-06): the per-MB MV grid pipeline records a
+    /// skipped MB as [`crate::mv_pred::MvGridCell::OneMv(Mv::default())`]
+    /// so its downstream neighbour position contributes a literal `(0, 0)`
+    /// MV to the median predictor of the next MB — equivalent to the
+    /// pre-round-240 `Some(Mv::default())` write into the parallel
+    /// `Vec<Option<Mv>>` book-keeping.
+    ///
+    /// This pins the skip-MB cell semantics so a refactor that
+    /// accidentally writes `Absent` (which would degrade the right
+    /// neighbour to a `None` and trigger the §7.6.5 zero-substitution
+    /// rule a second time, only changing behaviour at picture corners
+    /// where the cumulative substitution already lands on zero anyway)
+    /// is caught.
+    #[test]
+    fn round_240_skip_mb_cell_is_one_mv_default() {
+        use crate::mv::Mv;
+        use crate::mv_pred::{MvGrid, MvGridCell, NeighbourMvKind};
+
+        let mut grid = MvGrid::new(3, 3);
+        // Write a skip-MB cell at (0, 0) the same way `decode_pframe_mb`
+        // does, then confirm cell + neighbour resolution.
+        grid.set_cell(0, 0, MvGridCell::OneMv(Mv::default()));
+        assert_eq!(grid.cell_at(0, 0), MvGridCell::OneMv(Mv::default()));
+
+        // MB (1, 0) sees (0, 0) as its `left` neighbour — it must
+        // surface as a literal `OneMv((0, 0))`, not `Absent`.
+        let set = grid.neighbour_set_for(1, 0);
+        assert_eq!(set.left, NeighbourMvKind::OneMv(Mv::default()));
+        // `above` / `above_right` are out of bounds on row 0 — both
+        // Absent regardless of the skip-MB write.
+        assert_eq!(set.above, NeighbourMvKind::Absent);
+        assert_eq!(set.above_right, NeighbourMvKind::Absent);
     }
 }

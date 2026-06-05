@@ -9,6 +9,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 240 — `decode_pframe` MV book-keeping consolidated onto
+  `MvGrid`** (2026-06-06): replaces the parallel `Vec<Option<Mv>>`
+  raster-indexed MV cache that `picture::decode_pframe` /
+  `decode_pframe_mb` carried since the round-9 P-frame skeleton with
+  the production-tested [`crate::mv_pred::MvGrid`] /
+  [`crate::mv_pred::MvGridCell`] surface introduced in round 227.
+  The pframe MB loop now allocates one `MvGrid::new(mb_w, mb_h)` and
+  drives the three §7.6.5 neighbour positions through
+  [`crate::mv_pred::MvGrid::neighbour_set_for`], which folds the
+  picture-edge substitution rule
+  (`docs/video/mpeg4-visual/figure-7-34-mv-predictor-layout.md` §
+  "Boundary substitution") into a single
+  [`crate::mv_pred::NeighbourSet`] without any per-axis range
+  arithmetic at the pframe layer. Skip / inter MBs write
+  [`MvGridCell::OneMv`] back into the grid via
+  [`MvGrid::set_cell`]; intra-in-P MBs leave the cell `Absent` so the
+  next MB's median predictor treats that column as zero (identical
+  to the pre-round-240 `None` semantics). The
+  [`NeighbourMvKind::FourMv`] branch is wired through as
+  `mvs[1]` / `mvs[2]` / `mvs[2]` (the §7.6.5 bordering-cell picks
+  for left / above / above-right respectively) so when the 4-MV-per-MB
+  bitstream signalling lands in a future round the predictor layer
+  is already consuming the correct cells. Two new lib tests pin the
+  refactor:
+  `picture::tests::round_240_mv_grid_neighbour_lookup_matches_legacy_arithmetic`
+  walks a 4x3 mixed `OneMv` / `Absent` grid through both the new
+  `MvGrid::neighbour_set_for` route and the historical
+  raster-indexed `Vec<Option<Mv>>` lookups and asserts the
+  `(left, top, top_right)` triple matches at every MB position; and
+  `picture::tests::round_240_skip_mb_cell_is_one_mv_default` pins
+  that a skipped MB writes [`MvGridCell::OneMv(Mv::default())`] (not
+  `Absent`) so its neighbour position contributes a literal `(0, 0)`
+  MV to the next MB's median predictor — equivalent to the
+  pre-round-240 `Some(Mv::default())` skip-write. Lib tests 345 →
+  347 (+2); integration tests unchanged in count.
 - **Round 234 — G0..G3 packed-Huffman primary VLC wired** (2026-06-04):
   closes the OPEN status the README has carried for the four extended
   G-descriptor (G0..G3) canonical-Huffman primary VLCs. Per

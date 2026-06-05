@@ -60,6 +60,7 @@ right decoder when a packet arrives.
 | 4-MV stateful predict / commit driver           | `Macroblock4MvDecoderNeighbours` (round 221) |
 | Picture-wide MV grid → `NeighbourSet` builder    | `MvGrid` + `MvGridCell` (round 227)          |
 | G0..G3 packed-Huffman primary VLC                | wired (round 234, all 4 sources Kraft=1)     |
+| `decode_pframe` MV cache routed through `MvGrid` | wired (round 240, replaces parallel `Vec<Option<Mv>>`) |
 
 ### What's still spec-OPEN for real-content decode
 
