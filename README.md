@@ -61,6 +61,7 @@ right decoder when a packet arrives.
 | Picture-wide MV grid → `NeighbourSet` builder    | `MvGrid` + `MvGridCell` (round 227)          |
 | G0..G3 packed-Huffman primary VLC                | wired (round 234, all 4 sources Kraft=1)     |
 | `decode_pframe` MV cache routed through `MvGrid` | wired (round 240, replaces parallel `Vec<Option<Mv>>`) |
+| Per-MB 4-MV decoder → `MvGridCell` one-shot bridge | `finalise_to_grid_cell` on both 4-MV decoders (round 243) |
 
 ### What's still spec-OPEN for real-content decode
 
@@ -483,6 +484,40 @@ analysis is now unblocked: `picture::AcSelection::FromHeader` plus
 `for_luma_selector(0)` dispatches v3 intra-luma blocks through G3's
 133-entry canonical-Huffman walker (instead of the empty placeholder
 the round-7..233 path returned).
+
+Round-243 (2026-06-07) closes the per-MB-decoder → picture-wide-grid
+handoff that round 240 plumbed at the `picture::decode_pframe_mb`
+layer. Three purely-additive surface extensions in
+[`mv_pred`]: (1) [`mv_pred::Macroblock4MvDecoder::finalise_to_grid_cell`]
+and [`mv_pred::Macroblock4MvDecoderNeighbours::finalise_to_grid_cell`]
+return [`mv_pred::MvGridCell::FourMv`]`(self.finalise())` so a future
+4-MV-mode site can write
+`mv_grid.set_cell(mb_x, mb_y, decoder.finalise_to_grid_cell())` in a
+single call, without manually wrapping the `[Mv; 4]` in the cell enum
+— both helpers pick up `finalise()`'s `Mv::default()` substitution for
+any block that was never committed, matching the documented
+semantics. (2) Three `const fn` query predicates on `MvGridCell`:
+[`mv_pred::MvGridCell::is_absent`] / `is_one_mv` / `is_four_mv`,
+mirroring [`mv_pred::NeighbourMvKind::is_absent`] so a call site that
+treats the two types interchangeably via the
+`From<MvGridCell> for NeighbourMvKind` conversion reads the same way
+before and after. (3) [`mv_pred::MvGrid::dimensions`] returning
+`(width, height)` as a pair, in the same constructor-arg order as
+`MvGrid::new`, matching the per-axis accessors and acting as a
+single-call alternative. Eight new lib tests in
+`src/mv_pred.rs::tests` pin: the four-commit sweep on both decoders
+producing the correct `FourMv` payload in Figure 6-8 raster order;
+the `Mv::default()` substitution for uncommitted blocks; the
+end-to-end round-trip through `MvGrid::set_cell` + `cell_at` +
+`neighbour_set_for` (writing a 4-MV cell at one position then reading
+it as the `left` neighbour of the next-column MB); the
+mutually-exclusive trichotomy of the three predicates over the three
+cell variants; `is_absent` agreement with the `NeighbourMvKind`
+conversion side; and the `dimensions()` accessor matching
+`(width(), height())` across multiple grid shapes plus its `const fn`
+property. Lib tests 347 → 355 (+8); integration tests unchanged.
+Purely additive; the existing 1-MV `picture::decode_pframe_mb` path
+is unchanged.
 
 ## License
 

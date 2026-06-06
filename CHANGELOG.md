@@ -9,6 +9,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 243 — per-MB 4-MV decoder → `MvGridCell` one-shot bridge +
+  `MvGridCell` query predicates + `MvGrid::dimensions`** (2026-06-07):
+  three purely-additive `mv_pred` surface extensions that complete the
+  per-MB-decoder → picture-wide-grid handoff plumbed by round 240.
+  (1) [`crate::mv_pred::Macroblock4MvDecoder::finalise_to_grid_cell`]
+  and [`crate::mv_pred::Macroblock4MvDecoderNeighbours::finalise_to_grid_cell`]
+  return [`crate::mv_pred::MvGridCell::FourMv`]`(self.finalise())` so
+  the future 4-MV-mode site can write
+  `mv_grid.set_cell(mb_x, mb_y, decoder.finalise_to_grid_cell())` in
+  one call without manually wrapping the `[Mv; 4]` in the cell enum.
+  Both helpers pick up `finalise`'s `Mv::default()` substitution for
+  any block that was never committed, matching the documented
+  semantics. (2) Three `const fn` query predicates on `MvGridCell`:
+  [`crate::mv_pred::MvGridCell::is_absent`] /
+  [`crate::mv_pred::MvGridCell::is_one_mv`] /
+  [`crate::mv_pred::MvGridCell::is_four_mv`], mirroring
+  [`crate::mv_pred::NeighbourMvKind::is_absent`] (same name, same
+  semantics) so a call site that treats the two types interchangeably
+  via the `From<MvGridCell> for NeighbourMvKind` conversion reads the
+  same way before and after. (3)
+  [`crate::mv_pred::MvGrid::dimensions`] — a `const fn` returning
+  `(width, height)` as a pair, in the same constructor-arg order as
+  [`crate::mv_pred::MvGrid::new`], matching the per-axis accessors
+  `width()` / `height()` and acting as a single-call alternative.
+  Eight new lib tests in `src/mv_pred.rs::tests` pin: the four-commit
+  sweep through `Macroblock4MvDecoder::finalise_to_grid_cell`
+  returning the correct `FourMv` payload in Figure 6-8 raster order;
+  the `Mv::default()` substitution on uncommitted blocks; the same
+  shape on the `Macroblock4MvDecoderNeighbours` variant; the
+  end-to-end round-trip through `MvGrid::set_cell` + `cell_at` +
+  `neighbour_set_for` (writing a 4-MV cell at one position then
+  reading it as the `left` neighbour of the next-column MB); the
+  mutually-exclusive trichotomy of the three predicates over the
+  three cell variants; `is_absent` agreement with the
+  `NeighbourMvKind::is_absent` result on the converted side;
+  `dimensions()` matching `(width(), height())` across (5, 7) /
+  (4, 4) / (1, 1) shapes; and the `const fn` callable shape of
+  `dimensions`. Lib tests 347 → 355 (+8); integration tests
+  unchanged. Purely additive; the existing 1-MV
+  `picture::decode_pframe_mb` path is unchanged.
 - **Round 240 — `decode_pframe` MV book-keeping consolidated onto
   `MvGrid`** (2026-06-06): replaces the parallel `Vec<Option<Mv>>`
   raster-indexed MV cache that `picture::decode_pframe` /

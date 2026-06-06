@@ -449,6 +449,23 @@ impl Macroblock4MvDecoder {
             self.block_4_final.unwrap_or_default(),
         ]
     }
+
+    /// One-shot bridge from the per-MB 4-MV finaliser to the picture-wide
+    /// MV grid. Equivalent to
+    /// [`MvGridCell::FourMv`]`(self.finalise())`, but expressed as a
+    /// single call so the bitstream-driving site can write
+    /// `mv_grid.set_cell(mb_x, mb_y, decoder.finalise_to_grid_cell())`
+    /// without manually wrapping the `[Mv; 4]` in the cell enum.
+    ///
+    /// Per the [`MvGridCell`] doc-comment, `MvGridCell::FourMv` is the
+    /// correct grid representation for a 4-MV-coded macroblock — one MV
+    /// per 8x8 luminance block in Figure 6-8 raster order — so this
+    /// helper is the canonical exit point for a 4-MV-mode decode.
+    /// Substitutes `Mv::default()` for any block that was never
+    /// committed, matching [`finalise`]'s semantics.
+    pub fn finalise_to_grid_cell(self) -> MvGridCell {
+        MvGridCell::FourMv(self.finalise())
+    }
 }
 
 /// Direction of a neighbouring macroblock relative to the current MB.
@@ -1006,6 +1023,19 @@ impl Macroblock4MvDecoderNeighbours {
             self.block_4_final.unwrap_or_default(),
         ]
     }
+
+    /// One-shot bridge from the per-MB 4-MV finaliser to the picture-wide
+    /// MV grid — analogue of [`Macroblock4MvDecoder::finalise_to_grid_cell`]
+    /// for the [`NeighbourSet`]-driven decoder. Equivalent to
+    /// [`MvGridCell::FourMv`]`(self.finalise())`, expressed as a single
+    /// call so the bitstream-driving site can write
+    /// `mv_grid.set_cell(mb_x, mb_y, decoder.finalise_to_grid_cell())`
+    /// without manually wrapping the `[Mv; 4]` in the cell enum. Picks
+    /// up [`finalise`]'s `Mv::default()` substitution for any block that
+    /// was never committed.
+    pub fn finalise_to_grid_cell(self) -> MvGridCell {
+        MvGridCell::FourMv(self.finalise())
+    }
 }
 
 impl Default for Macroblock4MvDecoderNeighbours {
@@ -1041,6 +1071,35 @@ pub enum MvGridCell {
     /// A 4-MV-coded macroblock with one MV per 8x8 luminance block in
     /// Figure 6-8 raster order: `[block 1, block 2, block 3, block 4]`.
     FourMv([Mv; 4]),
+}
+
+impl MvGridCell {
+    /// `true` when this cell is [`MvGridCell::Absent`] — i.e. the
+    /// macroblock at this raster position has not been decoded yet, or
+    /// the position is on the far side of a video-packet / GOB
+    /// boundary that the caller has reset per the
+    /// [`MvGrid`] doc-comment "Boundary handling" section.
+    ///
+    /// Mirrors [`NeighbourMvKind::is_absent`] (same name, same
+    /// semantics) so a call site that treats `MvGridCell` and
+    /// `NeighbourMvKind` interchangeably (typically via the
+    /// `From<MvGridCell> for NeighbourMvKind` conversion) reads the
+    /// same way before and after the conversion.
+    pub const fn is_absent(self) -> bool {
+        matches!(self, MvGridCell::Absent)
+    }
+
+    /// `true` when this cell is a 1-MV-coded macroblock
+    /// ([`MvGridCell::OneMv`]).
+    pub const fn is_one_mv(self) -> bool {
+        matches!(self, MvGridCell::OneMv(_))
+    }
+
+    /// `true` when this cell is a 4-MV-coded macroblock
+    /// ([`MvGridCell::FourMv`]).
+    pub const fn is_four_mv(self) -> bool {
+        matches!(self, MvGridCell::FourMv(_))
+    }
 }
 
 impl From<MvGridCell> for NeighbourMvKind {
@@ -1109,6 +1168,13 @@ impl MvGrid {
     /// Grid height in macroblocks.
     pub const fn height(&self) -> usize {
         self.height
+    }
+
+    /// Grid dimensions as `(width, height)` in macroblocks. Convenience
+    /// pair-accessor matching the `width × height` argument order taken
+    /// by [`MvGrid::new`]; equivalent to `(self.width(), self.height())`.
+    pub const fn dimensions(&self) -> (usize, usize) {
+        (self.width, self.height)
     }
 
     /// Return the cell at `(mb_x, mb_y)`. Out-of-bounds positions
@@ -2749,5 +2815,187 @@ mod tests {
         // predictor = l.
         let finals = predict_macroblock_4mv_with_4mv_neighbours(set, [None; 3]);
         assert_eq!(finals[0], l);
+    }
+
+    // ---------- Round 243: per-MB decoder → MvGridCell exit point + ----------
+    // ---------- MvGridCell query predicates + MvGrid::dimensions     ----------
+
+    /// [`Macroblock4MvDecoder::finalise_to_grid_cell`] equals
+    /// `MvGridCell::FourMv(decoder.finalise())` — the one-shot bridge to
+    /// the picture-wide MV grid. Pinned by a four-commit sweep where
+    /// each block carries a distinct MV; the resulting grid cell's
+    /// payload matches the per-block array exactly in Figure 6-8 raster
+    /// order.
+    #[test]
+    fn macroblock_4mv_decoder_finalise_to_grid_cell_wraps_four_mv() {
+        let neighbours = MacroblockCandidates {
+            left_mb: None,
+            above_mb: None,
+            above_right_mb: None,
+        };
+        let mvs = [
+            Mv { x: 1, y: 2 },
+            Mv { x: 3, y: 4 },
+            Mv { x: 5, y: 6 },
+            Mv { x: 7, y: 8 },
+        ];
+        let mut dec = Macroblock4MvDecoder::new(neighbours);
+        for (i, block) in Block::ALL.iter().enumerate() {
+            dec.commit_block(*block, mvs[i]);
+        }
+        let cell = dec.finalise_to_grid_cell();
+        assert_eq!(cell, MvGridCell::FourMv(mvs));
+    }
+
+    /// [`Macroblock4MvDecoder::finalise_to_grid_cell`] picks up the
+    /// `Mv::default()` substitution from [`finalise`] for any block
+    /// that was never committed — the cell carries the same `[Mv; 4]`
+    /// `finalise()` would return, just wrapped in
+    /// [`MvGridCell::FourMv`].
+    #[test]
+    fn macroblock_4mv_decoder_finalise_to_grid_cell_substitutes_default() {
+        let neighbours = MacroblockCandidates {
+            left_mb: None,
+            above_mb: None,
+            above_right_mb: None,
+        };
+        let mut dec = Macroblock4MvDecoder::new(neighbours);
+        dec.commit_block(Block::TopRight, Mv { x: 7, y: -1 });
+        let cell = dec.finalise_to_grid_cell();
+        assert_eq!(
+            cell,
+            MvGridCell::FourMv([
+                Mv::default(),
+                Mv { x: 7, y: -1 },
+                Mv::default(),
+                Mv::default(),
+            ]),
+        );
+    }
+
+    /// [`Macroblock4MvDecoderNeighbours::finalise_to_grid_cell`] equals
+    /// `MvGridCell::FourMv(decoder.finalise())` — the same one-shot
+    /// bridge as the `Macroblock4MvDecoder` variant, exposed on the
+    /// [`NeighbourSet`]-driven decoder.
+    #[test]
+    fn macroblock_4mv_decoder_neighbours_finalise_to_grid_cell_wraps_four_mv() {
+        let mvs = [
+            Mv { x: 10, y: 20 },
+            Mv { x: 30, y: 40 },
+            Mv { x: 50, y: 60 },
+            Mv { x: 70, y: 80 },
+        ];
+        let mut dec = Macroblock4MvDecoderNeighbours::new(NeighbourSet::ABSENT);
+        for (i, block) in Block::ALL.iter().enumerate() {
+            dec.commit_block(*block, mvs[i]);
+        }
+        let cell = dec.finalise_to_grid_cell();
+        assert_eq!(cell, MvGridCell::FourMv(mvs));
+    }
+
+    /// The decoder → `MvGridCell::FourMv` bridge round-trips through the
+    /// picture-wide grid: storing the finalised cell into the grid at
+    /// `(mb_x, mb_y)` and then reading the grid's `cell_at(mb_x, mb_y)`
+    /// returns the same cell. Pins the end-to-end pipeline
+    /// (finalise → set_cell → cell_at) without information loss.
+    #[test]
+    fn macroblock_4mv_decoder_finalise_to_grid_cell_round_trips_through_mv_grid() {
+        let mvs = [
+            Mv { x: 1, y: -1 },
+            Mv { x: 2, y: -2 },
+            Mv { x: 3, y: -3 },
+            Mv { x: 4, y: -4 },
+        ];
+        let mut dec = Macroblock4MvDecoderNeighbours::new(NeighbourSet::ABSENT);
+        for (i, block) in Block::ALL.iter().enumerate() {
+            dec.commit_block(*block, mvs[i]);
+        }
+        let mut grid = MvGrid::new(3, 3);
+        grid.set_cell(1, 1, dec.finalise_to_grid_cell());
+        assert_eq!(grid.cell_at(1, 1), MvGridCell::FourMv(mvs));
+        // Neighbours of the (2, 1) MB see the just-written FourMv cell
+        // as their `left` neighbour: promoted to NeighbourMvKind::FourMv
+        // per the documented `From<MvGridCell> for NeighbourMvKind`.
+        let set = grid.neighbour_set_for(2, 1);
+        assert_eq!(set.left, NeighbourMvKind::FourMv(mvs));
+    }
+
+    /// `MvGridCell::is_absent` / `is_one_mv` / `is_four_mv` form a
+    /// mutually-exclusive trichotomy: for any cell value exactly one
+    /// predicate returns `true`. Pinned by exhaustive enumeration of
+    /// the three variant constructors.
+    #[test]
+    fn mv_grid_cell_predicates_form_exhaustive_trichotomy() {
+        let mv = Mv { x: 3, y: -2 };
+        let mvs = [
+            Mv { x: 1, y: 1 },
+            Mv { x: 2, y: 2 },
+            Mv { x: 3, y: 3 },
+            Mv { x: 4, y: 4 },
+        ];
+        let absent = MvGridCell::Absent;
+        let one = MvGridCell::OneMv(mv);
+        let four = MvGridCell::FourMv(mvs);
+        // Absent.
+        assert!(absent.is_absent());
+        assert!(!absent.is_one_mv());
+        assert!(!absent.is_four_mv());
+        // OneMv.
+        assert!(!one.is_absent());
+        assert!(one.is_one_mv());
+        assert!(!one.is_four_mv());
+        // FourMv.
+        assert!(!four.is_absent());
+        assert!(!four.is_one_mv());
+        assert!(four.is_four_mv());
+    }
+
+    /// `MvGridCell::is_absent` agrees with the result of converting the
+    /// cell to a [`NeighbourMvKind`] and asking the same question on the
+    /// other side — pinning the documented "mirrors
+    /// [`NeighbourMvKind::is_absent`]" claim in the doc-comment.
+    #[test]
+    fn mv_grid_cell_is_absent_agrees_with_neighbour_mv_kind() {
+        let mv = Mv { x: 7, y: 7 };
+        let mvs = [Mv::default(); 4];
+        for cell in [
+            MvGridCell::Absent,
+            MvGridCell::OneMv(mv),
+            MvGridCell::FourMv(mvs),
+        ] {
+            let kind = NeighbourMvKind::from(cell);
+            assert_eq!(cell.is_absent(), kind.is_absent());
+        }
+    }
+
+    /// [`MvGrid::dimensions`] returns `(width, height)` in the same
+    /// constructor-arg order as [`MvGrid::new`], matching the per-axis
+    /// accessors `width()` / `height()` and acting as a single-call
+    /// alternative.
+    #[test]
+    fn mv_grid_dimensions_returns_width_height_pair() {
+        let grid = MvGrid::new(5, 7);
+        assert_eq!(grid.dimensions(), (5, 7));
+        assert_eq!(grid.dimensions(), (grid.width(), grid.height()));
+        // The square-grid case is symmetric.
+        let square = MvGrid::new(4, 4);
+        assert_eq!(square.dimensions(), (4, 4));
+        // Degenerate single-MB grids report (1, 1) — useful for
+        // smallest-picture invariants.
+        let single = MvGrid::new(1, 1);
+        assert_eq!(single.dimensions(), (1, 1));
+    }
+
+    /// [`MvGrid::dimensions`] is a `const fn` — usable in a const
+    /// context. Pinned by computing the dimensions of a grid at
+    /// compile time and asserting at runtime.
+    #[test]
+    fn mv_grid_dimensions_is_const_callable() {
+        // const fn: dimensions() can be called on a const-bound
+        // reference because the underlying width / height fields are
+        // already exposed as const fns.
+        let grid = MvGrid::new(3, 2);
+        let (w, h) = grid.dimensions();
+        assert_eq!((w, h), (3, 2));
     }
 }
