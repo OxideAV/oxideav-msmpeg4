@@ -39,22 +39,27 @@
 //! | `mv_table_sel` | VLC source VMA   | MVDx LUT    | MVDy LUT    | Status |
 //! | -------------- | ---------------- | ----------- | ----------- | ------ |
 //! | 0 (default)    | `0x1c25cbc0`     | `0x1c25ee28`| `0x1c25f278`| **wired** ([`MvTable::Default`]) |
-//! | 1 (alternate)  | `0x1c25a0b8`     | `0x1c25c320`| `0x1c25c770`| placeholder ([`MvTable::Alternate`]) |
+//! | 1 (alternate)  | `0x1c25a0b8`     | `0x1c25c320`| `0x1c25c770`| byte LUTs landed; VLC source extraction truncated ([`MvTable::Alternate`]) |
 //!
-//! [`MvTable::Alternate`] is not yet usable because only a 256-byte
-//! extraction dump is available for the VLC source at `0x1c25a0b8`
-//! (per `docs/video/msmpeg4/tables/region_0594b8.meta`: `note: 256
-//! bytes is an over-dump; real table may be shorter` /
-//! `likely_interpretation: u8_scan_plausible`). The full ~8 KB
-//! 1099-entry packed-Huffman source has not been re-extracted, and
-//! the `(MVDx, MVDy)` byte LUTs at `0x1c25c320` / `0x1c25c770` have
-//! not been extracted at all. Until both land, [`decode_mv`] called
-//! with [`MvTable::Alternate`] returns the actionable
-//! [`Error::Unsupported`] diagnostic. Streams that use the alternate
-//! table include div3.avi frames 37/38/40 and div4.avi frames 1/16
-//! per `memory/project_msmpeg4_runtime_binding_clues.md` §2.1; the
-//! reject is the cause of div4.avi's `first_diverge=1` (the very
-//! first P-frame).
+//! [`MvTable::Alternate`] is still not usable end-to-end because the
+//! VLC source at `0x1c25a0b8` only has a 256-byte extraction available
+//! against the 8804-byte source documented in
+//! `docs/video/msmpeg4/spec/11-walker-format-resolved.md` §5 (1100
+//! `(code:u32-LE, bl:u32-LE)` records prefixed by a `count = 1100`
+//! header). The two `(MVDx, MVDy)` byte LUTs at `0x1c25c320` /
+//! `0x1c25c770` **are now extracted** (1104 bytes each, bias-32
+//! distributions matching the default-variant LUTs) and exposed as
+//! [`MVDX_V3_ALT_BYTES`](crate::tables_data::MVDX_V3_ALT_BYTES) /
+//! [`MVDY_V3_ALT_BYTES`](crate::tables_data::MVDY_V3_ALT_BYTES). Until
+//! the alt VLC source is re-extracted at full size, [`decode_mv`]
+//! called with [`MvTable::Alternate`] returns the actionable
+//! [`Error::Unsupported`] diagnostic — when that source lands, the
+//! placeholder body is a single canonical-Huffman builder swap (the
+//! byte LUTs are already wired). Streams that use the alternate table
+//! include div3.avi frames 37/38/40 and div4.avi frames 1/16 per
+//! `memory/project_msmpeg4_runtime_binding_clues.md` §2.1; the reject
+//! is the cause of div4.avi's `first_diverge=1` (the very first
+//! P-frame).
 
 use oxideav_core::bits::BitReader;
 use oxideav_core::{Error, Result};
@@ -193,18 +198,22 @@ pub fn decode_mv_with_table(
         MvTable::Default => decode_mv_default(br, predictor),
         MvTable::Alternate => Err(Error::unsupported(
             "msmpeg4v3 mv: alternate MV VLC (mv_table_sel=1, source VMA \
-             0x1c25a0b8) is not yet wired. The available extraction at \
-             docs/video/msmpeg4/tables/region_0594b8 is a 256-byte \
-             over-dump (likely_interpretation: u8_scan_plausible per the \
-             meta file) — the full ~8 KB 1099-entry packed-Huffman \
-             source has not been re-extracted, and the alternate \
-             (MVDx, MVDy) byte LUTs at VMAs 0x1c25c320 / 0x1c25c770 \
-             have not been extracted at all. To unblock: re-dump the \
-             three regions at full size and re-resolve their packed-\
-             Huffman record format, then swap the placeholder body in \
-             mv::decode_mv_with_table for the same canonical-Huffman \
-             builder pattern as decode_mv_default. Affected fixtures \
-             per memory/project_msmpeg4_runtime_binding_clues.md §2.1: \
+             0x1c25a0b8) is not yet wired end-to-end. The two byte LUTs \
+             at VMAs 0x1c25c320 / 0x1c25c770 ARE landed as \
+             MVDX_V3_ALT_BYTES / MVDY_V3_ALT_BYTES (round 251). What \
+             remains: the VLC source at file offset 0x594b8 / VMA \
+             0x1c25a0b8 — docs/video/msmpeg4/tables/region_0594b8.hex \
+             is a 256-byte truncation against the 8804-byte source \
+             documented in docs/video/msmpeg4/spec/11-walker-format-\
+             resolved.md §5 (header u32-LE count=1100 then 1100 \
+             (code:u32-LE, bl:u32-LE) records, identical record format \
+             to the default at 0x1c25cbc0). To unblock: re-extract \
+             region_0594b8 at full 8804-byte size, then swap the \
+             placeholder body in mv::decode_mv_with_table for the same \
+             canonical-Huffman builder pattern as decode_mv_default and \
+             route the byte-LUT reads to MVDX_V3_ALT_BYTES / \
+             MVDY_V3_ALT_BYTES. Affected fixtures per \
+             memory/project_msmpeg4_runtime_binding_clues.md §2.1: \
              div3.avi frames 37/38/40, div4.avi frames 1/16.",
         )),
     }
@@ -698,6 +707,112 @@ mod tests {
             msg.contains("0x1c25c320") && msg.contains("0x1c25c770"),
             "diagnostic must cite the alternate (MVDx, MVDy) byte LUT VMAs (so re-extraction \
              knows what to dump); got: {msg}"
+        );
+        // Round 251: diagnostic now records that the byte LUTs landed
+        // and names the only remaining blocker (the VLC source size).
+        assert!(
+            msg.contains("MVDX_V3_ALT_BYTES") && msg.contains("MVDY_V3_ALT_BYTES"),
+            "diagnostic must surface the wired alt byte-LUT constants so a downstream agent \
+             knows the swap is single-emitter; got: {msg}"
+        );
+        assert!(
+            msg.contains("8804"),
+            "diagnostic must cite the spec/11 §5 full-source size so re-extraction has a clear \
+             target byte count; got: {msg}"
+        );
+    }
+
+    // =================================================================
+    // Round 251: alternate-variant byte LUTs landed (spec/06 §2.2)
+    // =================================================================
+
+    /// The alternate (MVDx, MVDy) byte LUTs are emitted by `build.rs`
+    /// from `tables/region_05b720.hex` and `tables/region_05bb70.hex`
+    /// (VMAs `0x1c25c320` / `0x1c25c770` per spec/06 §2.2). Pin the
+    /// shape so a future regression can't quietly truncate or pad the
+    /// emitted arrays.
+    #[test]
+    fn mv_alt_byte_luts_have_expected_shape() {
+        use crate::tables_data::{MVDX_V3_ALT_BYTES, MVDY_V3_ALT_BYTES};
+        // 1104 = 1099 alphabet entries + 5 alignment padding bytes per
+        // spec/06 §2.2 (1104-byte spacing between adjacent LUT VMAs).
+        assert_eq!(MVDX_V3_ALT_BYTES.len(), 1104, "alt MVDx LUT length");
+        assert_eq!(MVDY_V3_ALT_BYTES.len(), 1104, "alt MVDy LUT length");
+    }
+
+    /// Each emitted byte is in the toroidal `[0, 63]` MV-residual range
+    /// that the decoder's `raw - 32` bias-subtract assumes (spec/06
+    /// §3.5). The byte values are unsigned 6-bit pre-biased residuals;
+    /// stored byte 0..=63 = MVD `-32..=+31` after bias. A drift into
+    /// the 64..=255 range would mean either the file got mis-parsed or
+    /// the wrong file was wired.
+    #[test]
+    fn mv_alt_byte_luts_in_six_bit_range() {
+        use crate::tables_data::{MVDX_V3_ALT_BYTES, MVDY_V3_ALT_BYTES};
+        for (i, &b) in MVDX_V3_ALT_BYTES[..1099].iter().enumerate() {
+            assert!(
+                b < 64,
+                "alt MVDx idx {i} = {b} not in [0, 63] (6-bit pre-biased range)"
+            );
+        }
+        for (i, &b) in MVDY_V3_ALT_BYTES[..1099].iter().enumerate() {
+            assert!(
+                b < 64,
+                "alt MVDy idx {i} = {b} not in [0, 63] (6-bit pre-biased range)"
+            );
+        }
+    }
+
+    /// The alt LUTs and the default LUTs are different alphabets per
+    /// spec/06 §2.1 / §4.3 (patent 6,983,018 Table 1 / Table 2 — two
+    /// distinct training corpora producing distinct byte values for the
+    /// same alphabet shape). Pin that they don't accidentally point at
+    /// the same source file or get loaded as identical arrays.
+    #[test]
+    fn mv_alt_byte_luts_differ_from_default() {
+        use crate::tables_data::{
+            MVDX_V3_ALT_BYTES, MVDX_V3_BYTES, MVDY_V3_ALT_BYTES, MVDY_V3_BYTES,
+        };
+        assert_ne!(
+            &MVDX_V3_ALT_BYTES[..1099],
+            &MVDX_V3_BYTES[..1099],
+            "alt MVDx LUT must not match default — both training corpora are independent"
+        );
+        assert_ne!(
+            &MVDY_V3_ALT_BYTES[..1099],
+            &MVDY_V3_BYTES[..1099],
+            "alt MVDy LUT must not match default — both training corpora are independent"
+        );
+    }
+
+    /// Both alt LUTs' value distributions cluster around 32 (the +32
+    /// bias baked into every LUT entry per spec/06 §3.5). A useful
+    /// guard: the mean of all 1099 active entries should be in
+    /// `[20, 44]` (i.e. within ±12 of the bias), which a corrupted /
+    /// mis-stride'd or non-LUT byte stream would not satisfy. The
+    /// default LUTs satisfy this trivially (means ~31.4 / 32.4 from a
+    /// direct count over `tables/region_05e228.hex` /
+    /// `region_05e678.hex`).
+    #[test]
+    fn mv_alt_byte_luts_cluster_around_bias() {
+        use crate::tables_data::{MVDX_V3_ALT_BYTES, MVDY_V3_ALT_BYTES};
+        let mean_x: f64 = MVDX_V3_ALT_BYTES[..1099]
+            .iter()
+            .map(|&b| b as f64)
+            .sum::<f64>()
+            / 1099.0;
+        let mean_y: f64 = MVDY_V3_ALT_BYTES[..1099]
+            .iter()
+            .map(|&b| b as f64)
+            .sum::<f64>()
+            / 1099.0;
+        assert!(
+            (20.0..=44.0).contains(&mean_x),
+            "alt MVDx mean {mean_x} should cluster around bias 32"
+        );
+        assert!(
+            (20.0..=44.0).contains(&mean_y),
+            "alt MVDy mean {mean_y} should cluster around bias 32"
         );
     }
 

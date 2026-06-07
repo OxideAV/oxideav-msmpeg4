@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 251 — Alternate-variant v3 MVDx / MVDy byte LUTs**
+  (2026-06-07): wires the spec/06 §2.2 alternate-variant byte LUTs
+  for the v3 joint MV decoder (`mv_table_sel == 1` path) at VMAs
+  `0x1c25c320` (MVDx) and `0x1c25c770` (MVDy), each 1104 bytes
+  (1099 alphabet entries + 5 bytes of alignment padding, identical
+  shape to the default-variant LUTs at `0x1c25ee28` / `0x1c25f278`).
+  Pre-extracted hex files `tables/region_05b720.hex` and
+  `tables/region_05bb70.hex` (already present in
+  `docs/video/msmpeg4/tables/`) are copied into the crate's
+  `tables/` directory and parsed at build time by a new emitter
+  `emit_mv_byte_lut_v3_alt` in `build.rs` — same shape as the
+  default-variant `emit_mv_byte_lut_v3` (xxd parser + 1104-byte
+  length assert + two `pub static …: &[u8; 1104]` arrays). The
+  emitted constants [`crate::tables_data::MVDX_V3_ALT_BYTES`] and
+  [`crate::tables_data::MVDY_V3_ALT_BYTES`] are ready for the
+  future alt-VLC-source-aware `mv::decode_mv_with_table` body.
+  Four new lib tests in `src/mv.rs::tests`
+  (`mv_alt_byte_luts_have_expected_shape`,
+  `mv_alt_byte_luts_in_six_bit_range`,
+  `mv_alt_byte_luts_differ_from_default`,
+  `mv_alt_byte_luts_cluster_around_bias`) pin the array shape, the
+  unsigned-6-bit pre-biased value range, the distinct-from-default
+  invariant, and the bias-32 distribution. The existing
+  `mv_table_alternate_is_unsupported_with_diagnostic` test was
+  extended to require the diagnostic now surfaces
+  `MVDX_V3_ALT_BYTES` / `MVDY_V3_ALT_BYTES` and the spec/11 §5
+  full-source size `8804` — the only remaining alt-path blocker.
+  Lib tests 366 → 370 (+4); integration tests unchanged. Purely
+  additive; `MvTable::Alternate` still returns the
+  `Error::Unsupported` diagnostic.
 - **Round 246 — `MvGrid` video-packet / GOB boundary-reset helpers +
   raster-order `iter_cells`** (2026-06-07): four purely-additive
   helpers on [`crate::mv_pred::MvGrid`] that close the documented

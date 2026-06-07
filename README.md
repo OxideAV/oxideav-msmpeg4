@@ -47,7 +47,7 @@ right decoder when a packet arrives.
 | G0..G3 canonical-Huffman primary VLC           | wired (round 234, spec/11 §5 row 1-4) |
 | MS-MPEG4v3 3-tier ESC body                     | wired (rounds 7 + 27 + 126: G5 LMAX/RMAX + tier 1/2/3 walk; integration-tested through `decode_intra_block_full_v3`) |
 | P-frame MV VLC + half-pel MC (default table)   | complete              |
-| P-frame MV VLC alternate table                 | unsupported (truncated dump) |
+| P-frame MV VLC alternate table                 | byte LUTs landed (round 251); VLC source still truncated |
 | Inter AC residual (G4 VLC → IDCT → add to MC)  | complete (round 123) |
 | V1 / V2 bitstream                              | header + MV + MCBPC done; AC OPEN; v3-compat defaults pinned (round 129) |
 | V1 / V2 shared CBPY VLC                        | binary cross-check vs H.263 (round 75) |
@@ -560,6 +560,47 @@ conversion side; and the `dimensions()` accessor matching
 property. Lib tests 347 → 355 (+8); integration tests unchanged.
 Purely additive; the existing 1-MV `picture::decode_pframe_mb` path
 is unchanged.
+
+Round-251 (2026-06-07) lands the **alternate-variant MVDx / MVDy byte
+LUTs** for the v3 joint MV decoder (`mv_table_sel == 1` path). Per
+`docs/video/msmpeg4/spec/06-mv-decoder.md` §2.2 the alternate VLC
+source at VMA `0x1c25a0b8` pairs with two byte LUTs at VMAs
+`0x1c25c320` (MVDx) and `0x1c25c770` (MVDy), each 1104 bytes
+(1099 alphabet entries + 5 bytes of alignment padding, identical
+shape to the default variant's `0x1c25ee28` / `0x1c25f278`). The two
+pre-extracted hex files `tables/region_05b720.hex` and
+`tables/region_05bb70.hex` (1104 bytes each, mean ≈ 32 matching the
+spec/06 §3.5 bias-32 distribution) were already present in
+`docs/video/msmpeg4/tables/` and are now copied into the crate's
+`tables/` directory and wired through a new `build.rs` emitter
+`emit_mv_byte_lut_v3_alt`. The emitter follows the exact same shape
+as `emit_mv_byte_lut_v3` (xxd parser + 1104-byte length assert + two
+`pub static …: &[u8; 1104]` arrays), producing
+[`tables_data::MVDX_V3_ALT_BYTES`] and
+[`tables_data::MVDY_V3_ALT_BYTES`]. Four new lib tests in
+`src/mv.rs::tests` pin: (1) both arrays are exactly 1104 bytes;
+(2) every active entry (indices 0..=1098) is in `[0, 63]` — the
+unsigned-6-bit pre-biased MV-residual range that the decoder's
+`raw - 32` bias-subtract assumes per spec/06 §3.5; (3) the alt LUTs
+differ from the default LUTs over indices 0..=1098 (the two patent
+6,983,018 training corpora produce distinct values for the same
+alphabet shape); (4) the alt LUT means cluster around the +32 bias
+(both in `[20, 44]`). The existing
+`mv_table_alternate_is_unsupported_with_diagnostic` test was
+extended to require the diagnostic now surfaces
+`MVDX_V3_ALT_BYTES` / `MVDY_V3_ALT_BYTES` and the spec/11 §5
+full-source size `8804` — so that when the VLC source at file
+`0x594b8` is re-extracted at its real 8804-byte size
+(currently a 256-byte truncation per
+`docs/video/msmpeg4/tables/region_0594b8.meta`), the alternate-path
+swap in `mv::decode_mv_with_table` is a single
+canonical-Huffman-builder edit: the byte LUTs it would consume are
+already wired. Lib tests 366 → 370 (+4); integration tests
+unchanged. Purely additive; `MvTable::Alternate` still returns the
+`Error::Unsupported` diagnostic — affected fixtures
+(`div3.avi` frames 37/38/40, `div4.avi` frames 1/16 per
+`memory/project_msmpeg4_runtime_binding_clues.md` §2.1) still
+reject at picture-dispatch time, exactly as before.
 
 ## License
 
