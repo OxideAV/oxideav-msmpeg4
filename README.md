@@ -52,7 +52,7 @@ right decoder when a packet arrives.
 | V1 / V2 bitstream                              | header + MV + MCBPC done; AC OPEN; v3-compat defaults pinned (round 129) |
 | V1 / V2 shared CBPY VLC                        | binary cross-check vs H.263 (round 75) |
 | G0..G5 (count_A, count_B) provenance pin       | spec/15 §3 binary-derived (round 81) |
-| Unified `GFamily` dispatch surface (G0..G5)    | wired (round 174); selector inverses + `subclass_of` (round 181) |
+| Unified `GFamily` dispatch surface (G0..G5)    | wired (round 174); selector inverses + `subclass_of` (round 181); per-field descriptor offsets (round 254) |
 | P-frame 1-MV predictor (Figure 7-34 top-left)  | routed through `mv_pred::predict_block_mv` (round 191) |
 | 4-MV-per-MB predictor batch surface             | `Macroblock4MvDecoder` + bitstream tests (rounds 196 / 202) |
 | 4-MV neighbour-MB bordering-cell picker         | `bordering_block_of_neighbour` + `pick_neighbour_mv_from_4mv` (round 208) |
@@ -601,6 +601,48 @@ unchanged. Purely additive; `MvTable::Alternate` still returns the
 (`div3.avi` frames 37/38/40, `div4.avi` frames 1/16 per
 `memory/project_msmpeg4_runtime_binding_clues.md` §2.1) still
 reject at picture-dispatch time, exactly as before.
+
+Round-254 (2026-06-08) lands a **per-descriptor field-offset accessor
+surface** on [`crate::g_family::GFamily`] mirroring the 36-byte
+record schema documented in
+`docs/video/msmpeg4/spec/15-count-ab-per-g-family.md` §1. The new
+[`crate::g_family::GDescriptorField`] enum names every one of the
+nine `u32` slots a G-descriptor holds (`DecoderObj`, `CountA`,
+`CountB`, `SubALevelExtPtr`, `SubBLevelExtPtr`, `SubARunExtPtr`,
+`SubBRunExtPtr`, `PriABase`, `PriBBase`), and exposes
+`offset_in_record()` (`+0x00, 0x04, …, 0x20` per spec/15 §1) plus a
+uniform `size_in_bytes()` (every slot is `u32`). Two new const-fn
+accessors on `GFamily` thread these through the family's own base
+offset: `field_offset(field)` returns the descriptor-relative offset
+(family-invariant per spec/15 §1) and `field_state_struct_offset(field)`
+returns the absolute state-struct offset (`descriptor_base_offset()
++ field.offset_in_record()`). Two new module-level constants —
+[`crate::g_family::DESCRIPTOR_RECORD_BYTES`] (`0x24`) and
+[`crate::g_family::DESCRIPTOR_CLUSTER_END_OFFSET`] (`0xab0`) —
+document the per-record size and the `[+0x9d8, +0xab0)` G0..G5
+cluster span per spec/14 §1. Eight new lib tests pin the field-offset
+schema against spec/15 §1 (`descriptor_field_offsets_match_spec_15_record_schema`,
+`descriptor_field_all_lists_every_field_in_record_order`,
+`descriptor_field_offset_delegates_to_field`,
+`descriptor_field_state_struct_offsets_match_spec_15_disassembly`
+[exact `count_A` / `count_B` storage VMAs for all six families per
+spec/15 §2.1's literal-immediate disassembly:
+G0=`+0x9dc,+0x9e0`, G1=`+0xa00,+0xa04`, G2=`+0xa24,+0xa28`,
+G3=`+0xa48,+0xa4c`, G4=`+0xa6c,+0xa70`, G5=`+0xa90,+0xa94`],
+`descriptor_field_state_struct_offset_decomposes`,
+`descriptor_record_size_and_cluster_end_match_spec_14`,
+`descriptor_fields_stay_inside_record_and_cluster`,
+`count_storage_offsets_consistent_with_count_values`). Lib tests
+370 → 378 (+8); integration tests unchanged. Purely additive; no
+runtime path is rewired and no new tables are introduced. The
+schema-mirror surface is intended as a docs-level binding (the
+decoder does not lay out a literal in-memory `GDescriptor` struct
+today, it stores the runtime equivalents on Rust-side enum variants)
+so that any future Auditor-style reconciliation between the binary's
+constructor stores and the in-tree decoder's state has a single
+canonical reference: `GFamily::field_state_struct_offset(field)`
+must equal the VMA the constructor disassembly cites for that
+`(family, field)` pair.
 
 ## License
 

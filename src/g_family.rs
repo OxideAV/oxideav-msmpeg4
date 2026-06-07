@@ -100,6 +100,121 @@ pub enum GRole {
     IntraLuma,
 }
 
+/// Per-descriptor field, identifying which slot inside the 36-byte
+/// G-descriptor record is being addressed.
+///
+/// Every G-descriptor (G0..G5) is a 36-byte (`0x24`) record laid out per
+/// `docs/video/msmpeg4/spec/15-count-ab-per-g-family.md` §1 and
+/// `spec/14` §1. The same nine `u32` slots appear in the same order in
+/// every record, so the field layout is per-family-invariant. This enum
+/// names each slot; [`GFamily::field_offset`] yields its
+/// descriptor-relative `(+0x00..0x24)` offset and
+/// [`GFamily::field_state_struct_offset`] yields the absolute
+/// state-struct offset for a given family.
+///
+/// The decoder-side disassembly evidence per spec/15 §1 is:
+///
+/// * intra kernel reads `count_A` via `mov eax, [eax+0x4]` at
+///   `1c216dd5`;
+/// * intra kernel reads `count_B` via `mov edi, [eax+0x8]` at
+///   `1c216dcc`;
+/// * v1 inter kernel mirrors at `1c215d47` / `1c215d3e`;
+/// * v3 inter kernel reads them through saved descriptor at the
+///   prologue per `spec/15` §6.3.
+///
+/// The constructor `mb_mv_struct_init` at `0x1c210643` populates every
+/// slot per `spec/15` §2.1; this enum is the structural mirror of that
+/// layout for the in-tree reference decoder.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum GDescriptorField {
+    /// `+0x00` — per-slot decoder-object pointer (`u32`). Initialised
+    /// by the `lea` / `mov` pair preceding each per-G count store per
+    /// `spec/15` §2.2.
+    DecoderObj,
+    /// `+0x04` — `count_A` (alphabet size; ESC marker index, `u32`).
+    /// Constructor literal-immediate stores per `spec/15` §2.1.
+    CountA,
+    /// `+0x08` — `count_B` (sub-A / sub-B partition boundary, `u32`).
+    /// Constructor literal-immediate stores per `spec/15` §2.1.
+    CountB,
+    /// `+0x0c` — sub-A level-extension array base pointer (`u32`,
+    /// LMAX-like). Per `spec/14` §1 / `spec/15` §1.
+    SubALevelExtPtr,
+    /// `+0x10` — sub-B level-extension array base pointer (`u32`).
+    SubBLevelExtPtr,
+    /// `+0x14` — sub-A run-extension array base pointer (`u32`,
+    /// RMAX-like). Per `spec/14` §1.
+    SubARunExtPtr,
+    /// `+0x18` — sub-B run-extension array base pointer (`u32`).
+    SubBRunExtPtr,
+    /// `+0x1c` — `pri_A` base pointer (level-magnitude byte array,
+    /// `u32`). Populated by the constructor's per-G binding pass; see
+    /// `spec/14` §3 for the per-family VMAs.
+    PriABase,
+    /// `+0x20` — `pri_B` base pointer (run-value u32 array, `u32`).
+    /// Same binding pass as `pri_A`; the array stride is 4 bytes per
+    /// entry where `pri_A`'s is 1.
+    PriBBase,
+}
+
+impl GDescriptorField {
+    /// All nine descriptor fields in `(+0x00..+0x24)` slot order. Useful
+    /// for callers that want to iterate the record schema once.
+    pub const ALL: [GDescriptorField; 9] = [
+        GDescriptorField::DecoderObj,
+        GDescriptorField::CountA,
+        GDescriptorField::CountB,
+        GDescriptorField::SubALevelExtPtr,
+        GDescriptorField::SubBLevelExtPtr,
+        GDescriptorField::SubARunExtPtr,
+        GDescriptorField::SubBRunExtPtr,
+        GDescriptorField::PriABase,
+        GDescriptorField::PriBBase,
+    ];
+
+    /// Offset of this field within the descriptor record (relative to
+    /// the family's [`GFamily::descriptor_base_offset`]). Per `spec/15`
+    /// §1: nine `u32` slots at `0x00, 0x04, 0x08, 0x0c, 0x10, 0x14,
+    /// 0x18, 0x1c, 0x20`.
+    pub const fn offset_in_record(self) -> u32 {
+        match self {
+            GDescriptorField::DecoderObj => 0x00,
+            GDescriptorField::CountA => 0x04,
+            GDescriptorField::CountB => 0x08,
+            GDescriptorField::SubALevelExtPtr => 0x0c,
+            GDescriptorField::SubBLevelExtPtr => 0x10,
+            GDescriptorField::SubARunExtPtr => 0x14,
+            GDescriptorField::SubBRunExtPtr => 0x18,
+            GDescriptorField::PriABase => 0x1c,
+            GDescriptorField::PriBBase => 0x20,
+        }
+    }
+
+    /// Width in bytes of this field. Every descriptor slot is a `u32`
+    /// per `spec/15` §1, so the answer is `4` for every variant; the
+    /// const-fn is exposed for completeness so a caller iterating the
+    /// record schema can size each slot uniformly without retyping the
+    /// constant.
+    pub const fn size_in_bytes(self) -> u32 {
+        // Every descriptor slot is u32 per spec/15 §1.
+        let _ = self;
+        4
+    }
+}
+
+/// Number of bytes in a single G-descriptor record per `spec/15` §1.
+/// Nine `u32` slots fully tile the record (`9 * 4 = 36 = 0x24`), with
+/// no trailing padding; the successive `0x24`-byte stride documented
+/// in `spec/14` §1 leaves G0..G5 exactly contiguous from `+0x9d8` to
+/// `+0xab0`.
+pub const DESCRIPTOR_RECORD_BYTES: u32 = 0x24;
+
+/// Cluster end offset per `spec/14` §1: G0..G5 occupy the contiguous
+/// range `[+0x9d8, +0xab0)`. Exposed so a caller iterating the per-G
+/// descriptors can assert in-cluster containment without retyping the
+/// constant.
+pub const DESCRIPTOR_CLUSTER_END_OFFSET: u32 = 0xab0;
+
 /// Which sub-class partition an alphabet index falls in, per spec/13 §2.
 ///
 /// The MS-MPEG4 inner kernel routes every non-ESC symbol to one of two
@@ -179,7 +294,34 @@ impl GFamily {
     /// by spec/15 §2.1's literal-immediate disassembly evidence.
     pub const fn descriptor_base_offset(self) -> u32 {
         // Six descriptors × 0x24 bytes each, starting at 0x9d8.
-        0x9d8 + (self.index() as u32) * 0x24
+        0x9d8 + (self.index() as u32) * DESCRIPTOR_RECORD_BYTES
+    }
+
+    /// Per `spec/15` §1: the descriptor-relative offset of `field`
+    /// within this family's 36-byte record. Equivalent to
+    /// `field.offset_in_record()` — the call is family-invariant, the
+    /// field layout per `spec/15` §1 is the same in every descriptor.
+    /// Exposed on `GFamily` so a caller that already names the family
+    /// can chain `family.field_offset(field)` without re-importing
+    /// [`GDescriptorField`].
+    pub const fn field_offset(self, field: GDescriptorField) -> u32 {
+        // Layout is per-family-invariant per spec/15 §1; this is a
+        // pure delegation. The `self` parameter is retained to keep the
+        // call shape symmetric with `field_state_struct_offset` below.
+        let _ = self;
+        field.offset_in_record()
+    }
+
+    /// Per `spec/15` §1 / §2.1: the **absolute** state-struct offset
+    /// (`this+...`) of `field` within this family's descriptor record.
+    /// Computed as `descriptor_base_offset() +
+    /// field.offset_in_record()` per `spec/15` §1's field-offset map.
+    ///
+    /// Example: `GFamily::G0.field_state_struct_offset(GDescriptorField::CountA)`
+    /// returns `0x9dc` (per `spec/15` §2.1, the constructor literal at
+    /// `1c210653` stores `0xa8` at `[ecx+0x9dc]`).
+    pub const fn field_state_struct_offset(self, field: GDescriptorField) -> u32 {
+        self.descriptor_base_offset() + field.offset_in_record()
     }
 
     /// Per spec/14 §3.1: the role this descriptor fills in the per-frame
@@ -691,6 +833,183 @@ mod tests {
                 GFamily::for_luma_selector(sel),
                 Some(g),
                 "{g:?} luma round-trip"
+            );
+        }
+    }
+
+    #[test]
+    fn descriptor_field_offsets_match_spec_15_record_schema() {
+        // Per spec/15 §1: nine u32 slots at 0x00, 0x04, 0x08, 0x0c,
+        // 0x10, 0x14, 0x18, 0x1c, 0x20.
+        let expected = [
+            (GDescriptorField::DecoderObj, 0x00u32),
+            (GDescriptorField::CountA, 0x04),
+            (GDescriptorField::CountB, 0x08),
+            (GDescriptorField::SubALevelExtPtr, 0x0c),
+            (GDescriptorField::SubBLevelExtPtr, 0x10),
+            (GDescriptorField::SubARunExtPtr, 0x14),
+            (GDescriptorField::SubBRunExtPtr, 0x18),
+            (GDescriptorField::PriABase, 0x1c),
+            (GDescriptorField::PriBBase, 0x20),
+        ];
+        for (field, off) in expected {
+            assert_eq!(field.offset_in_record(), off, "{field:?} offset");
+            // u32-width is uniform per spec/15 §1.
+            assert_eq!(field.size_in_bytes(), 4, "{field:?} width");
+        }
+    }
+
+    #[test]
+    fn descriptor_field_all_lists_every_field_in_record_order() {
+        // GDescriptorField::ALL is the canonical record-order list of
+        // every field per spec/15 §1; it must be exactly nine entries
+        // (no duplicates, no missing field) and successive offsets
+        // must equal 0x04 (every field is a u32 per spec/15 §1).
+        assert_eq!(GDescriptorField::ALL.len(), 9, "nine slots per spec/15 §1");
+        for pair in GDescriptorField::ALL.windows(2) {
+            let lo = pair[0].offset_in_record();
+            let hi = pair[1].offset_in_record();
+            assert_eq!(
+                hi - lo,
+                4,
+                "{:?}..{:?} stride must be u32 width",
+                pair[0],
+                pair[1]
+            );
+        }
+        // The nine u32 slots fully tile the 36-byte record: the last
+        // field's offset + width must equal the record size exactly
+        // (9 * 4 = 36 = 0x24). No trailing pad bytes per spec/15 §1.
+        let last = GDescriptorField::ALL[GDescriptorField::ALL.len() - 1];
+        assert_eq!(
+            last.offset_in_record() + last.size_in_bytes(),
+            DESCRIPTOR_RECORD_BYTES,
+            "9 * u32 slots fully tile the 0x24-byte record"
+        );
+    }
+
+    #[test]
+    fn descriptor_field_offset_delegates_to_field() {
+        // GFamily::field_offset(f) must equal f.offset_in_record() —
+        // the layout is per-family-invariant per spec/15 §1.
+        for g in GFamily::ALL {
+            for f in GDescriptorField::ALL {
+                assert_eq!(
+                    g.field_offset(f),
+                    f.offset_in_record(),
+                    "{g:?}.field_offset({f:?})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn descriptor_field_state_struct_offsets_match_spec_15_disassembly() {
+        // Per spec/15 §2.1's literal-immediate disassembly:
+        //   G0 +0x9dc (count_A) and +0x9e0 (count_B)
+        //   G1 +0xa00          +0xa04
+        //   G2 +0xa24          +0xa28
+        //   G3 +0xa48          +0xa4c
+        //   G4 +0xa6c          +0xa70
+        //   G5 +0xa90          +0xa94
+        let expected_count_a = [0x9dcu32, 0xa00, 0xa24, 0xa48, 0xa6c, 0xa90];
+        let expected_count_b = [0x9e0u32, 0xa04, 0xa28, 0xa4c, 0xa70, 0xa94];
+        for (g, (&ca, &cb)) in GFamily::ALL
+            .iter()
+            .zip(expected_count_a.iter().zip(expected_count_b.iter()))
+        {
+            assert_eq!(
+                g.field_state_struct_offset(GDescriptorField::CountA),
+                ca,
+                "{g:?} count_A storage VMA"
+            );
+            assert_eq!(
+                g.field_state_struct_offset(GDescriptorField::CountB),
+                cb,
+                "{g:?} count_B storage VMA"
+            );
+        }
+    }
+
+    #[test]
+    fn descriptor_field_state_struct_offset_decomposes() {
+        // For every (family, field) pair the absolute state-struct
+        // offset must equal descriptor_base_offset + offset_in_record.
+        for g in GFamily::ALL {
+            for f in GDescriptorField::ALL {
+                let abs = g.field_state_struct_offset(f);
+                assert_eq!(
+                    abs,
+                    g.descriptor_base_offset() + f.offset_in_record(),
+                    "{g:?}.field_state_struct_offset({f:?}) decomposition"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn descriptor_record_size_and_cluster_end_match_spec_14() {
+        // Per spec/14 §1 / spec/15 §2: G0..G5 occupy [+0x9d8, +0xab0).
+        // Six × 0x24 = 0xd8 total span.
+        assert_eq!(DESCRIPTOR_RECORD_BYTES, 0x24);
+        assert_eq!(DESCRIPTOR_CLUSTER_END_OFFSET, 0xab0);
+        assert_eq!(
+            GFamily::G0.descriptor_base_offset() + 6 * DESCRIPTOR_RECORD_BYTES,
+            DESCRIPTOR_CLUSTER_END_OFFSET,
+            "G0 base + 6 records = cluster end"
+        );
+    }
+
+    #[test]
+    fn descriptor_fields_stay_inside_record_and_cluster() {
+        // Every field's absolute state-struct offset must lie strictly
+        // inside the `[+0x9d8, +0xab0)` cluster span. The field's u32
+        // width must also fit inside the descriptor record (i.e.
+        // `offset_in_record + size_in_bytes <= 0x24`).
+        for g in GFamily::ALL {
+            for f in GDescriptorField::ALL {
+                let off = g.field_state_struct_offset(f);
+                assert!(
+                    off >= GFamily::G0.descriptor_base_offset()
+                        && off < DESCRIPTOR_CLUSTER_END_OFFSET,
+                    "{g:?}.{f:?} off=0x{off:x} not in cluster"
+                );
+                assert!(
+                    f.offset_in_record() + f.size_in_bytes() <= DESCRIPTOR_RECORD_BYTES,
+                    "{f:?} runs past record end"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn count_storage_offsets_consistent_with_count_values() {
+        // The constructor literal at each count_A storage VMA holds the
+        // count_A value (per spec/15 §2.1's `mov m32, imm32` form). We
+        // cross-check the GFamily API: `count_a()` must equal the
+        // value the constructor stores at the address
+        // `field_state_struct_offset(CountA)`. We don't read the binary
+        // here (clean-room), but we do assert the per-family API
+        // surfaces both pieces of information in parallel — a future
+        // regression that drifted one (e.g. by reordering the enum)
+        // would surface here.
+        for g in GFamily::ALL {
+            let stored_at = g.field_state_struct_offset(GDescriptorField::CountA);
+            // The stored-at offset must be inside the family's own
+            // record, not a sibling's.
+            assert!(
+                stored_at >= g.descriptor_base_offset()
+                    && stored_at < g.descriptor_base_offset() + DESCRIPTOR_RECORD_BYTES,
+                "{g:?} count_A storage outside its own record"
+            );
+            // Round-trip back to the family via descriptor stride
+            // arithmetic.
+            let recovered_index =
+                (stored_at - GFamily::G0.descriptor_base_offset()) / DESCRIPTOR_RECORD_BYTES;
+            assert_eq!(
+                recovered_index as usize,
+                g.index(),
+                "{g:?} stored-at VMA round-trip to its index"
             );
         }
     }

@@ -9,6 +9,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 254 — Per-descriptor field-offset accessor surface on
+  `g_family::GFamily`** (2026-06-08): mirrors the 36-byte G-descriptor
+  record schema documented in `docs/video/msmpeg4/spec/15-count-ab-per-g-family.md`
+  §1 onto the in-tree dispatch enum. The new
+  `g_family::GDescriptorField` enum names all nine `u32` slots
+  (`DecoderObj` at `+0x00`, `CountA` at `+0x04`, `CountB` at
+  `+0x08`, `SubALevelExtPtr` at `+0x0c`, `SubBLevelExtPtr` at
+  `+0x10`, `SubARunExtPtr` at `+0x14`, `SubBRunExtPtr` at `+0x18`,
+  `PriABase` at `+0x1c`, `PriBBase` at `+0x20`) and exposes
+  `offset_in_record()` / `size_in_bytes()`. Two new const-fn
+  accessors on `GFamily` — `field_offset(field)` and
+  `field_state_struct_offset(field)` — combine the family's
+  descriptor base with the field's record-relative offset, yielding
+  the absolute state-struct VMA the constructor's literal-immediate
+  stores at `1c210643..1c2108d0` write into (per spec/15 §2.1). Two
+  new module-level constants `DESCRIPTOR_RECORD_BYTES` (`0x24`) and
+  `DESCRIPTOR_CLUSTER_END_OFFSET` (`0xab0`) document the per-record
+  size and the G0..G5 cluster span per spec/14 §1. Eight new lib
+  tests in `src/g_family.rs::tests`
+  (`descriptor_field_offsets_match_spec_15_record_schema`,
+  `descriptor_field_all_lists_every_field_in_record_order`,
+  `descriptor_field_offset_delegates_to_field`,
+  `descriptor_field_state_struct_offsets_match_spec_15_disassembly`,
+  `descriptor_field_state_struct_offset_decomposes`,
+  `descriptor_record_size_and_cluster_end_match_spec_14`,
+  `descriptor_fields_stay_inside_record_and_cluster`,
+  `count_storage_offsets_consistent_with_count_values`) pin the
+  record-schema against spec/15 §1 / §2.1: in particular, the per-G
+  `count_A` / `count_B` storage VMAs match the constructor literals
+  cited for every family (G0=`+0x9dc,+0x9e0`, G1=`+0xa00,+0xa04`,
+  G2=`+0xa24,+0xa28`, G3=`+0xa48,+0xa4c`, G4=`+0xa6c,+0xa70`,
+  G5=`+0xa90,+0xa94`). Lib tests 370 → 378 (+8); integration tests
+  unchanged. Purely additive; no runtime path is rewired and no new
+  tables are introduced.
+
 - **Round 251 — Alternate-variant v3 MVDx / MVDy byte LUTs**
   (2026-06-07): wires the spec/06 §2.2 alternate-variant byte LUTs
   for the v3 joint MV decoder (`mv_table_sel == 1` path) at VMAs
