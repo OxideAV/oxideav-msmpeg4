@@ -1196,6 +1196,75 @@ impl MvGrid {
         self.cells[mb_y * self.width + mb_x] = cell;
     }
 
+    /// Reset the cell at `(mb_x, mb_y)` to [`MvGridCell::Absent`].
+    ///
+    /// Convenience shortcut for
+    /// `set_cell(mb_x, mb_y, MvGridCell::Absent)` that names the
+    /// boundary-resync intent: per
+    /// `docs/video/mpeg4-visual/figure-7-34-mv-predictor-layout.md` §
+    /// "Boundary substitution", a neighbouring macroblock that lies
+    /// outside the current video packet (when the stream uses
+    /// data-partitioned resync markers) or outside the current GOB
+    /// (when `short_video_header == '1'`) is treated as **transparent**
+    /// by §7.6.5, i.e. its candidate is reported as `Absent` and the
+    /// substitution rules apply. Out-of-bounds positions are a no-op,
+    /// mirroring [`MvGrid::set_cell`].
+    pub fn clear_cell(&mut self, mb_x: usize, mb_y: usize) {
+        self.set_cell(mb_x, mb_y, MvGridCell::Absent);
+    }
+
+    /// Reset every cell in row `mb_y` to [`MvGridCell::Absent`].
+    ///
+    /// Bulk shortcut for the common boundary-resync case where an
+    /// entire MB row sits on the far side of a video-packet boundary:
+    /// per `docs/video/mpeg4-visual/figure-7-34-mv-predictor-layout.md`
+    /// §"Boundary substitution" the row's macroblocks are treated as
+    /// transparent for the current row's predictor lookup, so the
+    /// caller writes `Absent` into every column of that row before
+    /// consulting [`MvGrid::neighbour_set_for`]. Out-of-bounds rows
+    /// (`mb_y >= self.height`) are a no-op.
+    pub fn clear_row(&mut self, mb_y: usize) {
+        if mb_y >= self.height {
+            return;
+        }
+        let start = mb_y * self.width;
+        let end = start + self.width;
+        for cell in &mut self.cells[start..end] {
+            *cell = MvGridCell::Absent;
+        }
+    }
+
+    /// Reset every cell in the grid to [`MvGridCell::Absent`] without
+    /// re-allocating.
+    ///
+    /// Equivalent to `*self = MvGrid::new(self.width(), self.height())`
+    /// in observable effect, but holds onto the existing backing
+    /// allocation. Useful at picture-start when a P-decoder reuses the
+    /// same grid across frames: the post-clear state matches the
+    /// `MvGrid::new`-fresh state, so [`MvGrid::neighbour_set_for`]
+    /// reports `NeighbourSet::ABSENT` for every position until the
+    /// caller starts writing per-MB cells back in.
+    pub fn clear_all(&mut self) {
+        for cell in &mut self.cells {
+            *cell = MvGridCell::Absent;
+        }
+    }
+
+    /// Raster-order iterator over `(mb_x, mb_y, MvGridCell)` triples.
+    ///
+    /// Walks the grid in the same raster order
+    /// (`for mb_y in 0..h { for mb_x in 0..w { ... } }`) that a P-VOP
+    /// macroblock loop writes cells in, so a diagnostic / regression
+    /// caller can pair its expected per-MB cell list against the grid
+    /// contents without re-deriving the raster index manually.
+    pub fn iter_cells(&self) -> impl Iterator<Item = (usize, usize, MvGridCell)> + '_ {
+        let width = self.width;
+        self.cells
+            .iter()
+            .enumerate()
+            .map(move |(idx, cell)| (idx % width, idx / width, *cell))
+    }
+
     /// Build the [`NeighbourSet`] for the current MB at `(mb_x, mb_y)`
     /// from the grid's already-decoded cells.
     ///
@@ -2997,5 +3066,259 @@ mod tests {
         let grid = MvGrid::new(3, 2);
         let (w, h) = grid.dimensions();
         assert_eq!((w, h), (3, 2));
+    }
+
+    // ----------------------------------------------------------------
+    // Round 246 — MvGrid video-packet / GOB boundary-reset helpers +
+    // raster-order iter_cells. Surface added to close the documented
+    // gap in MvGrid's "Boundary handling" section that video-packet /
+    // GOB boundary substitution must be applied by the caller writing
+    // Absent into the grid positions on the far side of the boundary.
+    // ----------------------------------------------------------------
+
+    /// [`MvGrid::clear_cell`] resets a single position to
+    /// [`MvGridCell::Absent`] — the boundary-resync primitive. Verifies
+    /// agreement with `set_cell(.., MvGridCell::Absent)`, that other
+    /// positions in the same row are unaffected, and that clearing a
+    /// cell of any of the three variants reaches the `Absent` state.
+    #[test]
+    fn round_246_mv_grid_clear_cell_resets_one_position_to_absent() {
+        let mv = Mv { x: 3, y: -1 };
+        let mvs = [Mv::default(); 4];
+        for initial in [
+            MvGridCell::Absent,
+            MvGridCell::OneMv(mv),
+            MvGridCell::FourMv(mvs),
+        ] {
+            let mut grid = MvGrid::new(3, 3);
+            grid.set_cell(1, 1, initial);
+            grid.set_cell(0, 1, MvGridCell::OneMv(mv));
+            grid.set_cell(2, 1, MvGridCell::OneMv(mv));
+            grid.clear_cell(1, 1);
+            // Target cell is now Absent regardless of starting variant.
+            assert_eq!(grid.cell_at(1, 1), MvGridCell::Absent);
+            // Same-row siblings untouched.
+            assert_eq!(grid.cell_at(0, 1), MvGridCell::OneMv(mv));
+            assert_eq!(grid.cell_at(2, 1), MvGridCell::OneMv(mv));
+        }
+    }
+
+    /// [`MvGrid::clear_cell`] agrees in observable effect with
+    /// `set_cell(mb_x, mb_y, MvGridCell::Absent)`.
+    #[test]
+    fn round_246_mv_grid_clear_cell_matches_set_cell_absent() {
+        let mv = Mv { x: 5, y: -2 };
+        let mut via_clear = MvGrid::new(2, 2);
+        let mut via_set = MvGrid::new(2, 2);
+        via_clear.set_cell(0, 0, MvGridCell::OneMv(mv));
+        via_set.set_cell(0, 0, MvGridCell::OneMv(mv));
+        via_clear.clear_cell(0, 0);
+        via_set.set_cell(0, 0, MvGridCell::Absent);
+        assert_eq!(via_clear, via_set);
+    }
+
+    /// [`MvGrid::clear_cell`] is a no-op for out-of-bounds positions —
+    /// matches [`MvGrid::set_cell`]'s OOB silence.
+    #[test]
+    fn round_246_mv_grid_clear_cell_oob_is_noop() {
+        let mv = Mv { x: 7, y: 4 };
+        let mut grid = MvGrid::new(2, 2);
+        for (x, y) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+            grid.set_cell(x, y, MvGridCell::OneMv(mv));
+        }
+        // Each of these is OOB on a 2x2 grid — must not alter cells.
+        grid.clear_cell(2, 0);
+        grid.clear_cell(0, 2);
+        grid.clear_cell(2, 2);
+        grid.clear_cell(99, 99);
+        for (x, y) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+            assert_eq!(grid.cell_at(x, y), MvGridCell::OneMv(mv));
+        }
+    }
+
+    /// [`MvGrid::clear_row`] resets every column of one row to
+    /// [`MvGridCell::Absent`] and leaves the other rows untouched.
+    #[test]
+    fn round_246_mv_grid_clear_row_resets_one_row_only() {
+        let mv = Mv { x: 1, y: 2 };
+        let mvs = [Mv { x: 1, y: 0 }; 4];
+        let mut grid = MvGrid::new(4, 3);
+        // Fill every cell with a non-Absent variant; row 1 mixes the
+        // two non-Absent shapes so the test pins both being reset.
+        for x in 0..4 {
+            grid.set_cell(x, 0, MvGridCell::OneMv(mv));
+            grid.set_cell(
+                x,
+                1,
+                if x % 2 == 0 {
+                    MvGridCell::OneMv(mv)
+                } else {
+                    MvGridCell::FourMv(mvs)
+                },
+            );
+            grid.set_cell(x, 2, MvGridCell::FourMv(mvs));
+        }
+        grid.clear_row(1);
+        for x in 0..4 {
+            assert_eq!(grid.cell_at(x, 0), MvGridCell::OneMv(mv));
+            assert_eq!(grid.cell_at(x, 1), MvGridCell::Absent);
+            assert_eq!(grid.cell_at(x, 2), MvGridCell::FourMv(mvs));
+        }
+    }
+
+    /// [`MvGrid::clear_row`] is a no-op for out-of-bounds rows.
+    #[test]
+    fn round_246_mv_grid_clear_row_oob_is_noop() {
+        let mv = Mv { x: 9, y: -3 };
+        let mut grid = MvGrid::new(3, 2);
+        for y in 0..2 {
+            for x in 0..3 {
+                grid.set_cell(x, y, MvGridCell::OneMv(mv));
+            }
+        }
+        // Row 2 is past the picture; row 99 even more so. Neither must
+        // touch the populated rows.
+        grid.clear_row(2);
+        grid.clear_row(99);
+        for y in 0..2 {
+            for x in 0..3 {
+                assert_eq!(grid.cell_at(x, y), MvGridCell::OneMv(mv));
+            }
+        }
+    }
+
+    /// [`MvGrid::clear_all`] resets every cell to
+    /// [`MvGridCell::Absent`] — observable effect matches replacing the
+    /// grid with a fresh [`MvGrid::new(width, height)`].
+    #[test]
+    fn round_246_mv_grid_clear_all_matches_fresh_new() {
+        let mv = Mv { x: -4, y: 6 };
+        let mut populated = MvGrid::new(3, 4);
+        for y in 0..4 {
+            for x in 0..3 {
+                populated.set_cell(x, y, MvGridCell::OneMv(mv));
+            }
+        }
+        populated.clear_all();
+        let fresh = MvGrid::new(3, 4);
+        assert_eq!(populated, fresh);
+        // Spot-check: every position reports Absent.
+        for y in 0..4 {
+            for x in 0..3 {
+                assert_eq!(populated.cell_at(x, y), MvGridCell::Absent);
+            }
+        }
+    }
+
+    /// [`MvGrid::clear_all`] preserves the grid dimensions — only the
+    /// per-cell payloads reset.
+    #[test]
+    fn round_246_mv_grid_clear_all_preserves_dimensions() {
+        let mut grid = MvGrid::new(5, 7);
+        grid.set_cell(2, 3, MvGridCell::OneMv(Mv { x: 1, y: 1 }));
+        grid.clear_all();
+        assert_eq!(grid.dimensions(), (5, 7));
+        assert_eq!(grid.width(), 5);
+        assert_eq!(grid.height(), 7);
+    }
+
+    /// [`MvGrid::iter_cells`] walks in raster order
+    /// (`for mb_y in 0..h { for mb_x in 0..w { ... } }`) and yields
+    /// `width * height` triples. Each triple's `(mb_x, mb_y)` round-
+    /// trips through [`MvGrid::cell_at`] for the same cell value.
+    #[test]
+    fn round_246_mv_grid_iter_cells_walks_raster_order() {
+        let mv = Mv { x: 2, y: -1 };
+        let mut grid = MvGrid::new(3, 2);
+        grid.set_cell(0, 0, MvGridCell::OneMv(mv));
+        grid.set_cell(2, 1, MvGridCell::FourMv([Mv::default(); 4]));
+        let collected: Vec<(usize, usize, MvGridCell)> = grid.iter_cells().collect();
+        // Width 3 × height 2 = 6 entries.
+        assert_eq!(collected.len(), 6);
+        // Expected raster order: (0,0), (1,0), (2,0), (0,1), (1,1), (2,1).
+        let expected_positions = [(0, 0), (1, 0), (2, 0), (0, 1), (1, 1), (2, 1)];
+        for (i, (mb_x, mb_y, _)) in collected.iter().enumerate() {
+            assert_eq!((*mb_x, *mb_y), expected_positions[i]);
+        }
+        // Cells round-trip with cell_at.
+        for (mb_x, mb_y, cell) in &collected {
+            assert_eq!(grid.cell_at(*mb_x, *mb_y), *cell);
+        }
+        // Spot-check the non-Absent positions surface their stored
+        // payloads.
+        assert_eq!(collected[0].2, MvGridCell::OneMv(mv));
+        assert_eq!(collected[5].2, MvGridCell::FourMv([Mv::default(); 4]));
+    }
+
+    /// [`MvGrid::iter_cells`] over a fresh [`MvGrid::new`] yields all
+    /// [`MvGridCell::Absent`] cells.
+    #[test]
+    fn round_246_mv_grid_iter_cells_fresh_grid_is_all_absent() {
+        let grid = MvGrid::new(4, 3);
+        for (_, _, cell) in grid.iter_cells() {
+            assert_eq!(cell, MvGridCell::Absent);
+        }
+        assert_eq!(grid.iter_cells().count(), 12);
+    }
+
+    /// [`MvGrid::clear_row`] is the bulk equivalent of looping
+    /// [`MvGrid::clear_cell`] across every column of the same row.
+    #[test]
+    fn round_246_mv_grid_clear_row_matches_per_cell_clear_loop() {
+        let mv = Mv { x: 3, y: 3 };
+        let mut via_row = MvGrid::new(5, 4);
+        let mut via_loop = MvGrid::new(5, 4);
+        for grid in [&mut via_row, &mut via_loop] {
+            for y in 0..4 {
+                for x in 0..5 {
+                    grid.set_cell(x, y, MvGridCell::OneMv(mv));
+                }
+            }
+        }
+        via_row.clear_row(2);
+        for x in 0..5 {
+            via_loop.clear_cell(x, 2);
+        }
+        assert_eq!(via_row, via_loop);
+    }
+
+    /// Boundary-resync worked example: a video-packet boundary at MB
+    /// `(2, 1)` per `docs/video/mpeg4-visual/figure-7-34-mv-predictor-
+    /// layout.md` §"Boundary substitution" means the three §7.6.5
+    /// candidate neighbours of MB `(2, 1)` that sit *across* the
+    /// boundary (i.e. the row above, columns 1..3 — `left`, `above`,
+    /// and `above_right`) must be reported `Absent` to the predictor.
+    /// The caller achieves this by `clear_cell`-ing each of those
+    /// three positions before calling
+    /// [`MvGrid::neighbour_set_for(2, 1)`]; the predictor then reports
+    /// every direction `Absent`.
+    #[test]
+    fn round_246_mv_grid_clear_cell_drives_video_packet_boundary_resync() {
+        let mv = Mv { x: 5, y: 5 };
+        let mut grid = MvGrid::new(4, 3);
+        // Pre-resync: every MB in row 0 plus the left-of-current cell
+        // on row 1 is populated as if a prior packet had decoded those
+        // positions. MB (2, 1)'s three §7.6.5 neighbours are at
+        // (1, 1) [left], (2, 0) [above], (3, 0) [above_right].
+        for x in 0..4 {
+            grid.set_cell(x, 0, MvGridCell::OneMv(mv));
+        }
+        grid.set_cell(1, 1, MvGridCell::OneMv(mv));
+        let before = grid.neighbour_set_for(2, 1);
+        assert!(!before.left.is_absent());
+        assert!(!before.above.is_absent());
+        assert!(!before.above_right.is_absent());
+        // Apply the video-packet boundary substitution at MB (2, 1):
+        // the three §7.6.5 candidate-neighbour positions get
+        // `clear_cell`-ed by the caller before the predictor lookup.
+        grid.clear_cell(1, 1);
+        grid.clear_cell(2, 0);
+        grid.clear_cell(3, 0);
+        // Post-resync: predictor sees Absent on all three directions
+        // — §7.6.5 rule 4 fires (all-zero predictor).
+        let after = grid.neighbour_set_for(2, 1);
+        assert!(after.left.is_absent());
+        assert!(after.above.is_absent());
+        assert!(after.above_right.is_absent());
     }
 }

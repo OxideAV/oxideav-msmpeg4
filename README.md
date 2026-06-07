@@ -62,6 +62,7 @@ right decoder when a packet arrives.
 | G0..G3 packed-Huffman primary VLC                | wired (round 234, all 4 sources Kraft=1)     |
 | `decode_pframe` MV cache routed through `MvGrid` | wired (round 240, replaces parallel `Vec<Option<Mv>>`) |
 | Per-MB 4-MV decoder → `MvGridCell` one-shot bridge | `finalise_to_grid_cell` on both 4-MV decoders (round 243) |
+| `MvGrid` video-packet / GOB boundary-reset helpers + raster iter | `clear_cell` / `clear_row` / `clear_all` + `iter_cells` (round 246) |
 
 ### What's still spec-OPEN for real-content decode
 
@@ -484,6 +485,47 @@ analysis is now unblocked: `picture::AcSelection::FromHeader` plus
 `for_luma_selector(0)` dispatches v3 intra-luma blocks through G3's
 133-entry canonical-Huffman walker (instead of the empty placeholder
 the round-7..233 path returned).
+
+Round-246 (2026-06-07) closes the documented gap in
+[`mv_pred::MvGrid`]'s "Boundary handling" section that
+video-packet / GOB boundary substitution per
+`docs/video/mpeg4-visual/figure-7-34-mv-predictor-layout.md` §
+"Boundary substitution" must be applied by the caller writing
+[`MvGridCell::Absent`] into grid positions on the far side of the
+boundary. Four purely-additive helpers on [`mv_pred::MvGrid`]:
+(1) [`mv_pred::MvGrid::clear_cell`] resets one `(mb_x, mb_y)`
+position to [`MvGridCell::Absent`] — the boundary-resync primitive,
+naming the intent and agreeing in observable effect with
+`set_cell(mb_x, mb_y, MvGridCell::Absent)`. (2)
+[`mv_pred::MvGrid::clear_row`] bulk-resets an entire MB row to
+[`MvGridCell::Absent`] for the common video-packet-at-row-start
+case. (3) [`mv_pred::MvGrid::clear_all`] resets every cell in the
+grid to [`MvGridCell::Absent`] without re-allocating the backing
+storage — picture-start reuse without a fresh allocation. (4)
+[`mv_pred::MvGrid::iter_cells`] is a raster-order iterator over
+`(mb_x, mb_y, MvGridCell)` triples (same order as the P-VOP MB
+loop), useful for diagnostic / regression callers that want to
+pair their expected per-MB cell list against the grid contents
+without re-deriving the raster index manually. Eleven new lib
+tests in `src/mv_pred.rs::tests` pin: `clear_cell` sets the target
+position to `Absent` regardless of the starting variant (`Absent`
+/ `OneMv` / `FourMv`) and leaves same-row siblings untouched;
+`clear_cell` matches `set_cell(.., Absent)` and is a no-op on
+out-of-bounds positions; `clear_row` resets every column of one
+row only and is OOB-no-op; `clear_all` matches a fresh
+`MvGrid::new(width, height)` in observable effect and preserves
+dimensions; `iter_cells` walks the documented raster order
+(`(0,0), (1,0), (2,0), (0,1), …`), round-trips its triples through
+`cell_at`, and on a fresh grid yields all `Absent` cells; the
+bulk-vs-per-cell equivalence
+`clear_row(mb_y) == clear_cell(0..width, mb_y)` for every column
+on the cleared row; and a worked boundary-resync example where MB
+`(2, 1)` initially sees three populated neighbours, the caller
+`clear_cell`-s those three positions, and
+[`MvGrid::neighbour_set_for(2, 1)`] then reports every direction
+`Absent` (rule-4 / all-zero predictor). Lib tests 355 → 366 (+11);
+integration tests unchanged. Purely additive; the existing 1-MV
+`picture::decode_pframe_mb` path is unchanged.
 
 Round-243 (2026-06-07) closes the per-MB-decoder → picture-wide-grid
 handoff that round 240 plumbed at the `picture::decode_pframe_mb`
