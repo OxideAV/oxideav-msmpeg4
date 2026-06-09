@@ -32,6 +32,9 @@
 use oxideav_core::bits::BitReader;
 use oxideav_core::{Error, Result};
 
+use crate::g_family::GFamily;
+use crate::mv::MvTable;
+
 /// Coded picture type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PictureType {
@@ -131,6 +134,59 @@ impl MsV3PictureHeader {
             dc_size_sel,
             mv_table_sel,
         })
+    }
+
+    /// Typed dispatch of the parsed `ac_chroma_sel` raw `u8` to the
+    /// chroma+all-inter [`GFamily`] per
+    /// `docs/video/msmpeg4/spec/14-pri-ab-runtime-binding.md` §3.1:
+    /// `0 → G2, 1 → G0, 2 → G4`. Equivalent to
+    /// `GFamily::for_chroma_selector(self.ac_chroma_sel)`; exposed as a
+    /// method on the header so callers that already hold a parsed
+    /// header reach the typed family without re-importing
+    /// [`GFamily`] or restating the per-frame slot identity.
+    ///
+    /// Returns `None` if `ac_chroma_sel` is outside `{0, 1, 2}` — the
+    /// `read_unary_cap2` helper already clamps to that range in
+    /// well-formed streams, so this is a defence-in-depth guard. The
+    /// returned family always has [`crate::g_family::GRole::ChromaAndInter`]
+    /// per spec/14 §3.1.
+    pub const fn ac_chroma_family(&self) -> Option<GFamily> {
+        GFamily::for_chroma_selector(self.ac_chroma_sel)
+    }
+
+    /// Typed dispatch of the parsed `ac_luma_sel` raw `u8` to the
+    /// intra-luma [`GFamily`] per spec/14 §3.1: `0 → G3, 1 → G1, 2 →
+    /// G5`. Equivalent to
+    /// `GFamily::for_luma_selector(self.ac_luma_sel)`.
+    ///
+    /// Returns `None` if `ac_luma_sel` is outside `{0, 1, 2}`. The
+    /// returned family always has [`crate::g_family::GRole::IntraLuma`]
+    /// per spec/14 §3.1.
+    ///
+    /// `ac_luma_sel` is read on I-frames only and persists into
+    /// subsequent P-frames (per spec/99 §2.3, the P-frame body does
+    /// not re-read this bit), so a caller iterating per-frame must
+    /// thread the value forward from the most recent I-frame header.
+    pub const fn ac_luma_family(&self) -> Option<GFamily> {
+        GFamily::for_luma_selector(self.ac_luma_sel)
+    }
+
+    /// Typed dispatch of the parsed `mv_table_sel` raw `u8` to the
+    /// joint-MV VLC [`MvTable`] per spec/06 §3.2:
+    /// `0 → MvTable::Default, 1 → MvTable::Alternate`. Equivalent to
+    /// `MvTable::from_sel(self.mv_table_sel)`.
+    ///
+    /// `mv_table_sel` is P-frame-scoped (read at `1c2120aa` per
+    /// spec/99 §2.3); on I-frames the header carries the parser's
+    /// zero default, so this method returns `Some(MvTable::Default)`
+    /// uniformly on both frame types — the call shape is
+    /// version-and-frame-independent at the call site.
+    ///
+    /// Returns `None` only for `mv_table_sel > 1` (which a well-formed
+    /// stream cannot produce; the `parse()` body reads a single bit
+    /// for the field).
+    pub const fn mv_table(&self) -> Option<MvTable> {
+        MvTable::from_sel(self.mv_table_sel)
     }
 }
 
@@ -255,6 +311,75 @@ pub struct V1V2V3CompatDefaults {
     /// `spec/07` §1.6 "Contrast with v3's patent-7,054,494 spatial-
     /// prediction path … which is absent from v1".
     pub has_spatial_dc_predictor: bool,
+}
+
+impl V1V2V3CompatDefaults {
+    /// Typed dispatch of [`Self::ac_chroma_sel`] to the chroma+all-inter
+    /// [`GFamily`] **via the v3 per-frame selector dispatcher** per
+    /// spec/14 §3.1. Equivalent to
+    /// `GFamily::for_chroma_selector(self.ac_chroma_sel)`.
+    ///
+    /// **Important:** the v1 / v2 paths do **not** read this selector
+    /// (per spec/01 §1.4); their runtime cluster is instead pinned by
+    /// the v1/v2 fallthrough at `0x1c212917` which writes
+    /// `[esi+0xab0] = G4` (per spec/14 §3.1) — i.e. the v1/v2
+    /// chroma+all-inter cluster is [`GFamily::G4`] regardless of any
+    /// per-frame selector value. The actual v1/v2 cluster the decoder
+    /// binds is therefore [`Self::v1_v2_fallthrough_chroma_family`],
+    /// **not** the value returned here. This method exists for the
+    /// narrow case of a caller that shares a v3 entry point with a
+    /// v1/v2 frame and wants the family that the v3 dispatcher would
+    /// pick if fed `self.ac_chroma_sel` — which is **not** the v1/v2
+    /// runtime cluster, since the v3 selector value `0` maps to
+    /// [`GFamily::G2`], not G4.
+    ///
+    /// Returns `None` if `ac_chroma_sel` is outside `{0, 1, 2}`.
+    pub const fn ac_chroma_family(&self) -> Option<GFamily> {
+        GFamily::for_chroma_selector(self.ac_chroma_sel)
+    }
+
+    /// Typed dispatch of [`Self::ac_luma_sel`] to the intra-luma
+    /// [`GFamily`] **via the v3 per-frame selector dispatcher** per
+    /// spec/14 §3.1. Equivalent to
+    /// `GFamily::for_luma_selector(self.ac_luma_sel)`.
+    ///
+    /// **Important:** the v1 / v2 paths do **not** read this selector;
+    /// their actual intra-luma cluster is [`GFamily::G5`], pinned by
+    /// the v1/v2 fallthrough at `0x1c212917` (`[esi+0xab4] = G5` per
+    /// spec/14 §3.1). Use [`Self::v1_v2_fallthrough_luma_family`] for
+    /// the v1/v2 cluster, and this method only when feeding
+    /// `self.ac_luma_sel` to a v3 entry point.
+    pub const fn ac_luma_family(&self) -> Option<GFamily> {
+        GFamily::for_luma_selector(self.ac_luma_sel)
+    }
+
+    /// The chroma+all-inter [`GFamily`] the **v1/v2 runtime** binds at
+    /// the fallthrough write `[esi+0xab0] = G4` (`0x1c212917`), per
+    /// spec/14 §3.1. Always returns [`GFamily::G4`] — both v1 and v2
+    /// paths share this cluster.
+    ///
+    /// This is the spec-correct family for a v1/v2 frame; contrast
+    /// with [`Self::ac_chroma_family`] which exposes the v3
+    /// per-frame-selector dispatch using the (don't-care, but
+    /// constant-pinned-at-0) `ac_chroma_sel` field value.
+    pub const fn v1_v2_fallthrough_chroma_family() -> GFamily {
+        GFamily::G4
+    }
+
+    /// The intra-luma [`GFamily`] the **v1/v2 runtime** binds at the
+    /// fallthrough write `[esi+0xab4] = G5` (`0x1c212917`), per
+    /// spec/14 §3.1. Always returns [`GFamily::G5`].
+    pub const fn v1_v2_fallthrough_luma_family() -> GFamily {
+        GFamily::G5
+    }
+
+    /// Typed dispatch of [`Self::mv_table_sel`] to the joint-MV VLC
+    /// [`MvTable`] per spec/06 §3.2. v1 / v2 default to
+    /// `MvTable::Default` per spec/99 §3.2 (the alternate-VLC slot
+    /// `[esi+0x834]` is v3-only — v1/v2 paths never reach it).
+    pub const fn mv_table(&self) -> Option<MvTable> {
+        MvTable::from_sel(self.mv_table_sel)
+    }
 }
 
 impl MsV1V2PictureHeader {
@@ -732,5 +857,233 @@ mod tests {
         assert_eq!(br.bit_position(), 44);
         let next = br.read_bit().unwrap();
         assert!(next, "I-frame parser must not have consumed the canary bit");
+    }
+
+    // ---------------------------------------------------------------------
+    // Typed-primitive accessors on `MsV3PictureHeader` and
+    // `V1V2V3CompatDefaults` — spec/14 §3.1 (G-family dispatch) +
+    // spec/06 §3.2 (MV-table dispatch). Mirror the raw `u8` selector
+    // fields to the typed `GFamily` / `MvTable` enums via the
+    // pre-existing `for_chroma_selector` / `for_luma_selector` /
+    // `MvTable::from_sel` const-fn dispatchers. Purely additive; raw
+    // `u8` fields stay public so existing callers are unaffected.
+    // ---------------------------------------------------------------------
+
+    use crate::g_family::{GFamily, GRole};
+    use crate::mv::MvTable;
+
+    fn header_with_selectors(chroma: u8, luma: u8, mv_sel: u8) -> MsV3PictureHeader {
+        MsV3PictureHeader {
+            picture_type: PictureType::I,
+            quant: 1,
+            ac_chroma_sel: chroma,
+            ac_luma_sel: luma,
+            dc_size_sel: 0,
+            mv_table_sel: mv_sel,
+        }
+    }
+
+    #[test]
+    fn ms_v3_ac_chroma_family_dispatches_per_spec_14_3_1() {
+        // Per spec/14 §3.1: 0 → G2, 1 → G0, 2 → G4.
+        let expected = [(0u8, GFamily::G2), (1, GFamily::G0), (2, GFamily::G4)];
+        for (sel, fam) in expected {
+            let h = header_with_selectors(sel, 0, 0);
+            assert_eq!(h.ac_chroma_family(), Some(fam), "chroma sel={sel}");
+            // Every chroma family fills the ChromaAndInter role.
+            assert_eq!(fam.role(), GRole::ChromaAndInter);
+        }
+    }
+
+    #[test]
+    fn ms_v3_ac_luma_family_dispatches_per_spec_14_3_1() {
+        // Per spec/14 §3.1: 0 → G3, 1 → G1, 2 → G5.
+        let expected = [(0u8, GFamily::G3), (1, GFamily::G1), (2, GFamily::G5)];
+        for (sel, fam) in expected {
+            let h = header_with_selectors(0, sel, 0);
+            assert_eq!(h.ac_luma_family(), Some(fam), "luma sel={sel}");
+            // Every luma family fills the IntraLuma role.
+            assert_eq!(fam.role(), GRole::IntraLuma);
+        }
+    }
+
+    #[test]
+    fn ms_v3_ac_family_accessors_return_none_for_out_of_range_selectors() {
+        // The read_unary_cap2 helper clamps to {0, 1, 2} in well-formed
+        // streams, but a hand-constructed header can carry any u8.
+        // Defence-in-depth: 3..=255 must return None on both family
+        // accessors.
+        for sel in 3u8..=255 {
+            let h = header_with_selectors(sel, sel, 0);
+            assert_eq!(h.ac_chroma_family(), None, "chroma sel={sel}");
+            assert_eq!(h.ac_luma_family(), None, "luma sel={sel}");
+        }
+    }
+
+    #[test]
+    fn ms_v3_mv_table_dispatches_per_spec_06_3_2() {
+        // Per spec/06 §3.2: 0 → Default, 1 → Alternate.
+        let h0 = header_with_selectors(0, 0, 0);
+        assert_eq!(h0.mv_table(), Some(MvTable::Default));
+        let h1 = header_with_selectors(0, 0, 1);
+        assert_eq!(h1.mv_table(), Some(MvTable::Alternate));
+    }
+
+    #[test]
+    fn ms_v3_mv_table_returns_none_for_out_of_range_selector() {
+        // The parser reads 1 bit so mv_table_sel can only be 0 or 1 in
+        // well-formed streams. Defence-in-depth check for 2..=255.
+        for sel in 2u8..=255 {
+            let h = header_with_selectors(0, 0, sel);
+            assert_eq!(h.mv_table(), None, "mv_table_sel={sel}");
+        }
+    }
+
+    #[test]
+    fn ms_v3_typed_accessors_agree_with_underlying_dispatchers() {
+        // Cross-check: the header's typed accessors must agree with the
+        // standalone `GFamily::for_*_selector` / `MvTable::from_sel`
+        // dispatchers for every input. This pins the delegation contract.
+        for cs in 0u8..=4 {
+            for ls in 0u8..=4 {
+                for ms in 0u8..=3 {
+                    let h = header_with_selectors(cs, ls, ms);
+                    assert_eq!(
+                        h.ac_chroma_family(),
+                        GFamily::for_chroma_selector(cs),
+                        "chroma {cs}"
+                    );
+                    assert_eq!(
+                        h.ac_luma_family(),
+                        GFamily::for_luma_selector(ls),
+                        "luma {ls}"
+                    );
+                    assert_eq!(h.mv_table(), MvTable::from_sel(ms), "mv {ms}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ms_v3_parsed_header_typed_accessors_round_trip() {
+        // End-to-end: parse a v3 P-frame header that sets every
+        // per-frame selector to a non-default value, then resolve via
+        // the typed accessors. The selectors are bit-correct.
+        // picture_type = P, quant = 3, ac_chroma_sel = 1 (G0),
+        // dc_size_sel = 1, mv_table_sel = 1 (Alternate).
+        let bytes = pack(&[
+            (1, 2),    // P
+            (3, 5),    // quant
+            (0b10, 2), // ac_chroma_sel = 1 → G0
+            (1, 1),    // dc_size_sel = 1
+            (1, 1),    // mv_table_sel = 1 → Alternate
+        ]);
+        let mut br = BitReader::new(&bytes);
+        let h = MsV3PictureHeader::parse(&mut br).unwrap();
+        assert_eq!(h.ac_chroma_sel, 1);
+        assert_eq!(h.mv_table_sel, 1);
+        assert_eq!(h.ac_chroma_family(), Some(GFamily::G0));
+        // P-frames don't read ac_luma_sel — the header carries the
+        // parser's zero default, so the typed accessor resolves to
+        // G3 (the luma family for selector 0 per spec/14 §3.1).
+        assert_eq!(h.ac_luma_sel, 0);
+        assert_eq!(h.ac_luma_family(), Some(GFamily::G3));
+        assert_eq!(h.mv_table(), Some(MvTable::Alternate));
+    }
+
+    // ---------------------------------------------------------------------
+    // V1V2V3CompatDefaults typed accessors — both V1_COMPAT_DEFAULTS and
+    // V2_COMPAT_DEFAULTS pin the v3-compat selectors at zero per
+    // spec/99 §5.2 (G4 chroma cluster, G5 luma cluster) and spec/99
+    // §3.2 (Default MV VLC), so the typed accessors must resolve
+    // accordingly.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn v1_v2_fallthrough_chroma_family_is_g4_per_spec_14() {
+        // Per spec/14 §3.1 v1/v2 fallthrough at `0x1c212917`: the
+        // decoder unconditionally writes `[esi+0xab0] = G4` for v1/v2
+        // chroma+all-inter. The associated fn surfaces this fact.
+        assert_eq!(
+            V1V2V3CompatDefaults::v1_v2_fallthrough_chroma_family(),
+            GFamily::G4,
+        );
+        assert_eq!(
+            V1V2V3CompatDefaults::v1_v2_fallthrough_chroma_family().role(),
+            GRole::ChromaAndInter,
+        );
+    }
+
+    #[test]
+    fn v1_v2_fallthrough_luma_family_is_g5_per_spec_14() {
+        // Per spec/14 §3.1 v1/v2 fallthrough: `[esi+0xab4] = G5`.
+        assert_eq!(
+            V1V2V3CompatDefaults::v1_v2_fallthrough_luma_family(),
+            GFamily::G5,
+        );
+        assert_eq!(
+            V1V2V3CompatDefaults::v1_v2_fallthrough_luma_family().role(),
+            GRole::IntraLuma,
+        );
+    }
+
+    #[test]
+    fn compat_defaults_v3_dispatch_does_not_equal_v1_v2_fallthrough() {
+        // The v1/v2 → v3-compat path stuffs `ac_chroma_sel: 0` /
+        // `ac_luma_sel: 0` into the v3 selector slots. The v3
+        // per-frame dispatcher would resolve those to (G2, G3) — but
+        // the actual v1/v2 runtime cluster is (G4, G5) per spec/14
+        // §3.1 fallthrough. The two surfaces deliberately diverge:
+        // ac_*_family is for v3 shared entry points,
+        // v1_v2_fallthrough_*_family is for the real v1/v2 cluster.
+        // This cross-check pins the divergence so a future round can't
+        // accidentally collapse the two surfaces.
+        let v1 = MsV1V2PictureHeader::V1_COMPAT_DEFAULTS;
+        assert_eq!(
+            v1.ac_chroma_family(),
+            Some(GFamily::G2),
+            "v3 dispatch of compat-default ac_chroma_sel=0"
+        );
+        assert_eq!(
+            v1.ac_luma_family(),
+            Some(GFamily::G3),
+            "v3 dispatch of compat-default ac_luma_sel=0"
+        );
+        assert_ne!(
+            v1.ac_chroma_family(),
+            Some(V1V2V3CompatDefaults::v1_v2_fallthrough_chroma_family()),
+            "v3 dispatch of ac_chroma_sel=0 (G2) must not equal v1/v2 fallthrough cluster (G4)"
+        );
+        assert_ne!(
+            v1.ac_luma_family(),
+            Some(V1V2V3CompatDefaults::v1_v2_fallthrough_luma_family()),
+            "v3 dispatch of ac_luma_sel=0 (G3) must not equal v1/v2 fallthrough cluster (G5)"
+        );
+    }
+
+    #[test]
+    fn compat_defaults_mv_table_is_default_per_spec_99_3_2() {
+        // Per spec/99 §3.2 the alternate-VLC slot `[esi+0x834]` is
+        // v3-only; v1/v2 frames never trigger the alternate MV VLC.
+        // Both compat-default constants therefore resolve mv_table to
+        // Default.
+        let v1 = MsV1V2PictureHeader::V1_COMPAT_DEFAULTS;
+        let v2 = MsV1V2PictureHeader::V2_COMPAT_DEFAULTS;
+        assert_eq!(v1.mv_table(), Some(MvTable::Default));
+        assert_eq!(v2.mv_table(), Some(MvTable::Default));
+    }
+
+    #[test]
+    fn compat_defaults_v1_v2_share_chroma_and_luma_fallthrough_clusters() {
+        // Per spec/14 §3.1 the v1/v2 fallthrough is shared between v1
+        // and v2 (same `1c212917` write site), so the per-version
+        // fallthrough-family helpers are constants and identical for
+        // both versions.
+        let v1_chroma = V1V2V3CompatDefaults::v1_v2_fallthrough_chroma_family();
+        let v2_chroma = V1V2V3CompatDefaults::v1_v2_fallthrough_chroma_family();
+        assert_eq!(v1_chroma, v2_chroma);
+        let v1_luma = V1V2V3CompatDefaults::v1_v2_fallthrough_luma_family();
+        let v2_luma = V1V2V3CompatDefaults::v1_v2_fallthrough_luma_family();
+        assert_eq!(v1_luma, v2_luma);
     }
 }

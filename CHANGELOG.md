@@ -9,6 +9,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 266 — Typed-primitive accessor surface on the picture-header
+  parser** (2026-06-09): mirrors the raw `u8` per-frame selector fields
+  on `header::MsV3PictureHeader` (and the compat-default constants on
+  `header::V1V2V3CompatDefaults`) onto the existing typed
+  `g_family::GFamily` / `mv::MvTable` enums via five new const-fn
+  accessors. `mv::MvTable::from_sel(sel: u8) -> Option<Self>` resolves
+  the picture-header `mv_table_sel` bit per
+  `docs/video/msmpeg4/spec/06-mv-decoder.md` §3.2 (`0 → Default,
+  1 → Alternate`); `mv::MvTable::to_sel(self) -> u8` is the inverse.
+  `header::MsV3PictureHeader::ac_chroma_family` /
+  `ac_luma_family` /  `mv_table` delegate to the standalone
+  dispatchers — chroma/luma per spec/14 §3.1 (`chroma: 0→G2, 1→G0,
+  2→G4`; `luma: 0→G3, 1→G1, 2→G5`), MV per spec/06 §3.2 — so a caller
+  holding a parsed header reaches the typed family without
+  re-importing `GFamily` / `MvTable` or restating the per-frame slot
+  identity. Two new associated fns on `V1V2V3CompatDefaults` —
+  `v1_v2_fallthrough_chroma_family` / `v1_v2_fallthrough_luma_family`
+  — surface the spec/14 §3.1 v1/v2 fallthrough cluster the runtime
+  binds at the `0x1c212917` write site (`[esi+0xab0] = G4` chroma,
+  `[esi+0xab4] = G5` luma), independent of the (zero-pinned,
+  don't-care) `ac_chroma_sel` / `ac_luma_sel` compat fields. The
+  `ac_chroma_family` / `ac_luma_family` accessors on the same struct
+  intentionally dispatch through the **v3** selector path
+  (`for_chroma_selector(0) = G2`, `for_luma_selector(0) = G3`) for
+  the niche case of a caller threading a v1/v2 frame through a shared
+  v3 entry point; the two surfaces deliberately diverge and a test
+  (`compat_defaults_v3_dispatch_does_not_equal_v1_v2_fallthrough`)
+  pins the divergence so a future round can't collapse them by
+  accident. Seventeen new lib tests across `src/mv.rs::tests` (5) and
+  `src/header.rs::tests` (12) pin every dispatch arm, the OOR-`None`
+  defence-in-depth path on every accessor, the inverse round-trip
+  for both selectors, the spec/14 §3.1 v1/v2 fallthrough family
+  identities, the spec/06 §3.2 `mv_table_sel` mapping and the
+  end-to-end parse-then-resolve flow through a real bit-packed v3
+  P-frame header with `ac_chroma_sel=1` + `mv_table_sel=1`. Lib
+  tests 378 → 395 (+17); integration tests unchanged. Purely
+  additive; no runtime path is rewired and no new tables are
+  introduced.
+
 - **Round 254 — Per-descriptor field-offset accessor surface on
   `g_family::GFamily`** (2026-06-08): mirrors the 36-byte G-descriptor
   record schema documented in `docs/video/msmpeg4/spec/15-count-ab-per-g-family.md`

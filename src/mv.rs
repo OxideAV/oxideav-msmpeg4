@@ -92,6 +92,54 @@ pub enum MvTable {
     Alternate,
 }
 
+impl MvTable {
+    /// Resolve a picture-header **`mv_table_sel`** bit ∈ {0, 1} to the
+    /// matching [`MvTable`]. Per spec/06 §3.2 and
+    /// `docs/video/msmpeg4/spec/01-bitstream-framing.md` §1.4, the
+    /// v3-only per-frame slot `[esi+0x834]` is a 1-bit selector: `0`
+    /// picks the default joint-MV VLC at VMA `0x1c25cbc0` (paired with
+    /// the byte LUTs at `0x1c25ee28` / `0x1c25f278`), `1` picks the
+    /// alternate variant at VMA `0x1c25a0b8` (paired with `0x1c25c320`
+    /// / `0x1c25c770`).
+    ///
+    /// Returns `None` for any selector value outside `{0, 1}` — the
+    /// picture-header parser ([`crate::header::MsV3PictureHeader::parse`])
+    /// already clamps via a single bit read, so this is a
+    /// defence-in-depth guard rather than a recoverable error path
+    /// (mirrors the shape of [`crate::g_family::GFamily::for_chroma_selector`]
+    /// / [`crate::g_family::GFamily::for_luma_selector`]).
+    ///
+    /// `mv_table_sel` is only meaningfully read on **v3 P-frames** per
+    /// spec/01 §1.4 (`1c2120aa`); v1 / v2 paths never consume the bit
+    /// and downstream code must substitute
+    /// [`MvTable::Default`] (per the v1/v2 → v3-compat default
+    /// `mv_table_sel = 0`, see
+    /// [`crate::header::MsV1V2PictureHeader::V1_COMPAT_DEFAULTS`] /
+    /// [`crate::header::MsV1V2PictureHeader::V2_COMPAT_DEFAULTS`]).
+    /// I-frames also never read this bit (it is P-frame-scoped in
+    /// `MsV3PictureHeader::parse` per spec/99 §2.3) and the picture
+    /// header carries the zero default at `mv_table_sel: 0` so an
+    /// I-frame caller that resolves through this helper picks up
+    /// [`MvTable::Default`] without a version-specific branch.
+    pub const fn from_sel(sel: u8) -> Option<Self> {
+        match sel {
+            0 => Some(MvTable::Default),
+            1 => Some(MvTable::Alternate),
+            _ => None,
+        }
+    }
+
+    /// **Inverse** of [`MvTable::from_sel`]: the picture-header
+    /// `mv_table_sel` bit value that dispatches to this variant. Per
+    /// spec/06 §3.2: `Default → 0, Alternate → 1`.
+    pub const fn to_sel(self) -> u8 {
+        match self {
+            MvTable::Default => 0,
+            MvTable::Alternate => 1,
+        }
+    }
+}
+
 /// Lazy-built canonical-Huffman table for the v3 MV VLC default variant.
 /// 1100 symbols (indices 0..=1099); index 1099 is the ESC sentinel.
 static MV_V3_TABLE: std::sync::OnceLock<Vec<VlcEntry<u16>>> = std::sync::OnceLock::new();
@@ -831,6 +879,68 @@ mod tests {
             br1.bit_position(),
             br2.bit_position(),
             "bit consumption must match"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // MvTable::from_sel / to_sel — typed dispatch of the picture-header
+    // `mv_table_sel` bit per spec/06 §3.2 and spec/01 §1.4. The bit is
+    // P-frame-scoped and v3-only; v1/v2 substitute the Default variant per
+    // the V1/V2 compat-default contract (`MsV1V2PictureHeader::V*_COMPAT_DEFAULTS`).
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn mv_table_from_sel_zero_is_default() {
+        // Per spec/06 §3.2: `mv_table_sel = 0` selects the default joint-MV
+        // VLC at VMA 0x1c25cbc0 (paired with the byte LUTs at 0x1c25ee28 /
+        // 0x1c25f278).
+        assert_eq!(MvTable::from_sel(0), Some(MvTable::Default));
+    }
+
+    #[test]
+    fn mv_table_from_sel_one_is_alternate() {
+        // Per spec/06 §3.2: `mv_table_sel = 1` selects the alternate
+        // variant at VMA 0x1c25a0b8 (paired with 0x1c25c320 / 0x1c25c770).
+        assert_eq!(MvTable::from_sel(1), Some(MvTable::Alternate));
+    }
+
+    #[test]
+    fn mv_table_from_sel_out_of_range_is_none() {
+        // The picture-header parser already clamps via a single bit read,
+        // so values > 1 cannot reach this helper from a well-formed stream
+        // — defence-in-depth check.
+        for sel in 2u8..=255 {
+            assert_eq!(MvTable::from_sel(sel), None, "sel={sel} must be None");
+        }
+    }
+
+    #[test]
+    fn mv_table_to_sel_inverts_from_sel() {
+        // Round-trip: every variant's `to_sel` must route back through
+        // `from_sel` to itself.
+        for variant in [MvTable::Default, MvTable::Alternate] {
+            let sel = variant.to_sel();
+            assert_eq!(
+                MvTable::from_sel(sel),
+                Some(variant),
+                "{variant:?} round-trip"
+            );
+        }
+        // Same direction in the literal-value form per spec/06 §3.2.
+        assert_eq!(MvTable::Default.to_sel(), 0);
+        assert_eq!(MvTable::Alternate.to_sel(), 1);
+    }
+
+    #[test]
+    fn mv_table_from_sel_default_value_matches_struct_default() {
+        // The `#[derive(Default)]` on MvTable resolves to MvTable::Default;
+        // ensure the from_sel(0) helper returns the same variant — so a
+        // caller using either entry point sees identical behaviour.
+        let from_zero = MvTable::from_sel(0).unwrap();
+        let derived: MvTable = MvTable::default();
+        assert_eq!(
+            from_zero, derived,
+            "from_sel(0) must match Default::default()"
         );
     }
 }

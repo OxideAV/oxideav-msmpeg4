@@ -644,6 +644,43 @@ canonical reference: `GFamily::field_state_struct_offset(field)`
 must equal the VMA the constructor disassembly cites for that
 `(family, field)` pair.
 
+Round-266 (2026-06-09) lands a **typed-primitive accessor surface** on
+the picture-header parser so callers that already hold a parsed
+[`crate::header::MsV3PictureHeader`] reach the spec-correct
+[`crate::g_family::GFamily`] / [`crate::mv::MvTable`] enums without
+re-importing the standalone dispatchers or restating per-frame slot
+identities. Five new const-fn accessors:
+[`crate::mv::MvTable::from_sel`] resolves a `mv_table_sel` bit ∈ {0,1}
+to `Some(MvTable::Default)` / `Some(MvTable::Alternate)` per spec/06
+§3.2 (and `None` for out-of-range); [`crate::mv::MvTable::to_sel`] is
+its inverse (`Default → 0, Alternate → 1`).
+[`crate::header::MsV3PictureHeader::ac_chroma_family`] /
+[`crate::header::MsV3PictureHeader::ac_luma_family`] delegate to
+[`crate::g_family::GFamily::for_chroma_selector`] /
+[`crate::g_family::GFamily::for_luma_selector`] (spec/14 §3.1: chroma
+`0→G2, 1→G0, 2→G4`; luma `0→G3, 1→G1, 2→G5`).
+[`crate::header::MsV3PictureHeader::mv_table`] delegates to
+[`crate::mv::MvTable::from_sel`]. Two new associated fns on
+[`crate::header::V1V2V3CompatDefaults`]
+(`v1_v2_fallthrough_chroma_family` / `v1_v2_fallthrough_luma_family`)
+surface the real v1/v2 runtime cluster bound at the
+`0x1c212917` fallthrough write site per spec/14 §3.1
+(`[esi+0xab0] = G4` chroma, `[esi+0xab4] = G5` luma) — independent of
+the (zero-pinned, don't-care) `ac_chroma_sel` / `ac_luma_sel` compat
+fields, which would otherwise dispatch through the v3 per-frame
+selector path to G2 / G3 (i.e. **not** the v1/v2 cluster). The two
+surfaces deliberately diverge, pinned by
+`compat_defaults_v3_dispatch_does_not_equal_v1_v2_fallthrough` so a
+future round can't accidentally collapse them. Seventeen new lib
+tests across `src/mv.rs::tests` (5) and `src/header.rs::tests` (12)
+pin every dispatch arm, the OOR-`None` defence-in-depth path on every
+accessor, the inverse round-trip for both selectors, the spec/14 §3.1
+v1/v2 fallthrough family identities, and the end-to-end
+parse-then-resolve flow through a real bit-packed v3 P-frame header
+with `ac_chroma_sel=1` + `mv_table_sel=1`. Lib tests 378 → 395 (+17);
+integration tests unchanged. Purely additive; no runtime path is
+rewired and no new tables are introduced.
+
 ## License
 
 MIT.
