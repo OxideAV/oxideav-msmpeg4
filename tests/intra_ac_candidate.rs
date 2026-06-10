@@ -177,9 +177,10 @@ fn candidate_drives_full_intra_block_decode() {
     let n = decode_intra_block(&mut br, &mut block, dc, Scan::Zigzag, &table, quant).unwrap();
     assert_eq!(n, 1, "exactly one AC coefficient decoded");
     assert_eq!(block[0], dc, "DC untouched");
-    // H.263-style dequant: |level|=1, q=5 (odd) → coeff = 1*(2*q) +
-    // (q - 1) = 10 + 4 = 14.
-    assert_eq!(block[ZIGZAG[1]], 14, "dequantised AC coefficient");
+    // H.263-style dequant (spec/08 §5): |level|=1, q=5 (odd) →
+    // even_flag = 0, bias = q - even_flag = 5, mag = 2*q = 10.
+    // coeff = 1*10 + 5 = 15.
+    assert_eq!(block[ZIGZAG[1]], 15, "dequantised AC coefficient");
 }
 
 #[test]

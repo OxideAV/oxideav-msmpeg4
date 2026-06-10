@@ -1681,8 +1681,8 @@ mod tests {
     fn decode_intra_block_runs_dequantise() {
         // DC = 512 goes straight to block[0]. AC has one token
         // terminating immediately with (last=1, run=0, level=+1).
-        // After dequant with q=5 (odd, parity=1, mag=10, bias=4):
-        //   coeff = 1 * 10 + 4 = 14.
+        // After dequant with q=5 (spec/08 §5: odd → even_flag=0,
+        // mag=10, bias=q-even_flag=5):  coeff = 1 * 10 + 5 = 15.
         let t = toy_table();
         let bytes = pack(&[(0b01, 2), (0, 1)]);
         let mut br = BitReader::new(&bytes);
@@ -1690,7 +1690,7 @@ mod tests {
         let n = decode_intra_block(&mut br, &mut block, 512, Scan::Zigzag, &t, 5).unwrap();
         assert_eq!(n, 1);
         assert_eq!(block[0], 512, "DC untouched");
-        assert_eq!(block[ZIGZAG[1]], 14, "AC dequantised");
+        assert_eq!(block[ZIGZAG[1]], 15, "AC dequantised");
     }
 
     // ----- 3-tier ESC body tests (round 27) -----
@@ -2209,14 +2209,15 @@ mod tests {
         // decode_inter_block runs the AC walk then dequantises ALL
         // positions (level_start = 0) — there is no separate DC scaler
         // on the inter path. `1` (run=0, level=1) sign 0 lands on the DC
-        // slot and must be dequantised. q=5 → mag=10, bias=4 → 1*10+4=14.
+        // slot and must be dequantised. q=5 (spec/08 §5: odd →
+        // even_flag=0, mag=10, bias=5) → 1*10+5=15.
         let t = toy_table();
         let bytes = pack(&[(0b1, 1), (0, 1), (0b01, 2), (0, 1)]);
         let mut br = BitReader::new(&bytes);
         let mut block = [0i32; 64];
         decode_inter_block(&mut br, &mut block, &t, 5).unwrap();
-        assert_eq!(block[ZIGZAG[0]], 14, "DC dequantised on inter path");
-        assert_eq!(block[ZIGZAG[1]], 14, "terminator dequantised");
+        assert_eq!(block[ZIGZAG[0]], 15, "DC dequantised on inter path");
+        assert_eq!(block[ZIGZAG[1]], 15, "terminator dequantised");
     }
 
     #[test]

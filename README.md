@@ -30,7 +30,7 @@ right decoder when a packet arrives.
 | V3 picture-header parser (I / P)               | complete              |
 | Scan tables (zigzag + alternate H/V)           | complete              |
 | IDCT (float reference)                         | complete              |
-| H.263-style dequantisation + DC scalers        | complete              |
+| H.263-style dequantisation + DC scalers        | complete (parity-bias direction corrected to spec/08 §5, round 275) |
 | CBPY + DC-size VLCs                            | complete              |
 | Intra MB header + DC differential decode       | complete              |
 | Joint MCBPCY VLC (v3, 128-entry canonical)     | complete              |
@@ -680,6 +680,27 @@ parse-then-resolve flow through a real bit-packed v3 P-frame header
 with `ac_chroma_sel=1` + `mv_table_sel=1`. Lib tests 378 → 395 (+17);
 integration tests unchanged. Purely additive; no runtime path is
 rewired and no new tables are introduced.
+
+Round-275 (2026-06-11) **corrects the H.263 quantiser-parity bias
+direction** in [`iq::dequantise_h263`]. The kernel had computed the
+Eq. 12 additive offset as `bias = PQUANT - (PQUANT & 1)` — subtracting 1
+for **odd** PQUANT. The sandbox-verified runtime materialisation in
+`docs/video/msmpeg4/spec/08-descriptor-constants.md` §5 (the
+`audit/06` hand-patched-PQUANT trials watched at `[ctx+0x138]`) shows
+the per-frame even-parity flag is `1` iff PQUANT is **even** and
+`bias = PQUANT - even_flag`, i.e. `bias = PQUANT - 1` for even PQUANT
+and `bias = PQUANT` for odd. `spec/07` §4.2's inline annotation
+"`edx = 1 if odd else 0`" mis-described its own quoted
+`neg edx; sbb edx,edx; inc edx` idiom: applied to `edx = PQUANT % 2 ∈
+{0,1}` that idiom evaluates to `1 - CF` = 1 when even, 0 when odd, in
+agreement with spec/08 §5. The one-line fix (`even_flag = 1 - (q & 1)`)
+changes every non-zero coefficient's dequantised magnitude for **even**
+PQUANT (the common case in real streams) — e.g. q=4, |level|=1 now
+yields `2·4 + (4−1) = 11` instead of the previous `2·4 + 4 = 12`. A new
+sweep test pins the corrected direction across PQUANT 1..=31 and four
+existing value-expectation tests plus one integration assertion were
+updated. Lib tests 395 → 396 (+1); the module docs now carry the
+spec/07-vs-spec/08 reconciliation inline.
 
 ## License
 

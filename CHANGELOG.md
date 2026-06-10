@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Round 275 — Dequant parity-bias direction corrected to spec/08 §5**
+  (2026-06-11): `iq::dequantise_h263` computed the H.263 §6.2.2.1 Eq. 12
+  quantiser-parity offset as `bias = PQUANT - (PQUANT & 1)`, i.e. it
+  subtracted 1 for **odd** PQUANT. The sandbox-verified runtime
+  materialisation in `docs/video/msmpeg4/spec/08-descriptor-constants.md`
+  §5 (backed by `audit/06` hand-patched-PQUANT trials watched at
+  `[ctx+0x138]`) establishes the opposite: the per-frame even-parity flag
+  is `1` iff PQUANT is **even**, and `bias = PQUANT - even_flag`, so
+  `bias = PQUANT - 1` for even PQUANT and `bias = PQUANT` for odd PQUANT.
+  `spec/07` §4.2's prose annotation "`edx = 1 if odd else 0`" was wrong
+  about its own quoted `neg edx; sbb edx,edx; inc edx` idiom — that
+  idiom over `edx = PQUANT % 2 ∈ {0,1}` yields `1 - CF` = 1 if even, 0 if
+  odd, matching spec/08 §5. The fix flips the parity term to
+  `even_flag = 1 - (q & 1)` so every non-zero AC/inter coefficient
+  dequantises to `mag·|level| + (PQUANT - even_flag)` for even PQUANT and
+  the correct half-step for odd — affecting bit-exact reconstruction of
+  every even-PQUANT block (the majority of real streams). A new lib test
+  `iq::tests::parity_bias_direction_matches_spec_08_section_5` sweeps
+  PQUANT 1..=31 and pins both arms; four existing tests
+  (`iq::tests::{positive_odd_quant,negative_even_quant}`,
+  `ac::tests::{decode_intra_block_runs_dequantise,
+  inter_block_dequantises_with_level_start_zero}`) and one integration
+  expectation (`tests/intra_ac_candidate.rs`) were updated to the
+  corrected values (q=5 odd |level|=1 → 15, not 14; q=4 even |level|=2
+  → −19, not −20). Lib tests 395 → 396 (+1). The module docs now carry
+  the spec/07-vs-spec/08 reconciliation inline.
+
 ### Added
 
 - **Round 266 — Typed-primitive accessor surface on the picture-header

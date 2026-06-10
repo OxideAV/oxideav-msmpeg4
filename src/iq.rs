@@ -1,30 +1,40 @@
 //! Inverse quantisation — H.263-style as used by MS-MPEG4 v1/v2/v3.
 //!
-//! Per `docs/video/msmpeg4/spec/08-descriptor-constants.md` §3.2 /
-//! `docs/video/msmpeg4/spec/07-remaining-opens.md` §4, all three
-//! integer inner kernels (v1 inter `0x1c215d2c`, v2/v3 inter `0x1c215e6f`
-//! / `0x1c21611b`, and v1/v2/v3 intra `0x1c216d97`) use the **same**
-//! per-MB scalar pair `[esi+0x13c]` (mag) / `[esi+0x140]` (bias),
-//! computed from PQUANT exactly as H.263 §6.2.2.1 Eq. 12:
+//! Per `docs/video/msmpeg4/spec/08-descriptor-constants.md` §5 (the
+//! sandbox-verified runtime materialisation), all three integer inner
+//! kernels (v1 inter `0x1c215d2c`, v2/v3 inter `0x1c215e6f` /
+//! `0x1c21611b`, and v1/v2/v3 intra `0x1c216d97`) use the **same**
+//! per-frame scalar pair `[ctx+0x13c]` (mag) / `[ctx+0x140]` (bias),
+//! materialised once per frame from PQUANT at `0x1c2125b2..0x1c2125d0`:
 //!
-//!   parity = PQUANT & 1
-//!   mag    = 2 * PQUANT
-//!   bias   = PQUANT - parity
+//!   even_flag = 1 if PQUANT is even else 0     ; [ctx+0x138]
+//!   mag       = 2 * PQUANT                      ; [ctx+0x13c]
+//!   bias      = PQUANT - even_flag              ; [ctx+0x140]
 //!
-//! The dequantised coefficient is:
+//! i.e. `bias = PQUANT - 1` for **even** PQUANT and `bias = PQUANT` for
+//! **odd** PQUANT. The dequantised coefficient is:
 //!
 //!   coeff = level * mag + bias   if level > 0
 //!   coeff = level * mag - bias   if level < 0
 //!   coeff = 0                    if level == 0
 //!
-//! This is equivalent to the older "sum of half-step" form:
+//! This is the H.263 §6.2.2.1 Eq. 12 quantiser-parity rule:
+//! `|REC| = QUANT·(2·|LEVEL| + 1) - (QUANT even ? 1 : 0)`, which expands
+//! to `mag·|LEVEL| + (PQUANT - even_flag)`.
 //!
-//!   coeff = sign(level) * (quant * (2|level| + 1) - (1 - parity))
+//! ## Reconciliation of spec/07 §4.2 vs spec/08 §5
 //!
-//! because `2 * QP * |l| + (QP - parity) = QP * (2|l| + 1) - parity` and
-//! parity=0 for odd QP in the old form (a sign-convention flip). The
-//! spec/08 form is what the disassembly actually does, so that's what
-//! we implement.
+//! `spec/07` §4.2 quoted the per-MB store at `0x1c2132c6` and annotated
+//! the parity idiom `neg edx; sbb edx,edx; inc edx` (operating on
+//! `edx = PQUANT % 2`) as "`edx = 1 if odd else 0`", concluding
+//! `bias = PQUANT` for even PQUANT. That **prose annotation is wrong
+//! about its own quoted assembly**: with `edx ∈ {0,1}`, `neg edx` sets
+//! CF iff the operand was non-zero, `sbb edx,edx` then yields `-CF`, and
+//! `inc edx` yields `1 - CF` = **1 if even (CF=0), 0 if odd (CF=1)**.
+//! That matches `spec/08` §5 (sandbox audit `audit/06`, hand-patched
+//! PQUANT trials watched at `[ctx+0x138]`), which states the flag is
+//! "1 if PQUANT even else 0". `spec/08` §5 is the authoritative,
+//! runtime-verified form and is what we implement here.
 //!
 //! Final coefficients are clipped to the signed 12-bit range
 //! [-2048, 2047] per the 12-bit DCT-domain saturation (MPEG-4 Part 2
@@ -51,15 +61,18 @@ pub fn dequantise_h263(coeffs: &mut [i32; 64], quant: u32, level_start: usize) -
         )));
     }
     let q = quant as i32;
-    let parity = q & 1;
+    // spec/08 §5: even_flag = 1 if PQUANT is even, else 0. The runtime
+    // computes this via the `neg/sbb/inc` idiom at `0x1c2132c6` (see the
+    // module-level reconciliation note); `1 - (q & 1)` is the same value.
+    let even_flag = 1 - (q & 1);
     let mag = 2 * q;
-    let bias = q - parity;
+    let bias = q - even_flag;
     for c in &mut coeffs[level_start..] {
         let lv = *c;
         if lv == 0 {
             continue;
         }
-        // spec/08 §3.2 / spec/07 §4.5: sign(level) * (|level| * mag + bias).
+        // spec/08 §5: sign(level) * (|level| * mag + bias).
         let scaled = lv.unsigned_abs() as i32 * mag + bias;
         *c = if lv < 0 { -scaled } else { scaled }.clamp(-2048, 2047);
     }
@@ -105,20 +118,20 @@ mod tests {
     fn positive_odd_quant() {
         let mut c = [0i32; 64];
         c[1] = 3;
-        // spec/08: mag = 2*q = 10, parity = 1, bias = q - parity = 4.
-        //   coeff = 3 * 10 + 4 = 34.
+        // spec/08 §5: q=5 odd → even_flag = 0, mag = 2*q = 10,
+        //   bias = q - even_flag = 5.  coeff = 3 * 10 + 5 = 35.
         dequantise_h263(&mut c, 5, 1).unwrap();
-        assert_eq!(c[1], 34);
+        assert_eq!(c[1], 35);
     }
 
     #[test]
     fn negative_even_quant() {
         let mut c = [0i32; 64];
         c[5] = -2;
-        // q=4 (even): mag = 8, parity = 0, bias = 4.
-        //   |coeff| = 2 * 8 + 4 = 20; sign of level => -20.
+        // spec/08 §5: q=4 even → even_flag = 1, mag = 8, bias = q - 1 = 3.
+        //   |coeff| = 2 * 8 + 3 = 19; sign of level => -19.
         dequantise_h263(&mut c, 4, 0).unwrap();
-        assert_eq!(c[5], -20);
+        assert_eq!(c[5], -19);
     }
 
     #[test]
@@ -141,6 +154,36 @@ mod tests {
         c[1] = -200;
         dequantise_h263(&mut c, 31, 1).unwrap();
         assert_eq!(c[1], -2048);
+    }
+
+    #[test]
+    fn parity_bias_direction_matches_spec_08_section_5() {
+        // spec/08 §5 (sandbox-verified): bias = PQUANT - even_flag where
+        // even_flag = 1 iff PQUANT is even. So bias = PQUANT - 1 for EVEN
+        // PQUANT and bias = PQUANT for ODD PQUANT. This is the opposite of
+        // the pre-fix direction (which subtracted 1 for odd). Pin both
+        // arms with |level| = 1 so coeff = mag + bias = 2*PQUANT + bias.
+        for q in 1..=31u32 {
+            let mut c = [0i32; 64];
+            c[1] = 1;
+            dequantise_h263(&mut c, q, 1).unwrap();
+            let qi = q as i32;
+            let even_flag = if q % 2 == 0 { 1 } else { 0 };
+            let expected = (2 * qi + (qi - even_flag)).clamp(-2048, 2047);
+            assert_eq!(
+                c[1], expected,
+                "q={q}: bias direction must be PQUANT - even_flag"
+            );
+        }
+        // Concrete spot checks of the corrected direction.
+        let mut even = [0i32; 64];
+        even[1] = 1;
+        dequantise_h263(&mut even, 4, 1).unwrap();
+        assert_eq!(even[1], 2 * 4 + (4 - 1), "q=4 even → bias=3, coeff=11");
+        let mut odd = [0i32; 64];
+        odd[1] = 1;
+        dequantise_h263(&mut odd, 5, 1).unwrap();
+        assert_eq!(odd[1], 2 * 5 + 5, "q=5 odd → bias=5, coeff=15");
     }
 
     #[test]
