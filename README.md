@@ -49,7 +49,7 @@ right decoder when a packet arrives.
 | P-frame MV VLC + half-pel MC (default table)   | complete              |
 | P-frame MV VLC alternate table                 | byte LUTs landed (round 251); VLC source still truncated |
 | Inter AC residual (G4 VLC → IDCT → add to MC)  | complete (round 123) |
-| V1 / V2 bitstream                              | header + MV + MCBPC done; AC OPEN; v3-compat defaults pinned (round 129) |
+| V1 / V2 bitstream                              | header + MV + MCBPC done; **P-frame skip + inter pixel pipeline end-to-end (round 285)**; I-frame / intra-in-P gated on the spec/07 §1.6 DC-prediction docs gap |
 | V1 / V2 shared CBPY VLC                        | binary cross-check vs H.263 (round 75) |
 | G0..G5 (count_A, count_B) provenance pin       | spec/15 §3 binary-derived (round 81) |
 | Unified `GFamily` dispatch surface (G0..G5)    | wired (round 174); selector inverses + `subclass_of` (round 181); per-field descriptor offsets (round 254) |
@@ -680,6 +680,44 @@ parse-then-resolve flow through a real bit-packed v3 P-frame header
 with `ac_chroma_sel=1` + `mv_table_sel=1`. Lib tests 378 → 395 (+17);
 integration tests unchanged. Purely additive; no runtime path is
 rewired and no new tables are introduced.
+
+Round-285 (2026-06-12) lands the **v1/v2 P-frame pixel pipeline** —
+the first version-1/-2 path that produces actual pixels. The new
+public [`picture::decode_picture_v1v2`] (+ [`picture::MsV1V2Version`])
+chains the pieces earlier rounds wired in isolation: the v1/v2
+picture-header parsers (spec/01 §1.4; the v1 P-frame UMV flag is
+consumed as framing but never branched on, per spec/07 §3.4's "the
+v<4 body does not branch on it"), the per-MB skip bit + separate
+MCBPC / CBPY VLCs (spec/07 §1-§2, `decode_mcbpcy_v{1,2}` from round
+11), the §7.6.5 1-MV predictor (spec/07 §3.5 pins the v1/v2 MV body
+to the *same* median-of-3 helper `0x1c217c8c` as v3, so the path
+routes through the same `MvGrid` + `predict_block_mv` surface the v3
+P-loop uses), the per-component MV pair (`mv::decode_mv_v1v2`, round
+12), half-pel MC, and the **G4 inter AC residual** for every
+CBP-coded block — spec/14 §3.1's v1/v2 fallthrough at `0x1c212917`
+binds the inter/chroma DCT descriptor to G4 unconditionally, and
+spec/99 §6 pins the inter kernels to the shared hard-zigzag /
+scan-start-0 / single-tier-ESC shape across v1/v2/v3. `send_packet`
+on `msmpeg4v1` / `msmpeg4v2` now emits `Frame::Video` for P-frames.
+Three paths stay behind *documented* `Unsupported` gates with the
+precise citation in the error text: (1) **v1/v2 I-frames and
+intra-in-P MBs** — spec/07 §1.6 pins that v1/v2 do **not** load the
+v3 spatial-prediction LUT pair at `0x1c23a788 / 0x1c23a7b0`, but no
+staged chapter documents the replacement DC-prediction rule (or the
+v1/v2 intra DC-size descriptor binding) for the shared intra kernel
+`0x1c216d97`, so intra pixels would be guesswork; (2) **v1 non-zero
+inter sub-types** (`mb_type ∈ {1, 2, 4, 5}`) — spec/07 §1.4 asserts
+only the `mcbpc >> 2` decomposition and the H.263 Table-8 *lineage*
+("structural, value-level match not asserted"), leaving the
+per-sub-type side reads untraced. The v3 P-loop's predictor lookup
+and residual walk were factored into shared helpers
+(`one_mv_predictor` / `decode_inter_residual_blocks`) with no v3
+behavioural change. New `tests/v1_v2_pframe.rs` (11 tests) covers
+all-skip identity, zero-MV copy, +1-pel MV shift, residual locality,
+all three gates' diagnostics, the missing-reference error, and the
+`send_packet` surface; the ffmpeg-backed MP42 expectation in
+`tests/v1_v2_mcbpcy.rs` now pins the real-stream I-frame stop-line.
+Integration tests 97 → 108 (+11).
 
 Round-275 (2026-06-11) **corrects the H.263 quantiser-parity bias
 direction** in [`iq::dequantise_h263`]. The kernel had computed the

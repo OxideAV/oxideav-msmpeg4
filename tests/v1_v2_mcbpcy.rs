@@ -16,10 +16,11 @@
 //! 1. The synthetic-stream round-trip of every (sym, bl, code) triple
 //!    in both MCBPC alphabets.
 //! 2. Real ffmpeg-encoded `msmpeg4v2` bitstreams (when ffmpeg is
-//!    available on the host) — the decoder is currently expected to
-//!    parse the v2 picture header successfully but bail with a
-//!    documented `Unsupported` once the per-MB intra/inter AC VLC is
-//!    needed (still spec/99 §9 OPEN).
+//!    available on the host) — as of round 285 the decoder is expected
+//!    to parse the v2 I-frame picture header successfully but bail
+//!    with the documented `Unsupported` citing the v1/v2 intra
+//!    DC-prediction docs gap (spec/07 §1.6); P-frame skip + inter MBs
+//!    decode end-to-end (see `tests/v1_v2_pframe.rs`).
 
 use oxideav_core::bits::BitReader;
 use oxideav_msmpeg4::header::{MsV1V2PictureHeader, PictureType};
@@ -201,9 +202,11 @@ fn v1_v2_cbpy_reserved_sentinel_codes_are_rejected() {
 }
 
 /// Drive a real ffmpeg-encoded msmpeg4v2 stream through our top-level
-/// decoder. We expect the picture header to parse successfully and the
-/// decoder to surface a documented `Unsupported` error citing spec/99
-/// §9 OPEN-O4 once it tries to walk MB data without the AC VLC.
+/// decoder. The first packet is an I-frame, so we expect the picture
+/// header to parse successfully and the decoder to surface the
+/// documented round-285 `Unsupported` citing the v1/v2 DC-prediction
+/// docs gap (spec/07 §1.6) — P-frame skip + inter MBs decode
+/// end-to-end, but the v1/v2 intra pixel pipeline is still gated.
 ///
 /// Skipped if ffmpeg is not available.
 #[test]
@@ -298,32 +301,27 @@ fn ffmpeg_v2_picture_header_parses_through_decoder() {
         .with_keyframe(true);
     let result = dec.send_packet(&pkt);
 
-    // The expected outcome in this round: the picture header parses
-    // successfully but the decoder bails with a documented Unsupported
-    // citing spec/99 §9. Either the parse error names the AC VLC gap
-    // or it cites the spec directly.
+    // The expected outcome as of round 285: the I-frame picture header
+    // parses successfully but the decoder bails with the documented
+    // Unsupported citing the v1/v2 intra DC-prediction docs gap
+    // (spec/07 §1.6) — the intra pixel pipeline is the remaining gate.
     match result {
         Ok(()) => {
             // If decode somehow succeeded, that's even better — we'll
-            // find out in a later round when the AC VLC lands. For now
-            // we don't fail on success.
+            // find out in a later round when the intra DC-prediction
+            // trace lands. For now we don't fail on success.
             eprintln!("v2 decode succeeded unexpectedly (great!)");
         }
         Err(e) => {
             let msg = format!("{e}");
             assert!(
-                msg.contains("OPEN-O4")
-                    || msg.contains("intra-AC")
-                    || msg.contains("AC")
-                    || msg.contains("VLC")
-                    || msg.contains("MCBPC")
-                    || msg.contains("not implemented"),
-                "v2 error should cite a documented gap; got: {msg}"
+                msg.contains("DC-prediction") && msg.contains("spec/07"),
+                "v2 error should cite the DC-prediction docs gap; got: {msg}"
             );
             eprintln!(
                 "v2 decode reached the documented stop-line: {msg}\n\
-                 (picture header was parsed; further decode requires the \
-                 v1/v2 intra-AC VLC table — spec/99 §9 OPEN-O4)"
+                 (picture header was parsed; the v1/v2 intra pixel \
+                 pipeline awaits the DC-prediction trace — spec/07 §1.6)"
             );
         }
     }

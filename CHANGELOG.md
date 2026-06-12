@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Round 285 — v1/v2 P-frame pixel pipeline (skip + inter MBs)
+  end-to-end** (2026-06-12): new public
+  `picture::decode_picture_v1v2` (+ `picture::MsV1V2Version`)
+  decodes MS-MPEG4 v1/v2 P-frames into a `Picture`: picture header
+  (spec/01 §1.4, the v1 UMV flag consumed as framing per spec/07 §3.4),
+  per-MB skip bit + separate MCBPC / CBPY VLCs (spec/07 §1-§2 via the
+  existing `mcbpcy::decode_mcbpcy_v{1,2}`), the §7.6.5 1-MV predictor
+  (same helper `0x1c217c8c` as v3 per spec/07 §3.5, threaded through
+  the shared `MvGrid` surface), the per-component MV pair
+  (`mv::decode_mv_v1v2`, spec/07 §3), half-pel MC, and the G4 inter AC
+  residual for every CBP-coded block — per spec/14 §3.1 the v1/v2
+  fallthrough at `0x1c212917` binds the inter/chroma DCT descriptor to
+  G4, and per spec/99 §6 the inter kernels share the hard-zigzag /
+  scan-start-0 / single-tier-ESC shape across v1/v2/v3.
+  `send_packet` on `msmpeg4v1` / `msmpeg4v2` now produces
+  `Frame::Video` for P-frames instead of the blanket round-12
+  `Unsupported`. Still gated with a *documented* `Unsupported` carrying
+  the precise citation: v1/v2 I-frames + intra-in-P MBs (spec/07 §1.6
+  pins that v1/v2 do not load the v3 spatial-prediction LUT pair at
+  `0x1c23a788 / 0x1c23a7b0`, but no staged chapter documents the
+  replacement DC-prediction rule or the v1/v2 intra DC-size descriptor
+  binding) and the v1 non-zero inter sub-types (spec/07 §1.4 asserts
+  the H.263 Table-8 lineage only structurally). Internally the v3
+  P-frame path's 1-MV predictor lookup and CBP-driven inter-residual
+  loop were factored into shared helpers (`one_mv_predictor`,
+  `decode_inter_residual_blocks`) consumed by both version families —
+  no behavioural change on the v3 path. New integration suite
+  `tests/v1_v2_pframe.rs` (11 tests): all-skip identity copy (v1 4-MB
+  + v2 1-MB), zero-MV inter copy (v1 + v2), non-zero-MV reference
+  shift, G4-residual application confined to the coded block, the
+  three documented `Unsupported` gates (I-frame, intra-in-P, v1
+  sub-type ≠ 0) with diagnostic-content asserts, the missing-reference
+  error, and an end-to-end `send_packet` docs-gap surface check. The
+  ffmpeg-backed `v1_v2_mcbpcy.rs` expectation was updated to the new
+  stop-line (a real MP42 I-frame now reaches the DC-prediction gate).
+  Integration tests 97 → 108 (+11); lib tests unchanged at 396.
+
 ### Fixed
 
 - **Round 275 — Dequant parity-bias direction corrected to spec/08 §5**

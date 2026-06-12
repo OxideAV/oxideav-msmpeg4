@@ -90,19 +90,20 @@
 //!   path at helper offset `1c21587f`) saturate the 13-bit prefix space
 //!   (Kraft sum = 1 - 4/2^13 over the 65 codes).
 //!
-//! Per-MB pixel reconstruction for v1/v2 P-frames is still gated on the
-//! per-version intra-AC and inter-AC VLC tables (spec/99 §9 OPEN-O4) —
-//! the MV decoder produces the (MVx, MVy) byte pair that the MC
-//! fetcher consumes, but the residual path needs the AC tables for a
-//! complete pipeline. The v1/v2 `send_packet` therefore continues to
-//! return the same documented `Unsupported` after parsing the picture
-//! header.
-//!
-//! The full v1/v2 per-MB decode (intra-AC, inter-AC) still requires the
-//! corresponding VLC tables which are spec/99 §9 OPEN — `send_packet`
-//! parses the picture header successfully and then surfaces a
-//! documented `Unsupported` citing the open spec item, so callers can
-//! distinguish "header malformed" from "decoder gap".
+//! **v1 / v2 P-frame pixel pipeline.** Round 285 (2026-06-12) wires
+//! [`picture::decode_picture_v1v2`] end-to-end for P-frame **skip +
+//! plain inter** MBs: the spec/07 §1-§2 MB-header decoders above feed
+//! the shared §7.6.5 1-MV predictor, the per-component MV decode, the
+//! half-pel MC fetcher, and the G4 inter residual (the spec/14 §3.1
+//! v1/v2 fallthrough binding). `send_packet` on a v1/v2 P-frame now
+//! produces a `Frame::Video`. **Still gated with a documented
+//! `Unsupported`:** v1/v2 I-frames and intra-in-P MBs (the staged
+//! trace pins that v1/v2 do not load the v3 spatial-prediction LUT
+//! pair — spec/07 §1.6 — but does not document the replacement
+//! DC-prediction rule for the shared intra kernel), and the v1
+//! non-zero inter sub-types (spec/07 §1.4 asserts the H.263 Table-8
+//! lineage only structurally). Callers can still distinguish "header
+//! malformed" from "decoder gap" by the error text.
 //!
 //! **Round 18 (2026-04-26)** wires the G4 (inter chroma + all-inter)
 //! and G5 (intra-luma) DCT-descriptor `pri_A` / `pri_B` byte arrays
@@ -321,9 +322,9 @@ pub fn probe_is_msmpeg4(ctx: &ProbeContext) -> f32 {
 /// the same FourCCs with its own mirror probe, and whichever probe
 /// returns the higher confidence wins.
 ///
-/// The decoders themselves currently return
-/// `Error::Unsupported` on `send_packet`, with distinct diagnostic
-/// messages for the two failure modes.
+/// The v3 decoder runs end-to-end; the v1/v2 decoders decode P-frame
+/// skip + inter MBs and return a documented `Error::Unsupported` for
+/// the still-gated intra paths (see [`picture::decode_picture_v1v2`]).
 ///
 /// Prefer the unified [`register`] entry point when you have a
 /// [`oxideav_core::RuntimeContext`] in hand.
@@ -531,31 +532,30 @@ impl Decoder for MsMpeg4Decoder {
                         Ok(())
                     }
                     MsVersion::V1 | MsVersion::V2 => {
-                        // v1/v2 picture-header parse + MCBPCY decoders
-                        // are wired (spec/07 §1-§2). The downstream
-                        // intra-AC and inter-AC VLCs are not yet
-                        // extracted (spec/99 §9 OPEN). For now we parse
-                        // the header (proves wiring is end-to-end) and
-                        // surface a documented Unsupported with the
-                        // exact spec citation so callers can tell apart
+                        // v1/v2 P-frame skip + inter MBs decode
+                        // end-to-end (round 285): separate MCBPC +
+                        // CBPY VLCs (spec/07 §1-§2), per-component MV
+                        // pair (spec/07 §3), half-pel MC, and the G4
+                        // inter residual (spec/14 §3.1 fallthrough
+                        // binding). I-frames and intra-in-P MBs are
+                        // still gated on the v1/v2 DC-prediction docs
+                        // gap — `decode_picture_v1v2` surfaces the
+                        // precise citation so callers can tell apart
                         // "header malformed" from "decoder gap".
-                        let hdr = match self.version {
-                            MsVersion::V1 => header::MsV1V2PictureHeader::parse_v1(&mut br)?,
-                            MsVersion::V2 => header::MsV1V2PictureHeader::parse_v2(&mut br)?,
-                            _ => unreachable!(),
+                        let v = match self.version {
+                            MsVersion::V1 => picture::MsV1V2Version::V1,
+                            _ => picture::MsV1V2Version::V2,
                         };
-                        Err(Error::unsupported(format!(
-                            "{}: parsed picture header (type={:?}, quant={}, umv={}) \
-                             but per-MB decode requires the v1/v2 intra-AC and \
-                             inter-AC VLC tables which are still OPEN per \
-                             docs/video/msmpeg4/spec/99-current-understanding.md \
-                             §9 OPEN-O4. The MCBPC + CBPY pipeline (spec/07 \
-                             §1, §2) is wired and tested.",
-                            self.version.codec_id(),
-                            hdr.picture_type,
-                            hdr.quant,
-                            hdr.v1_umv_flag,
-                        )))
+                        let pic = picture::decode_picture_v1v2(
+                            &mut br,
+                            dims,
+                            v,
+                            self.last_picture.as_ref(),
+                        )?;
+                        let frame = picture_to_video_frame(&pic, packet.pts);
+                        self.last_picture = Some(pic);
+                        self.output_queue.push_back(Frame::Video(frame));
+                        Ok(())
                     }
                 }
             }

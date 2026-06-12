@@ -68,7 +68,7 @@ use oxideav_core::{Error, Result};
 
 use crate::ac::{AcVlcTable, Scan};
 use crate::dc_pred::{DcCache, DcPrediction};
-use crate::header::{MsV3PictureHeader, PictureType};
+use crate::header::{MsV1V2PictureHeader, MsV3PictureHeader, PictureType};
 use crate::idct::idct8x8_to_pel;
 use crate::mb::{decode_intra_block_full_v3, IntraMbHeader};
 
@@ -514,33 +514,6 @@ fn decode_pframe_mb(
         PFrameMcbpcy::Coded { decode, ac_pred } => (false, Some((decode, ac_pred))),
     };
 
-    // Picture-edge-aware neighbour lookup (spec/06 §3.4 +
-    // `docs/video/mpeg4-visual/figure-7-34-mv-predictor-layout.md` §
-    // "Boundary substitution"). The grid surfaces missing neighbours
-    // as [`crate::mv_pred::NeighbourMvKind::Absent`] which threads
-    // through the [`crate::mv_pred::BlockCandidates`] fields below as
-    // `None`, then via [`crate::mv_pred::predict_block_mv`] applies
-    // the four §7.6.5 candidate-validity substitution rules.
-    let nset = mv_grid.neighbour_set_for(mb_x, mb_y);
-    let left = match nset.left {
-        crate::mv_pred::NeighbourMvKind::Absent => None,
-        crate::mv_pred::NeighbourMvKind::OneMv(mv) => Some(mv),
-        // 1-MV-per-MB v3 path: neighbours are always OneMv or Absent.
-        // 4-MV-coded neighbours would land here once the 4-MV-per-MB
-        // bitstream signalling is wired (round 240+, depth follow-up).
-        crate::mv_pred::NeighbourMvKind::FourMv(mvs) => Some(mvs[1]),
-    };
-    let top = match nset.above {
-        crate::mv_pred::NeighbourMvKind::Absent => None,
-        crate::mv_pred::NeighbourMvKind::OneMv(mv) => Some(mv),
-        crate::mv_pred::NeighbourMvKind::FourMv(mvs) => Some(mvs[2]),
-    };
-    let top_right = match nset.above_right {
-        crate::mv_pred::NeighbourMvKind::Absent => None,
-        crate::mv_pred::NeighbourMvKind::OneMv(mv) => Some(mv),
-        crate::mv_pred::NeighbourMvKind::FourMv(mvs) => Some(mvs[2]),
-    };
-
     if skip {
         // Skip MB: MV = predictor-based zero (spec/06 §3.4 says
         // missing neighbours are zero-subbed; skipped MBs themselves
@@ -606,6 +579,61 @@ fn decode_pframe_mb(
     // instead of `median(neighbour, 0, 0) = 0`. This affects the first
     // inter MB after a row of intra MBs at row 0 (`left` is the sole
     // valid neighbour) and the analogous edge cases.
+    let predictor = one_mv_predictor(mv_grid, mb_x, mb_y);
+    let mv = crate::mv::decode_mv_with_table(br, predictor, mv_table)?;
+    mv_grid.set_cell(mb_x, mb_y, crate::mv_pred::MvGridCell::OneMv(mv));
+
+    // Lay down the motion-compensated prediction first; the residual
+    // (decoded below) is added on top of it.
+    apply_mc_to_mb(pic, reference, mb_x, mb_y, (mv.x as i32, mv.y as i32));
+
+    decode_inter_residual_blocks(
+        br,
+        pic,
+        mb_x,
+        mb_y,
+        quant,
+        inter_ac,
+        decode.cbpy,
+        decode.cbp_cb,
+        decode.cbp_cr,
+    )
+}
+
+/// Compute the 1-MV-per-MB §7.6.5 predictor for `(mb_x, mb_y)` from the
+/// picture-wide [`crate::mv_pred::MvGrid`].
+///
+/// Picture-edge-aware neighbour lookup (spec/06 §3.4 +
+/// `docs/video/mpeg4-visual/figure-7-34-mv-predictor-layout.md` §
+/// "Boundary substitution"): the grid surfaces missing neighbours as
+/// [`crate::mv_pred::NeighbourMvKind::Absent`], which threads through
+/// the [`crate::mv_pred::BlockCandidates`] fields as `None`; then
+/// [`crate::mv_pred::predict_block_mv`] applies the four §7.6.5
+/// candidate-validity substitution rules for the Figure 7-34 top-left
+/// sub-diagram (the 1-MV-per-MB case). Shared by the v3 P-frame path
+/// and the v1/v2 P-frame path — per spec/07 §3.5 the v1/v2 MV decoder
+/// body calls the *same* median-of-3 predictor helper (`0x1c217c8c`)
+/// as v3, with identical semantics.
+fn one_mv_predictor(mv_grid: &crate::mv_pred::MvGrid, mb_x: usize, mb_y: usize) -> crate::mv::Mv {
+    let nset = mv_grid.neighbour_set_for(mb_x, mb_y);
+    let left = match nset.left {
+        crate::mv_pred::NeighbourMvKind::Absent => None,
+        crate::mv_pred::NeighbourMvKind::OneMv(mv) => Some(mv),
+        // 1-MV-per-MB path: neighbours are always OneMv or Absent.
+        // 4-MV-coded neighbours would land here once the 4-MV-per-MB
+        // bitstream signalling is wired (round 240+, depth follow-up).
+        crate::mv_pred::NeighbourMvKind::FourMv(mvs) => Some(mvs[1]),
+    };
+    let top = match nset.above {
+        crate::mv_pred::NeighbourMvKind::Absent => None,
+        crate::mv_pred::NeighbourMvKind::OneMv(mv) => Some(mv),
+        crate::mv_pred::NeighbourMvKind::FourMv(mvs) => Some(mvs[2]),
+    };
+    let top_right = match nset.above_right {
+        crate::mv_pred::NeighbourMvKind::Absent => None,
+        crate::mv_pred::NeighbourMvKind::OneMv(mv) => Some(mv),
+        crate::mv_pred::NeighbourMvKind::FourMv(mvs) => Some(mvs[2]),
+    };
     let cands = crate::mv_pred::BlockCandidates {
         left_mb: left,
         above_mb: top,
@@ -615,26 +643,40 @@ fn decode_pframe_mb(
         mb_block_2: None,
         mb_block_3: None,
     };
-    let predictor = crate::mv_pred::predict_block_mv(crate::mv_pred::Block::TopLeft, &cands);
-    let mv = crate::mv::decode_mv_with_table(br, predictor, mv_table)?;
-    mv_grid.set_cell(mb_x, mb_y, crate::mv_pred::MvGridCell::OneMv(mv));
+    crate::mv_pred::predict_block_mv(crate::mv_pred::Block::TopLeft, &cands)
+}
 
-    // Lay down the motion-compensated prediction first; the residual
-    // (decoded below) is added on top of it.
-    apply_mc_to_mb(pic, reference, mb_x, mb_y, (mv.x as i32, mv.y as i32));
-
-    // Inter residual: per spec/04 §1 the coded-block-pattern from the
-    // MCBPCY decode selects which of the 6 blocks carry an AC walk. The
-    // four luma CBPY bits are MSB-first (block 0 = bit 3); chroma blocks
-    // use the cbp_cb / cbp_cr flags. Each coded block decodes the G4
-    // inter AC VLC (spec/04 §1.3), dequantises (spec/08 §3.2,
-    // level_start = 0 — DC is a coded coefficient on the inter path),
-    // IDCTs to a signed residual, and is added onto the MC prediction.
+/// Decode the inter AC residual for every CBP-coded block of one MB and
+/// add it onto the MC prediction already laid down in `pic`.
+///
+/// Per spec/04 §1 the coded-block-pattern from the MB-header decode
+/// selects which of the 6 blocks carry an AC walk. The four luma CBPY
+/// bits are MSB-first (block 0 = bit 3); chroma blocks use the cbp_cb /
+/// cbp_cr flags. Each coded block decodes the G4 inter AC VLC (spec/04
+/// §1.3), dequantises (spec/08 §3.2, level_start = 0 — DC is a coded
+/// coefficient on the inter path), IDCTs to a signed residual, and is
+/// added onto the MC prediction. Shared by the v3 and v1/v2 P-frame
+/// paths: per spec/99 §6 the v1 inter DCT kernel (`0x1c215d2c`) and the
+/// v2/v3 inter kernels consume the same G4 alphabet with a hard-coded
+/// zigzag, scan start 0, single-tier ESC, and the uniform H.263
+/// Eq. 12 dequant pair (spec/08 §5).
+#[allow(clippy::too_many_arguments)]
+fn decode_inter_residual_blocks(
+    br: &mut BitReader<'_>,
+    pic: &mut Picture,
+    mb_x: usize,
+    mb_y: usize,
+    quant: u32,
+    inter_ac: &AcVlcTable,
+    cbpy: u8,
+    cbp_cb: bool,
+    cbp_cr: bool,
+) -> Result<()> {
     for block_idx in 0..6usize {
         let coded = match block_idx {
-            0..=3 => decode.cbpy & (1 << (3 - block_idx)) != 0,
-            4 => decode.cbp_cb,
-            5 => decode.cbp_cr,
+            0..=3 => cbpy & (1 << (3 - block_idx)) != 0,
+            4 => cbp_cb,
+            5 => cbp_cr,
             _ => unreachable!(),
         };
         if !coded {
@@ -646,8 +688,241 @@ fn decode_pframe_mb(
         idct8x8_to_pel(&coeffs, &mut residual);
         add_residual_to_picture(pic, mb_x, mb_y, block_idx, &residual);
     }
-
     Ok(())
+}
+
+// ==================== v1 / v2 picture decode ====================
+
+/// Version selector for [`decode_picture_v1v2`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MsV1V2Version {
+    /// MS-MPEG4 v1 (`MP41` / `MPG4`): 37-bit opaque picture-header
+    /// preamble + P-frame UMV flag (spec/01 §1.4), separate 21-entry
+    /// MCBPC VLC (spec/07 §1), no AC-prediction bit anywhere
+    /// (spec/07 §1.4).
+    V1,
+    /// MS-MPEG4 v2 (`MP42`): no preamble, separate 8-entry MCBPC VLC
+    /// (spec/07 §2), P-frame-gated skip bit, AC-prediction bit on
+    /// intra-in-P MBs only (spec/07 §2.4).
+    V2,
+}
+
+/// Decode one MS-MPEG4 v1 / v2 picture.
+///
+/// Wires the P-frame **skip + inter** macroblock pixel pipeline
+/// end-to-end:
+///
+///   1. Picture header via [`MsV1V2PictureHeader::parse_v1`] /
+///      [`parse_v2`](MsV1V2PictureHeader::parse_v2) (spec/01 §1.4).
+///      The v1 P-frame UMV flag is consumed as framing but not
+///      branched on — per spec/07 §3.4 the v<4 MV decoder body does
+///      not branch on it.
+///   2. Per-MB loop (raster order, single slice per spec/01 §3):
+///      [`crate::mcbpcy::decode_mcbpcy_v1`] /
+///      [`decode_mcbpcy_v2`](crate::mcbpcy::decode_mcbpcy_v2) for the
+///      MB header (skip bit + separate MCBPC + CBPY VLCs, spec/07
+///      §1-§2).
+///   3. Skipped MBs copy the reference at MV = (0, 0); coded inter
+///      MBs decode the per-component MV pair
+///      ([`crate::mv::decode_mv_v1v2`], shared 65-entry table at VMA
+///      `0x1c24f930`, spec/07 §3) against the same §7.6.5 1-MV
+///      predictor as v3 (same helper `0x1c217c8c` per spec/07 §3.5),
+///      apply half-pel MC, then add the G4 inter AC residual for every
+///      CBP-coded block — per spec/14 §3.1 the v1/v2 fallthrough at
+///      `0x1c212917` pins the inter/chroma DCT descriptor to G4, and
+///      per spec/99 §6 the inter kernels share the hard-zigzag /
+///      scan-start-0 / single-tier-ESC shape across v1/v2/v3.
+///
+/// **Still gated (documented `Unsupported`):**
+///
+/// * **I-frames and intra-in-P MBs** — the staged trace pins that
+///   v1/v2 do *not* load the v3 spatial-prediction LUT pair at
+///   `0x1c23a788 / 0x1c23a7b0` (spec/07 §1.6), but no chapter
+///   documents the replacement DC-prediction rule the shared intra
+///   kernel (`0x1c216d97`, spec/99 §6) uses on the v1/v2 path, nor
+///   the v1/v2 intra DC-size descriptor binding. Decoding intra
+///   pixels would be guesswork; we surface the precise gap instead.
+/// * **v1 non-zero inter MB sub-types** (`mb_type` ∈ {1, 2, 4, 5}) —
+///   spec/07 §1.4 pins only the `mb_type = mcbpc >> 2` decomposition
+///   and the H.263 Table-8 *lineage* ("structural, value-level match
+///   not asserted"); the per-sub-type side reads (quantiser delta /
+///   per-block MV count) are untraced.
+pub fn decode_picture_v1v2(
+    br: &mut BitReader<'_>,
+    dims: PictureDims,
+    version: MsV1V2Version,
+    reference: Option<&Picture>,
+) -> Result<Picture> {
+    let codec = match version {
+        MsV1V2Version::V1 => "msmpeg4v1",
+        MsV1V2Version::V2 => "msmpeg4v2",
+    };
+    let hdr = match version {
+        MsV1V2Version::V1 => MsV1V2PictureHeader::parse_v1(br)?,
+        MsV1V2Version::V2 => MsV1V2PictureHeader::parse_v2(br)?,
+    };
+    match hdr.picture_type {
+        PictureType::I => Err(Error::unsupported(format!(
+            "{codec}: parsed I-frame picture header (quant={}) but the \
+             v1/v2 intra pixel pipeline is gated on a docs gap: spec/07 \
+             §1.6 pins that v1/v2 do not load the v3 spatial-prediction \
+             LUT pair at 0x1c23a788 / 0x1c23a7b0, and no staged chapter \
+             documents the replacement DC-prediction rule or the v1/v2 \
+             intra DC-size descriptor binding for the shared intra \
+             kernel 0x1c216d97 (spec/99 §6). P-frame skip + inter MBs \
+             decode end-to-end.",
+            hdr.quant,
+        ))),
+        PictureType::P => {
+            let reference = reference.ok_or_else(|| {
+                Error::invalid(format!(
+                    "{codec}: P-frame decode requires a reference picture \
+                     (decoder state is missing the previous frame). Make \
+                     sure to feed packets in decode order starting with an \
+                     I-frame.",
+                ))
+            })?;
+            decode_pframe_v1v2(br, dims, &hdr, version, codec, reference)
+        }
+    }
+}
+
+/// Decode a full v1/v2 P-frame into a [`Picture`], using the supplied
+/// `reference` for motion compensation. See [`decode_picture_v1v2`]
+/// for the pipeline shape and the documented gates.
+fn decode_pframe_v1v2(
+    br: &mut BitReader<'_>,
+    dims: PictureDims,
+    hdr: &MsV1V2PictureHeader,
+    version: MsV1V2Version,
+    codec: &'static str,
+    reference: &Picture,
+) -> Result<Picture> {
+    if reference.width != dims.width || reference.height != dims.height {
+        return Err(Error::invalid(format!(
+            "{codec}: P-frame reference dimensions {}x{} differ from \
+             current {}x{}",
+            reference.width, reference.height, dims.width, dims.height,
+        )));
+    }
+
+    let (mb_w, mb_h) = dims.mb_dims();
+    let mut pic = Picture::alloc(dims, PictureType::P);
+    let quant = hdr.quant as u32;
+    // Per spec/14 §3.1 the v1/v2 fallthrough at `0x1c212917` binds the
+    // inter/chroma DCT descriptor to G4 unconditionally — there is no
+    // per-frame AC selector in the v1/v2 picture header (spec/01 §1.4:
+    // the selector reads gate on `version == 3`).
+    let inter_ac = crate::ac::AcVlcTable::g4_inter();
+    let mut mv_grid = crate::mv_pred::MvGrid::new(mb_w, mb_h);
+
+    for my in 0..mb_h {
+        for mx in 0..mb_w {
+            decode_pframe_mb_v1v2(
+                br,
+                &mut pic,
+                &mut mv_grid,
+                reference,
+                mx,
+                my,
+                quant,
+                version,
+                codec,
+                &inter_ac,
+            )?;
+        }
+    }
+
+    Ok(pic)
+}
+
+/// Decode one v1/v2 P-frame MB: skip bit, separate MCBPC / CBPY VLCs,
+/// then (for a plain inter MB) per-component MV decode, half-pel MC,
+/// and the G4 inter residual. See [`decode_picture_v1v2`] for the
+/// documented gates on intra-in-P and the v1 non-zero sub-types.
+#[allow(clippy::too_many_arguments)]
+fn decode_pframe_mb_v1v2(
+    br: &mut BitReader<'_>,
+    pic: &mut Picture,
+    mv_grid: &mut crate::mv_pred::MvGrid,
+    reference: &Picture,
+    mb_x: usize,
+    mb_y: usize,
+    quant: u32,
+    version: MsV1V2Version,
+    codec: &'static str,
+    inter_ac: &AcVlcTable,
+) -> Result<()> {
+    use crate::mcbpcy::{decode_mcbpcy_v1, decode_mcbpcy_v2, V2FrameType};
+
+    let decode = match version {
+        MsV1V2Version::V1 => decode_mcbpcy_v1(br)?,
+        MsV1V2Version::V2 => decode_mcbpcy_v2(br, V2FrameType::P)?,
+    };
+
+    if decode.skip {
+        // Skipped MB: copy the MC prediction at MV = (0, 0). The MV
+        // grid records a zero MV so downstream neighbour predictors
+        // see this column as a valid (0, 0) candidate — same
+        // convention as the v3 skip path.
+        mv_grid.set_cell(
+            mb_x,
+            mb_y,
+            crate::mv_pred::MvGridCell::OneMv(crate::mv::Mv::default()),
+        );
+        apply_mc_to_mb(pic, reference, mb_x, mb_y, (0, 0));
+        return Ok(());
+    }
+
+    if decode.is_intra {
+        // Intra-in-P: same docs gap as v1/v2 I-frames — the v1/v2
+        // DC-prediction rule and intra DC-size descriptor binding are
+        // not in the staged trace (see `decode_picture_v1v2`).
+        return Err(Error::unsupported(format!(
+            "{codec}: intra-in-P MB at ({mb_x}, {mb_y}) — the v1/v2 \
+             intra pixel pipeline is gated on the spec/07 §1.6 \
+             DC-prediction docs gap (see decode_picture_v1v2). Skip + \
+             inter MBs decode end-to-end.",
+        )));
+    }
+
+    if decode.mb_type != 0 {
+        // spec/07 §1.4 pins only the `mb_type = mcbpc >> 2`
+        // decomposition; the per-sub-type side reads (quantiser
+        // delta / per-block MV count in the H.263 Table-8 lineage)
+        // are untraced, so anything but the plain 1-MV inter type 0
+        // is rejected with the precise gap.
+        return Err(Error::unsupported(format!(
+            "{codec}: inter MB sub-type {} at ({mb_x}, {mb_y}) — \
+             spec/07 §1.4 asserts the H.263 Table-8 lineage only \
+             structurally; the per-sub-type side reads are an open \
+             trace item, so only sub-type 0 (plain 1-MV inter) is \
+             decoded.",
+            decode.mb_type,
+        )));
+    }
+
+    // Plain inter MB: §7.6.5 1-MV predictor (same helper as v3 per
+    // spec/07 §3.5), two separate component reads against the shared
+    // 65-entry table (spec/07 §3.2), bias subtract + toroidal wrap
+    // inside `decode_mv_v1v2`.
+    let predictor = one_mv_predictor(mv_grid, mb_x, mb_y);
+    let mv = crate::mv::decode_mv_v1v2(br, predictor)?;
+    mv_grid.set_cell(mb_x, mb_y, crate::mv_pred::MvGridCell::OneMv(mv));
+
+    apply_mc_to_mb(pic, reference, mb_x, mb_y, (mv.x as i32, mv.y as i32));
+
+    decode_inter_residual_blocks(
+        br,
+        pic,
+        mb_x,
+        mb_y,
+        quant,
+        inter_ac,
+        decode.cbpy,
+        decode.cbp_cb,
+        decode.cbp_cr,
+    )
 }
 
 /// Add a signed 8×8 IDCT residual onto the existing (motion-compensated)

@@ -16,10 +16,11 @@
 //! 3. Symmetry of the alphabet around the bias point (sym 32 = MVD 0):
 //!    sym 32+k and sym 32-k always have the same canonical bit length.
 //!
-//! NOTE: full per-MB pixel reconstruction is still gated on the v1/v2
-//! intra-AC and inter-AC VLC tables (spec/99 §9 OPEN-O4). The MV
-//! decoder built in this round produces the (MVx, MVy) byte pair the
-//! MC fetcher consumes, but the residual path is still placeholder.
+//! NOTE: as of round 285 the v1/v2 P-frame skip + inter pixel pipeline
+//! decodes end-to-end (`picture::decode_picture_v1v2`, exercised in
+//! `tests/v1_v2_pframe.rs`); this MV decoder feeds it directly. The
+//! v1/v2 intra paths remain gated on the spec/07 §1.6 DC-prediction
+//! docs gap.
 
 use oxideav_core::bits::BitReader;
 use oxideav_msmpeg4::mcbpcy::{decode_mcbpcy_v1, decode_mcbpcy_v2, V2FrameType};
