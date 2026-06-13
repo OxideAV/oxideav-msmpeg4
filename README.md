@@ -63,6 +63,7 @@ right decoder when a packet arrives.
 | `decode_pframe` MV cache routed through `MvGrid` | wired (round 240, replaces parallel `Vec<Option<Mv>>`) |
 | Per-MB 4-MV decoder → `MvGridCell` one-shot bridge | `finalise_to_grid_cell` on both 4-MV decoders (round 243) |
 | `MvGrid` video-packet / GOB boundary-reset helpers + raster iter | `clear_cell` / `clear_row` / `clear_all` + `iter_cells` (round 246) |
+| Per-G-family `pri_A` / `pri_B` runtime-binding accessors | `pri_a_vma` / `pri_b_vma` / `pri_{a,b}_size_bytes` on `GFamily` (round 292, spec/14 §3) |
 
 ### What's still spec-OPEN for real-content decode
 
@@ -739,6 +740,37 @@ sweep test pins the corrected direction across PQUANT 1..=31 and four
 existing value-expectation tests plus one integration assertion were
 updated. Lib tests 395 → 396 (+1); the module docs now carry the
 spec/07-vs-spec/08 reconciliation inline.
+
+Round-292 (2026-06-14) lands a **per-G-family `pri_A` / `pri_B`
+runtime-binding accessor surface** on [`g_family::GFamily`], completing
+the schema-binding reference the round-254
+`field_state_struct_offset(PriABase / PriBBase)` accessors point at
+(they yield the descriptor `+0x1c` / `+0x20` slot offsets; this round
+resolves each slot to the `.data` VMA it is bound to and the bound
+array's byte size). Per
+`docs/video/msmpeg4/spec/14-pri-ab-runtime-binding.md` §2.1 / §3 the
+constructor `mb_mv_struct_init` (`0x1c210643`) writes 12 literal-
+immediate stores binding every G-descriptor's `pri_A` (level-magnitude
+byte array) and `pri_B` (run-value u32 array) base pointers — a
+**static, one-shot** binding that is never re-bound for the lifetime of
+the decoder (spec/14 §5.2 item 5). The four new const-fn accessors are
+[`GFamily::pri_a_vma`] (G0=`0x1c257860` … G5=`0x1c258430`),
+[`GFamily::pri_b_vma`] (G0=`0x1c2575c0` … G5=`0x1c258498`),
+[`GFamily::pri_a_size_bytes`] (= `count_A`, 1 byte/symbol) and
+[`GFamily::pri_b_size_bytes`] (= `count_A * 4`, a u32 run value/symbol).
+Four new lib tests pin every VMA against the spec/14 §3 binding table,
+the byte sizes against §3 and their definitional equality with
+`count_a()`, the spec/14 §2.3 cluster-containment + pairwise-non-overlap
+of all 12 arrays inside `[0x1c2575c0, 0x1c258630)` (the tail ending
+exactly at the first per-slot packed-Huffman source VMA `0x1c258630`),
+and the const-fn property. Test suite 396 → 400 (+4) lib tests; purely
+additive, no runtime path rewired and no new tables introduced. The
+surface is intended as the canonical Auditor reconciliation reference:
+`GFamily::field_state_struct_offset(field)` names the descriptor slot,
+`GFamily::pri_{a,b}_vma()` names the `.data` VMA stored there, and the
+in-tree `(idx → |level|)` / `(idx → run)` mappings (via
+[`g_descriptor`] / [`g_enum`]) are the materialised form of the byte /
+u32 arrays at those VMAs.
 
 ## License
 

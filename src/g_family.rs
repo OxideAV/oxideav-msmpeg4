@@ -324,6 +324,98 @@ impl GFamily {
         self.descriptor_base_offset() + field.offset_in_record()
     }
 
+    /// The `.data` VMA stored into this descriptor's `+0x1c` slot
+    /// (`pri_A` base pointer — the level-magnitude byte array) by the
+    /// constructor `mb_mv_struct_init` at `0x1c210643`.
+    ///
+    /// Per `docs/video/msmpeg4/spec/14-pri-ab-runtime-binding.md` §2.1 /
+    /// §3 the binding is **static, one-shot, at decoder construction** —
+    /// there is no per-frame or lazy re-binding (spec/14 §5.2 item 5).
+    /// The 12 literal-immediate stores are enumerated in spec/14 §2.1; the
+    /// per-family `pri_A` VMA is the `mov DWORD PTR [ecx+<desc+0x1c>],
+    /// <pri_A_VMA>` immediate:
+    ///
+    /// | G | `pri_A` VMA  |
+    /// | - | ------------ |
+    /// | G0 | `0x1c257860` |
+    /// | G1 | `0x1c257bf0` |
+    /// | G2 | `0x1c257f00` |
+    /// | G3 | `0x1c2581a8` |
+    /// | G4 | `0x1c258230` |
+    /// | G5 | `0x1c258430` |
+    ///
+    /// These are the source-of-truth addresses an Extractor reads the
+    /// `pri_A` level-magnitude bytes from; the crate's in-tree
+    /// `(idx → |level|)` mapping (via [`crate::g_descriptor`] /
+    /// [`crate::g_enum`]) is the materialised form of the byte array at
+    /// this VMA. Exposed so a future Auditor reconciliation has a single
+    /// canonical reference for the binary's per-family `pri_A` base.
+    pub const fn pri_a_vma(self) -> u32 {
+        match self {
+            GFamily::G0 => 0x1c25_7860,
+            GFamily::G1 => 0x1c25_7bf0,
+            GFamily::G2 => 0x1c25_7f00,
+            GFamily::G3 => 0x1c25_81a8,
+            GFamily::G4 => 0x1c25_8230,
+            GFamily::G5 => 0x1c25_8430,
+        }
+    }
+
+    /// The `.data` VMA stored into this descriptor's `+0x20` slot
+    /// (`pri_B` base pointer — the run-value `u32` array) by the
+    /// constructor `mb_mv_struct_init` at `0x1c210643`.
+    ///
+    /// Per `docs/video/msmpeg4/spec/14-pri-ab-runtime-binding.md` §2.1 /
+    /// §3 (same static one-shot binding as [`pri_a_vma`]):
+    ///
+    /// | G | `pri_B` VMA  |
+    /// | - | ------------ |
+    /// | G0 | `0x1c2575c0` |
+    /// | G1 | `0x1c257908` |
+    /// | G2 | `0x1c257cb0` |
+    /// | G3 | `0x1c257f98` |
+    /// | G4 | `0x1c258298` |
+    /// | G5 | `0x1c258498` |
+    ///
+    /// Per spec/14 §2.3 the `pri_A` and `pri_B` arrays are interleaved
+    /// back-to-back in the contiguous `.data` cluster
+    /// `[0x1c2575c0 .. 0x1c258630)`; the per-slot packed-Huffman sources
+    /// (spec/11 §5) start immediately after at `0x1c258630`.
+    ///
+    /// [`pri_a_vma`]: GFamily::pri_a_vma
+    pub const fn pri_b_vma(self) -> u32 {
+        match self {
+            GFamily::G0 => 0x1c25_75c0,
+            GFamily::G1 => 0x1c25_7908,
+            GFamily::G2 => 0x1c25_7cb0,
+            GFamily::G3 => 0x1c25_7f98,
+            GFamily::G4 => 0x1c25_8298,
+            GFamily::G5 => 0x1c25_8498,
+        }
+    }
+
+    /// Byte length of this descriptor's `pri_A` array (the
+    /// level-magnitude byte array at [`pri_a_vma`]). Per spec/14 §1 /
+    /// §3 the kernel reads `[pri_A + sym]` for `sym ∈ [0, count_A − 1]`,
+    /// so the array is exactly `count_A` bytes (1 byte per symbol).
+    ///
+    /// [`pri_a_vma`]: GFamily::pri_a_vma
+    pub const fn pri_a_size_bytes(self) -> usize {
+        // 1 byte per symbol, count_A symbols (spec/14 §1 row +0x1c).
+        self.count_a()
+    }
+
+    /// Byte length of this descriptor's `pri_B` array (the run-value
+    /// `u32` array at [`pri_b_vma`]). Per spec/14 §1 / §3 the kernel
+    /// reads `[pri_B + sym * 4]` for `sym ∈ [0, count_A − 1]`, so the
+    /// array is `count_A * 4` bytes (a `u32` run value per symbol).
+    ///
+    /// [`pri_b_vma`]: GFamily::pri_b_vma
+    pub const fn pri_b_size_bytes(self) -> usize {
+        // 4 bytes (u32) per symbol, count_A symbols (spec/14 §1 row +0x20).
+        self.count_a() * 4
+    }
+
     /// Per spec/14 §3.1: the role this descriptor fills in the per-frame
     /// dispatch. Chroma+all-inter for G0/G2/G4; intra-luma for G1/G3/G5.
     pub const fn role(self) -> GRole {
@@ -1012,6 +1104,133 @@ mod tests {
                 "{g:?} stored-at VMA round-trip to its index"
             );
         }
+    }
+
+    #[test]
+    fn pri_ab_vmas_match_spec_14_section_3_binding_table() {
+        // Per spec/14 §3 / §2.1 the constructor mb_mv_struct_init at
+        // 0x1c210643 writes these literal-immediate pri_A (+0x1c) and
+        // pri_B (+0x20) base VMAs per G-family.
+        let expected = [
+            (GFamily::G0, 0x1c25_7860u32, 0x1c25_75c0u32),
+            (GFamily::G1, 0x1c25_7bf0, 0x1c25_7908),
+            (GFamily::G2, 0x1c25_7f00, 0x1c25_7cb0),
+            (GFamily::G3, 0x1c25_81a8, 0x1c25_7f98),
+            (GFamily::G4, 0x1c25_8230, 0x1c25_8298),
+            (GFamily::G5, 0x1c25_8430, 0x1c25_8498),
+        ];
+        for (g, pa, pb) in expected {
+            assert_eq!(g.pri_a_vma(), pa, "{g:?} pri_A VMA");
+            assert_eq!(g.pri_b_vma(), pb, "{g:?} pri_B VMA");
+        }
+    }
+
+    #[test]
+    fn pri_ab_sizes_match_count_a_per_spec_14_section_3() {
+        // Per spec/14 §3: pri_A is count_A bytes (1B/sym); pri_B is
+        // count_A * 4 bytes (u32/sym). Concrete values from the §3 table.
+        let expected = [
+            (GFamily::G0, 168usize, 672usize),
+            (GFamily::G1, 185, 740),
+            (GFamily::G2, 148, 592),
+            (GFamily::G3, 132, 528),
+            (GFamily::G4, 102, 408),
+            (GFamily::G5, 102, 408),
+        ];
+        for (g, pa_size, pb_size) in expected {
+            assert_eq!(g.pri_a_size_bytes(), pa_size, "{g:?} pri_A size");
+            assert_eq!(g.pri_b_size_bytes(), pb_size, "{g:?} pri_B size");
+            // Definitional cross-checks against count_a().
+            assert_eq!(g.pri_a_size_bytes(), g.count_a(), "{g:?} pri_A = count_A");
+            assert_eq!(
+                g.pri_b_size_bytes(),
+                g.count_a() * 4,
+                "{g:?} pri_B = count_A * 4"
+            );
+        }
+    }
+
+    #[test]
+    fn pri_ab_arrays_lie_in_data_cluster_without_overlap() {
+        // Per spec/14 §2.3 the 12 pri_A / pri_B arrays are laid out
+        // interleaved in the contiguous .data cluster
+        // [0x1c2575c0 .. 0x1c258630). The cluster START is G0's pri_B
+        // (the lowest VMA) and the cluster END is exactly the first
+        // per-slot packed-Huffman source VMA (spec/11 §5 row 1 /
+        // spec/14 §2.3 "no slack" at the tail). The interleave carries
+        // small 4-byte alignment gaps between adjacent arrays (pri_B is
+        // a u32 array, so its successor pri_A starts at a 4-aligned VMA),
+        // so this pins containment + pairwise non-overlap + the exact
+        // tail boundary, NOT zero-gap tiling.
+        const CLUSTER_START: u32 = 0x1c25_75c0;
+        const CLUSTER_END: u32 = 0x1c25_8630; // first Huffman source VMA.
+
+        // Collect every (start, end) interval from all 12 arrays.
+        let mut intervals: Vec<(u32, u32)> = Vec::new();
+        for g in GFamily::ALL {
+            let a_start = g.pri_a_vma();
+            let a_end = a_start + g.pri_a_size_bytes() as u32;
+            let b_start = g.pri_b_vma();
+            let b_end = b_start + g.pri_b_size_bytes() as u32;
+            // Each array lies fully inside the cluster.
+            assert!(
+                a_start >= CLUSTER_START && a_end <= CLUSTER_END,
+                "{g:?} pri_A [{a_start:#x},{a_end:#x}) escapes cluster"
+            );
+            assert!(
+                b_start >= CLUSTER_START && b_end <= CLUSTER_END,
+                "{g:?} pri_B [{b_start:#x},{b_end:#x}) escapes cluster"
+            );
+            intervals.push((a_start, a_end));
+            intervals.push((b_start, b_end));
+        }
+        intervals.sort_by_key(|&(s, _)| s);
+        // The lowest array begins exactly at the cluster start (G0 pri_B).
+        assert_eq!(
+            intervals[0].0, CLUSTER_START,
+            "lowest array starts at cluster start"
+        );
+        // The highest array ends exactly at the first Huffman source VMA
+        // (spec/14 §2.3: G5's pri_B ends at 0x1c258630 with no slack).
+        assert_eq!(
+            intervals[intervals.len() - 1].1,
+            CLUSTER_END,
+            "highest array ends exactly at the first Huffman source VMA"
+        );
+        // No two arrays overlap (each successor starts at or after the
+        // previous array's end). Adjacent arrays may carry small
+        // alignment gaps — pri_A is a byte array whose odd length leaves
+        // its u32-aligned pri_B successor a few padding bytes — so this
+        // pins non-overlap, not zero-gap tiling.
+        for pair in intervals.windows(2) {
+            assert!(
+                pair[1].0 >= pair[0].1,
+                "overlap between {:#x?} and {:#x?}",
+                pair[0],
+                pair[1]
+            );
+        }
+        // The combined payload (12 arrays) must not exceed the cluster
+        // span — a coarse density check that the cluster bound is real.
+        let payload: u32 = intervals.iter().map(|&(s, e)| e - s).sum();
+        assert!(
+            payload <= CLUSTER_END - CLUSTER_START,
+            "payload {payload} exceeds cluster span"
+        );
+    }
+
+    #[test]
+    fn pri_ab_vmas_are_const_fn() {
+        // const-fn property: usable in const context (mirrors the other
+        // accessor const-fn pins).
+        const G5_PRI_A: u32 = GFamily::G5.pri_a_vma();
+        const G5_PRI_B: u32 = GFamily::G5.pri_b_vma();
+        const G5_PRI_A_SZ: usize = GFamily::G5.pri_a_size_bytes();
+        const G5_PRI_B_SZ: usize = GFamily::G5.pri_b_size_bytes();
+        assert_eq!(G5_PRI_A, 0x1c25_8430);
+        assert_eq!(G5_PRI_B, 0x1c25_8498);
+        assert_eq!(G5_PRI_A_SZ, 102);
+        assert_eq!(G5_PRI_B_SZ, 408);
     }
 
     #[test]

@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 292 — per-G-family `pri_A` / `pri_B` runtime-binding
+  accessor surface** (2026-06-14): four additive const-fn accessors on
+  `g_family::GFamily` mirroring the static binding table in
+  `docs/video/msmpeg4/spec/14-pri-ab-runtime-binding.md` §3.
+  `pri_a_vma()` / `pri_b_vma()` return the `.data` VMA the constructor
+  `mb_mv_struct_init` (`0x1c210643`) writes into each descriptor's
+  `+0x1c` (level-magnitude byte array) / `+0x20` (run-value u32 array)
+  slots — one-shot, static, never re-bound (spec/14 §2.1 / §5.2 item 5):
+  G0=`0x1c257860`/`0x1c2575c0`, G1=`0x1c257bf0`/`0x1c257908`,
+  G2=`0x1c257f00`/`0x1c257cb0`, G3=`0x1c2581a8`/`0x1c257f98`,
+  G4=`0x1c258230`/`0x1c258298`, G5=`0x1c258430`/`0x1c258498`.
+  `pri_a_size_bytes()` returns `count_A` (1 byte per symbol) and
+  `pri_b_size_bytes()` returns `count_A * 4` (a u32 run value per
+  symbol) per spec/14 §1 / §3. This completes the schema-binding
+  reference the round-254 `field_state_struct_offset(PriABase/PriBBase)`
+  surface points at (slot offsets) by resolving each `+0x1c` / `+0x20`
+  slot to its bound `.data` VMA and array size — giving a future Auditor
+  a single canonical reference for the binary's per-family `pri_A` /
+  `pri_B` base pointers (`GFamily::field_state_struct_offset(field)` =
+  the descriptor slot; `GFamily::pri_{a,b}_vma()` = the VMA stored
+  there). Four new lib tests pin: every VMA against the spec/14 §3 §2.1
+  literal-immediate disassembly; pri_A/pri_B byte sizes against the §3
+  table and their definitional equality with `count_a()` / `count_a()*4`;
+  the spec/14 §2.3 cluster containment + pairwise non-overlap for all 12
+  arrays in `[0x1c2575c0, 0x1c258630)` with the tail ending exactly at
+  the first per-slot packed-Huffman source VMA (`0x1c258630`); and the
+  const-fn property. Lib tests 396 → 400 (+4). Purely additive; no
+  runtime path is rewired and no new tables are introduced.
+
 - **Round 285 — v1/v2 P-frame pixel pipeline (skip + inter MBs)
   end-to-end** (2026-06-12): new public
   `picture::decode_picture_v1v2` (+ `picture::MsV1V2Version`)
