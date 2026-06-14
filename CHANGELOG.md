@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 299 — 3-tier ESC LMAX/RMAX validated against the binary's
+  authoritative ESC-extension arrays** (2026-06-14): a new lib test
+  `ac::tests::esc_ext_arrays_match_derived_lmax_rmax_all_g` pins the
+  **derived** level-extension (LMAX, indexed by run) and run-extension
+  (RMAX, indexed by level) tables that drive the v3 intra 3-tier escape
+  body (`decode_escape_body`, rounds 7/27/126) against the binary's
+  **ground-truth** ESC-extension arrays extracted at `region_060988`
+  (VMA `0x1c261588..0x1c261e00`). Per
+  `docs/video/msmpeg4/spec/08-descriptor-constants.md` §1-§2 those four
+  per-descriptor arrays (`desc+0x0c`/`+0x10` level-ext, `desc+0x14`/
+  `+0x18` run-ext) are the only data the intra (`0x1c216d97`) and inter
+  (`0x1c215e6f`) kernels read on the first- and second-tier ESC paths;
+  spec/08 §4.1 left their *content* semantics OPEN. This round resolves
+  them empirically from the Implementer side: for all six G-families the
+  derived tables reproduce the extracted bytes **exactly** over each
+  array's meaningful extent, with the sub-A half mapping to `[last=0]`
+  and the sub-B half to `[last=1]`. The run-ext arrays carry a
+  never-indexed `0xFFFFFFFF` sentinel in the `level == 0` slot (an ESC's
+  re-decoded base symbol always has `|level| >= 1`); slices also carry
+  trailing bytes past the last alphabet-representable run/level
+  (spec/08 §2.4 only upper-bounds each array at `count_A * 4`), neither
+  of which is compared. The previously "derived from the same
+  packed-Huffman source the primary VLC consumes, but never
+  cross-checked against the binary's own extension tables" 3-tier ESC
+  body is therefore now a **ground-truth-verified** decode path. Lib
+  tests 400 → 401 (+1). Purely additive; no runtime path is rewired and
+  no new tables are introduced.
+
 - **Round 292 — per-G-family `pri_A` / `pri_B` runtime-binding
   accessor surface** (2026-06-14): four additive const-fn accessors on
   `g_family::GFamily` mirroring the static binding table in

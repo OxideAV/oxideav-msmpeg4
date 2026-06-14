@@ -45,7 +45,7 @@ right decoder when a packet arrives.
 | G0..G3 `(idx → (run, level, last))` enumeration | wired (round 29)     |
 | G0..G3 LMAX / RMAX (ESC-extension offsets)     | wired (round 7, 2026-05-17) |
 | G0..G3 canonical-Huffman primary VLC           | wired (round 234, spec/11 §5 row 1-4) |
-| MS-MPEG4v3 3-tier ESC body                     | wired (rounds 7 + 27 + 126: G5 LMAX/RMAX + tier 1/2/3 walk; integration-tested through `decode_intra_block_full_v3`) |
+| MS-MPEG4v3 3-tier ESC body                     | wired (rounds 7 + 27 + 126: G5 LMAX/RMAX + tier 1/2/3 walk; integration-tested through `decode_intra_block_full_v3`); LMAX/RMAX **ground-truth-validated** against the binary's ESC-extension arrays (`region_060988`) for all 6 G-families (round 299, spec/08 §1-§2/§4.1) |
 | P-frame MV VLC + half-pel MC (default table)   | complete              |
 | P-frame MV VLC alternate table                 | byte LUTs landed (round 251); VLC source still truncated |
 | Inter AC residual (G4 VLC → IDCT → add to MC)  | complete (round 123) |
@@ -771,6 +771,33 @@ surface is intended as the canonical Auditor reconciliation reference:
 in-tree `(idx → |level|)` / `(idx → run)` mappings (via
 [`g_descriptor`] / [`g_enum`]) are the materialised form of the byte /
 u32 arrays at those VMAs.
+
+Round-299 (2026-06-14) closes the spec/08 §4.1 "ESC-extension
+slice-content semantics OPEN" item from the Implementer side. The
+binary's intra (`0x1c216d97`) and inter (`0x1c215e6f`) kernels reach
+four per-descriptor arrays (`desc+0x0c`/`+0x10` level-extension,
+`desc+0x14`/`+0x18` run-extension) only on the first- and second-tier
+ESC paths, indexing them with the re-decoded symbol's value
+(`docs/video/msmpeg4/spec/08-descriptor-constants.md` §1-§2). Those
+arrays were extracted at `region_060988` (VMA `0x1c261588..0x1c261e00`)
+and wired byte-for-byte in round 33, but their *content* meaning was
+left OPEN. A new lib test
+`ac::tests::esc_ext_arrays_match_derived_lmax_rmax_all_g` proves
+empirically that each level-extension array is exactly the per-run
+`LMAX[sub-class]` table and each run-extension array is exactly the
+per-level `RMAX[sub-class]` table that the round-7/27/126 3-tier ESC
+body (`decode_escape_body`) already derives from the primary alphabet
+— and that the two agree **bit-for-bit** for all six G-families over
+each array's meaningful extent (sub-A → `[last=0]`, sub-B →
+`[last=1]`). The run-extension arrays store a never-indexed
+`0xFFFFFFFF` sentinel at the `level == 0` slot (an ESC's re-decoded
+base symbol always carries `|level| >= 1`) and trailing bytes past the
+last alphabet-representable run/level (spec/08 §2.4 only upper-bounds
+each array at `count_A * 4`); neither is compared. Net effect: the
+previously "derived but never cross-checked against the binary's own
+extension tables" 3-tier ESC body is now a **ground-truth-verified**
+decode path. Lib tests 400 → 401 (+1). Purely additive; no runtime
+path is rewired and no new tables are introduced.
 
 ## License
 

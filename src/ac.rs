@@ -2252,4 +2252,147 @@ mod tests {
             assert_eq!(block[ZIGZAG[pos]], level as i32);
         }
     }
+
+    /// Pin the **derived** 3-tier-ESC LMAX / RMAX tables against the
+    /// binary's **authoritative** ESC-extension arrays extracted at
+    /// `region_060988` (VMA `0x1c261588..0x1c261e00`, the descriptor
+    /// `+0x0c..+0x18` pointer targets per spec/08 §2.2).
+    ///
+    /// `docs/video/msmpeg4/spec/08-descriptor-constants.md` §1-§2 proved
+    /// that the v2/v3 intra kernel (`0x1c216d97`) and inter kernel
+    /// (`0x1c215e6f`) reach these four per-descriptor arrays only on the
+    /// first- (level-extension) and second-tier (run-extension) ESC
+    /// paths, indexing them with the **re-decoded symbol's** value via
+    /// `[base + idx*4]` (BYTE for the `+0x0c`/`+0x10` level-ext arrays,
+    /// DWORD for the `+0x14`/`+0x18` run-ext arrays). spec/08 §4.1 left
+    /// the *content* semantics OPEN. This test resolves them empirically
+    /// from the Implementer side: each level-ext array is exactly
+    /// `LMAX[sub-class][run]` (the per-run maximum `|level|` over the
+    /// G-family's primary alphabet) and each run-ext array is exactly
+    /// `RMAX[sub-class][level]` (the per-level maximum `run`). The two
+    /// sub-class halves (`+0x0c`/`+0x14` = sub-A / `last=0`,
+    /// `+0x10`/`+0x18` = sub-B / `last=1`) map to `[0]` / `[1]` of the
+    /// derived tables.
+    ///
+    /// All six G-families match exactly over each array's meaningful
+    /// extent — the run/level range for which an alphabet symbol exists
+    /// (`build_escape_body`'s [`decode_escape_body`] can never index past
+    /// that, since the re-decoded symbol's `(run, level)` is itself drawn
+    /// from the same alphabet). The slices carry trailing bytes beyond
+    /// that extent (an adjacent array or padding — spec/08 §2.4 only
+    /// upper-bounds each array at `count_A * 4`), which are not compared.
+    /// The run-ext arrays store `0xFFFFFFFF` in the `level == 0` slot
+    /// (a never-indexed sentinel, since an ESC's re-decoded base symbol
+    /// always carries `|level| >= 1`); the derived tables store `0`
+    /// there, and the two are treated as equal.
+    ///
+    /// This makes the round-7/27/126 3-tier ESC body — previously
+    /// "derived from the same packed-Huffman source the primary VLC
+    /// consumes" but never cross-checked against the binary's own
+    /// extension tables — a **ground-truth-verified** decode path.
+    ///
+    /// FROM: `docs/video/msmpeg4/spec/08-descriptor-constants.md` §1-§2 / §4.1
+    /// FROM: `crates/oxideav-msmpeg4/tables/region_060988.hex` + `region_060988_index.csv`
+    #[test]
+    fn esc_ext_arrays_match_derived_lmax_rmax_all_g() {
+        use crate::tables_data::{
+            ESC_EXT_G0_SLICE_INDICES, ESC_EXT_G1_SLICE_INDICES, ESC_EXT_G2_SLICE_INDICES,
+            ESC_EXT_G3_SLICE_INDICES, ESC_EXT_G4_SLICE_INDICES, ESC_EXT_G5_SLICE_INDICES,
+            ESC_EXT_SLICES,
+        };
+        let slice_u32 = |idx: usize| -> Vec<u32> {
+            ESC_EXT_SLICES[idx]
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect()
+        };
+        // The extracted slices are sized to the in-binary array allocation,
+        // which may carry trailing bytes belonging to an adjacent array or
+        // padding past the last meaningful entry (spec/08 §2.4 gives only
+        // an upper bound on each array's size). The meaningful extent of a
+        // level-extension array is `[0, max_run]` for that sub-class; of a
+        // run-extension array `[0, max_level]`. Compare only that prefix —
+        // the run/level beyond which the derived table is all-zero (no
+        // alphabet symbol exists, so the ESC walk can never index there).
+        let effective_len = |tbl: &[u8]| tbl.iter().rposition(|&v| v != 0).map_or(0, |p| p + 1);
+        let check = |name: &str, idxs: [usize; 4], lmax: &LevelLimitTable, rmax: &RunLimitTable| {
+            let lev_a = slice_u32(idxs[0]);
+            let lev_b = slice_u32(idxs[1]);
+            let run_a = slice_u32(idxs[2]);
+            let run_b = slice_u32(idxs[3]);
+            let norm = |v: u32| if v == u32::MAX { 0 } else { v };
+            for (sub, (slice, tbl)) in [(&lev_a, &lmax[0]), (&lev_b, &lmax[1])].iter().enumerate() {
+                let n = effective_len(*tbl);
+                assert!(slice.len() >= n, "{name} lev sub{sub}: slice too short");
+                for run in 0..n {
+                    assert_eq!(slice[run], tbl[run] as u32, "{name} lev sub{sub} run={run}");
+                }
+            }
+            for (sub, (slice, tbl)) in [(&run_a, &rmax[0]), (&run_b, &rmax[1])].iter().enumerate() {
+                let n = effective_len(*tbl);
+                assert!(slice.len() >= n, "{name} run sub{sub}: slice too short");
+                for lvl in 0..n {
+                    assert_eq!(
+                        norm(slice[lvl]),
+                        tbl[lvl] as u32,
+                        "{name} run sub{sub} lvl={lvl}"
+                    );
+                }
+            }
+        };
+        // G4's LMAX/RMAX derived from its alphabet (the shipping G4
+        // inter table uses a 1-tier ESC and does not consult them, but
+        // the binary still carries the arrays — cross-check the data).
+        let (g4_lmax, g4_rmax) = {
+            use crate::g_descriptor::{g4_iter, GSymbol};
+            let mut l: LevelLimitTable = [[0u8; 64]; 2];
+            let mut r: RunLimitTable = [[0u8; 32]; 2];
+            for (_i, sym) in g4_iter() {
+                if let GSymbol::Token(t) = sym {
+                    let li = if t.last { 1 } else { 0 };
+                    let run = t.run as usize;
+                    if run < 64 && t.level_mag > l[li][run] {
+                        l[li][run] = t.level_mag;
+                    }
+                    let lvl = t.level_mag as usize;
+                    if lvl < 32 && t.run > r[li][lvl] {
+                        r[li][lvl] = t.run;
+                    }
+                }
+            }
+            (l, r)
+        };
+        use crate::g_enum::GExtended;
+        check(
+            "G0",
+            ESC_EXT_G0_SLICE_INDICES,
+            &build_g_extended_lmax(GExtended::G0),
+            &build_g_extended_rmax(GExtended::G0),
+        );
+        check(
+            "G1",
+            ESC_EXT_G1_SLICE_INDICES,
+            &build_g_extended_lmax(GExtended::G1),
+            &build_g_extended_rmax(GExtended::G1),
+        );
+        check(
+            "G2",
+            ESC_EXT_G2_SLICE_INDICES,
+            &build_g_extended_lmax(GExtended::G2),
+            &build_g_extended_rmax(GExtended::G2),
+        );
+        check(
+            "G3",
+            ESC_EXT_G3_SLICE_INDICES,
+            &build_g_extended_lmax(GExtended::G3),
+            &build_g_extended_rmax(GExtended::G3),
+        );
+        check("G4", ESC_EXT_G4_SLICE_INDICES, &g4_lmax, &g4_rmax);
+        check(
+            "G5",
+            ESC_EXT_G5_SLICE_INDICES,
+            &build_g5_lmax(),
+            &build_g5_rmax(),
+        );
+    }
 }
