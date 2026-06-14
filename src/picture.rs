@@ -616,33 +616,30 @@ fn decode_pframe_mb(
 /// as v3, with identical semantics.
 fn one_mv_predictor(mv_grid: &crate::mv_pred::MvGrid, mb_x: usize, mb_y: usize) -> crate::mv::Mv {
     let nset = mv_grid.neighbour_set_for(mb_x, mb_y);
-    let left = match nset.left {
-        crate::mv_pred::NeighbourMvKind::Absent => None,
-        crate::mv_pred::NeighbourMvKind::OneMv(mv) => Some(mv),
-        // 1-MV-per-MB path: neighbours are always OneMv or Absent.
-        // 4-MV-coded neighbours would land here once the 4-MV-per-MB
-        // bitstream signalling is wired (round 240+, depth follow-up).
-        crate::mv_pred::NeighbourMvKind::FourMv(mvs) => Some(mvs[1]),
-    };
-    let top = match nset.above {
-        crate::mv_pred::NeighbourMvKind::Absent => None,
-        crate::mv_pred::NeighbourMvKind::OneMv(mv) => Some(mv),
-        crate::mv_pred::NeighbourMvKind::FourMv(mvs) => Some(mvs[2]),
-    };
-    let top_right = match nset.above_right {
-        crate::mv_pred::NeighbourMvKind::Absent => None,
-        crate::mv_pred::NeighbourMvKind::OneMv(mv) => Some(mv),
-        crate::mv_pred::NeighbourMvKind::FourMv(mvs) => Some(mvs[2]),
-    };
-    let cands = crate::mv_pred::BlockCandidates {
-        left_mb: left,
-        above_mb: top,
-        above_right_mb: top_right,
-        // 1-MV-per-MB mode has no within-MB block dependencies.
-        mb_block_1: None,
-        mb_block_2: None,
-        mb_block_3: None,
-    };
+    // Build the §7.6.5 candidate set for the 1-MV-per-MB case (Figure
+    // 7-34 top-left sub-diagram) through the spec-derived resolver
+    // (round 214) rather than hand-picking the neighbour bytes. For a
+    // 1-MV neighbour (`OneMv`) the resolver reports its single MV in
+    // every bordering direction; for a 4-MV-coded neighbour
+    // (`FourMv`) it indexes the neighbour's `[Mv; 4]` by the
+    // physically-bordering 8x8 cell per
+    // [`crate::mv_pred::bordering_block_of_neighbour`] (round 208,
+    // `docs/video/mpeg4-visual/figure-7-34-mv-predictor-layout.md`) —
+    // i.e. the current MB's block 1 takes its left neighbour's block 2
+    // (TR), its above neighbour's block 3 (BL), and its above-right
+    // neighbour's block 3 (BL). Previously these three indices were
+    // open-coded as `mvs[1]` / `mvs[2]` / `mvs[2]`, duplicating the
+    // Figure 7-34 mapping that already lives in the resolver and
+    // risking silent drift if that table is ever corrected. Routing
+    // through [`crate::mv_pred::resolve_block_candidates`] keeps the
+    // picture path provably consistent with the documented mapping.
+    // There are no within-MB block dependencies in the 1-MV case, so
+    // the within-MB slots are all `None`.
+    let cands = crate::mv_pred::resolve_block_candidates(
+        crate::mv_pred::Block::TopLeft,
+        nset,
+        [None, None, None],
+    );
     crate::mv_pred::predict_block_mv(crate::mv_pred::Block::TopLeft, &cands)
 }
 
@@ -2263,5 +2260,99 @@ mod tests {
         // Absent regardless of the skip-MB write.
         assert_eq!(set.above, NeighbourMvKind::Absent);
         assert_eq!(set.above_right, NeighbourMvKind::Absent);
+    }
+
+    #[test]
+    fn round_306_one_mv_predictor_unchanged_for_one_mv_neighbours() {
+        // Routing `one_mv_predictor` through
+        // `mv_pred::resolve_block_candidates` (replacing the open-coded
+        // FourMv index match) must not perturb the all-`OneMv` /
+        // `Absent` path that is the only one the shipping 1-MV-per-MB v3
+        // / v1 / v2 picture decoder exercises today. Pin the predictor
+        // output for a fully-populated interior MB against a direct
+        // `predict_block_mv(Block::TopLeft, ..)` call built by hand from
+        // the same three neighbour MVs.
+        use crate::mv::Mv;
+        use crate::mv_pred::{predict_block_mv, Block, BlockCandidates, MvGrid, MvGridCell};
+
+        let mut grid = MvGrid::new(3, 3);
+        let left = Mv { x: 4, y: -2 };
+        let above = Mv { x: -1, y: 3 };
+        let above_right = Mv { x: 6, y: 6 };
+        // Lay neighbours of the interior MB (1, 1): left (0, 1),
+        // above (1, 0), above-right (2, 0).
+        grid.set_cell(0, 1, MvGridCell::OneMv(left));
+        grid.set_cell(1, 0, MvGridCell::OneMv(above));
+        grid.set_cell(2, 0, MvGridCell::OneMv(above_right));
+
+        let got = one_mv_predictor(&grid, 1, 1);
+        let want = predict_block_mv(
+            Block::TopLeft,
+            &BlockCandidates {
+                left_mb: Some(left),
+                above_mb: Some(above),
+                above_right_mb: Some(above_right),
+                mb_block_1: None,
+                mb_block_2: None,
+                mb_block_3: None,
+            },
+        );
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn round_306_one_mv_predictor_picks_bordering_cell_of_four_mv_neighbour() {
+        // When a neighbouring MB is 4-MV-coded, `one_mv_predictor` must
+        // source the *physically-bordering* 8x8 cell per Figure 7-34
+        // (round 208 `bordering_block_of_neighbour`), not an arbitrary
+        // raster index. For the current MB's block 1 (Block::TopLeft):
+        //   left neighbour     -> its block 2 (TR, raster index 1)
+        //   above neighbour    -> its block 3 (BL, raster index 2)
+        //   above-right neighbr -> its block 3 (BL, raster index 2)
+        // This pins the post-r306 resolver path against the documented
+        // mapping and against a by-hand `predict_block_mv` built from
+        // exactly those bordering cells.
+        use crate::mv::Mv;
+        use crate::mv_pred::{predict_block_mv, Block, BlockCandidates, MvGrid, MvGridCell};
+
+        let mk = |base: i8| {
+            [
+                Mv { x: base, y: base }, // block 1 (TL)
+                Mv {
+                    x: base + 1,
+                    y: base + 1,
+                }, // block 2 (TR)
+                Mv {
+                    x: base + 2,
+                    y: base + 2,
+                }, // block 3 (BL)
+                Mv {
+                    x: base + 3,
+                    y: base + 3,
+                }, // block 4 (BR)
+            ]
+        };
+        let left4 = mk(10);
+        let above4 = mk(20);
+        let above_right4 = mk(30);
+
+        let mut grid = MvGrid::new(3, 3);
+        grid.set_cell(0, 1, MvGridCell::FourMv(left4));
+        grid.set_cell(1, 0, MvGridCell::FourMv(above4));
+        grid.set_cell(2, 0, MvGridCell::FourMv(above_right4));
+
+        let got = one_mv_predictor(&grid, 1, 1);
+        let want = predict_block_mv(
+            Block::TopLeft,
+            &BlockCandidates {
+                left_mb: Some(left4[1]),               // left -> block 2 (TR)
+                above_mb: Some(above4[2]),             // above -> block 3 (BL)
+                above_right_mb: Some(above_right4[2]), // above-right -> block 3 (BL)
+                mb_block_1: None,
+                mb_block_2: None,
+                mb_block_3: None,
+            },
+        );
+        assert_eq!(got, want);
     }
 }

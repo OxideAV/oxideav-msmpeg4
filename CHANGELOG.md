@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Round 306 — P-frame 1-MV predictor neighbour-MB candidate
+  construction routed through the spec-derived resolver** (2026-06-15):
+  `picture::one_mv_predictor` (shared by the v3 and v1/v2 P-frame
+  paths) now builds its `mv_pred::BlockCandidates` via
+  `mv_pred::resolve_block_candidates(Block::TopLeft, nset, [None; 3])`
+  (round 214) instead of hand-picking 4-MV neighbour cells with
+  open-coded `mvs[1]` / `mvs[2]` / `mvs[2]` raster indices. For a
+  4-MV-coded neighbour the §7.6.5 predictor sources the
+  physically-bordering 8x8 cell per Figure 7-34 (round 208
+  `bordering_block_of_neighbour`,
+  `docs/video/mpeg4-visual/figure-7-34-mv-predictor-layout.md`): the
+  current MB's block 1 takes its left neighbour's block 2 (TR), its
+  above neighbour's block 3 (BL), and its above-right neighbour's
+  block 3 (BL). The old indices agreed with that mapping but
+  duplicated the Figure 7-34 table inline; routing through the single
+  documented resolver removes the duplication and keeps the picture
+  path provably consistent. Two new lib tests pin the all-`OneMv` /
+  `Absent` path (unchanged byte-for-byte) and the FourMv bordering-cell
+  selection. Lib tests 401 → 403 (+2). No runtime behavioural change on
+  the shipping 1-MV path.
+
 ### Added
 
 - **Round 299 — 3-tier ESC LMAX/RMAX validated against the binary's

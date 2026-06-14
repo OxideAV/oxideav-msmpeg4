@@ -799,6 +799,31 @@ extension tables" 3-tier ESC body is now a **ground-truth-verified**
 decode path. Lib tests 400 → 401 (+1). Purely additive; no runtime
 path is rewired and no new tables are introduced.
 
+Round-306 (2026-06-15) routes the P-frame 1-MV predictor's
+**neighbour-MB candidate construction** through the spec-derived
+[`mv_pred::resolve_block_candidates`] resolver (round 214) instead of
+the previously open-coded `mvs[1]` / `mvs[2]` / `mvs[2]` FourMv raster
+indices in [`picture::one_mv_predictor`]. For a 4-MV-coded neighbour
+the §7.6.5 predictor must source the physically-*bordering* 8x8 cell
+per Figure 7-34 (round 208 `bordering_block_of_neighbour`,
+`docs/video/mpeg4-visual/figure-7-34-mv-predictor-layout.md`): the
+current MB's block 1 (`Block::TopLeft`) takes its left neighbour's
+block 2 (TR), its above neighbour's block 3 (BL), and its above-right
+neighbour's block 3 (BL). The old hand-rolled indices happened to
+agree with that mapping, but duplicated the Figure 7-34 table inline
+and would silently drift if the resolver were ever corrected. Routing
+the picture path through the single documented resolver keeps it
+provably consistent and removes the duplication. `one_mv_predictor` is
+shared by both the v3 and the v1/v2 P-frame paths (spec/07 §3.5 — the
+v1/v2 MV decoder body calls the same median-of-3 helper as v3), so the
+fix lands on both. Two new lib tests pin (1) the all-`OneMv` /
+`Absent` path — the only one the shipping 1-MV-per-MB decoder
+exercises today — is byte-for-byte unchanged, and (2) the FourMv path
+picks each documented bordering cell. Lib tests 401 → 403 (+2). No
+runtime behavioural change on the 1-MV path; the FourMv arm is
+exercised only once 4-MV-per-MB bitstream signalling is wired (still
+gated on the v3 MCBPC 1-MV/4-MV bit pattern, an open spec item).
+
 ## License
 
 MIT.
