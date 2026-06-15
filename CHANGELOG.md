@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/OxideAV/oxideav-msmpeg4/compare/v0.0.7...v0.0.8) - 2026-06-15
+
+### Other
+
+- round 309: G3 intra-luma I-frame end-to-end via decode_picture FromHeader
+- round 306: route P-frame 1-MV predictor neighbour candidates through resolve_block_candidates
+- validate 3-tier ESC LMAX/RMAX against binary ESC-extension arrays (spec/08 §4.1)
+- per-G-family pri_A/pri_B runtime-binding accessors (spec/14 §3)
+- round 285: v1/v2 P-frame pixel pipeline (skip + inter MBs) end-to-end
+- correct H.263 quantiser-parity bias direction to spec/08 §5
+- round 266: typed-primitive accessors on picture-header parser
+- round 254: per-descriptor field-offset accessors on GFamily
+- round 251: alternate-variant v3 MVDx / MVDy byte LUTs landed
+- drop release-plz.toml — use release-plz defaults across the workspace
+- round 246: MvGrid video-packet / GOB boundary-reset helpers + iter_cells
+- round 243: per-MB 4-MV decoder -> MvGridCell one-shot bridge
+- round 240: decode_pframe MV cache routed through MvGrid
+- round 234: G0..G3 packed-Huffman primary VLC wired
+- round 227: picture-wide MV grid -> NeighbourSet builder
+- round 221: 4-MV stateful predict/commit driver with NeighbourSet-aware bordering
+- round 214: 4-MV neighbour-state resolver (1-MV vs 4-MV per neighbour)
+- round 208: 4-MV neighbour-MB bordering-cell picker (Figure 7-34)
+- round 202: README — add 4-MV-per-MB predictor batch surface status row
+- round 202: 4-MV-per-MB bitstream integration tests (Figure 7-34 + real joint-VLC)
+
 ### Changed
 
 - **Round 306 — P-frame 1-MV predictor neighbour-MB candidate
