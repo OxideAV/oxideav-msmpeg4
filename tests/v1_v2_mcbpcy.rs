@@ -301,27 +301,31 @@ fn ffmpeg_v2_picture_header_parses_through_decoder() {
         .with_keyframe(true);
     let result = dec.send_packet(&pkt);
 
-    // The expected outcome as of round 285: the I-frame picture header
-    // parses successfully but the decoder bails with the documented
-    // Unsupported citing the v1/v2 intra DC-prediction docs gap
-    // (spec/07 §1.6) — the intra pixel pipeline is the remaining gate.
+    // The expected outcome (round 317 narrowing): the I-frame picture
+    // header parses successfully but the decoder bails with the
+    // documented Unsupported citing the single residual blocker — the
+    // untraced construction-time default of intra-DC-size selector
+    // [esi+0x8bc] (spec/01 §1.4) — the intra pixel pipeline is wired
+    // otherwise.
     match result {
         Ok(()) => {
             // If decode somehow succeeded, that's even better — we'll
-            // find out in a later round when the intra DC-prediction
+            // find out in a later round when the [esi+0x8bc] default
             // trace lands. For now we don't fail on success.
             eprintln!("v2 decode succeeded unexpectedly (great!)");
         }
         Err(e) => {
             let msg = format!("{e}");
             assert!(
-                msg.contains("DC-prediction") && msg.contains("spec/07"),
-                "v2 error should cite the DC-prediction docs gap; got: {msg}"
+                msg.contains("[esi+0x8bc]") && msg.contains("spec/01 §1.4"),
+                "v2 error should cite the narrowed [esi+0x8bc] docs gap; \
+                 got: {msg}"
             );
             eprintln!(
                 "v2 decode reached the documented stop-line: {msg}\n\
                  (picture header was parsed; the v1/v2 intra pixel \
-                 pipeline awaits the DC-prediction trace — spec/07 §1.6)"
+                 pipeline awaits the [esi+0x8bc] default trace — \
+                 spec/01 §1.4)"
             );
         }
     }

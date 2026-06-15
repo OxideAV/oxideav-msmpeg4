@@ -303,13 +303,20 @@ pub struct V1V2V3CompatDefaults {
     /// in any macroblock. `false` for v1 (entirely absent), `true` for
     /// v2 (intra-in-P MBs only — see §2.4).
     pub has_ac_pred_anywhere: bool,
-    /// True iff this version has a frame-level spatial DC predictor /
-    /// patent-7,054,494 prediction path. `false` for v1; for v2 the
-    /// patent text says yes but the disassembly trace at `1c2171c7` does
-    /// **not** load the LUTs at `0x1c23a788 / 0x1c23a7b0`, so v2 also
-    /// reports `false` here pending an Extractor follow-up — see
-    /// `spec/07` §1.6 "Contrast with v3's patent-7,054,494 spatial-
-    /// prediction path … which is absent from v1".
+    /// True iff this version loads the **CBP** spatial-prediction LUT
+    /// pair at `0x1c23a788 / 0x1c23a7b0` (patent 7,054,494 — the
+    /// CBP/MCBPCY predictor-decision weights per `spec/99` §3.3 and the
+    /// corrections-table, **not** a DC predictor). `false` for v1; for
+    /// v2 the patent text suggests yes but the MCBPCY trace at
+    /// `1c2171c7` / `1c21729c` does **not** load these LUTs, so v2 also
+    /// reports `false` pending an Extractor follow-up — see `spec/07`
+    /// §1.6 "Contrast with v3's patent-7,054,494 spatial-prediction
+    /// path … which is absent from v1".
+    ///
+    /// NOTE on the field name: this gates the **CBP** spatial predictor,
+    /// not the intra-DC predictor. The intra-DC gradient predictor
+    /// (`0x1c20aef0`, `spec/99` §4.4) carries no version gate and is
+    /// shared by v1/v2/v3. The name is retained for API stability.
     pub has_spatial_dc_predictor: bool,
 }
 

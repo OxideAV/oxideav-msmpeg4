@@ -61,8 +61,19 @@ few inter sub-types remain gated on open spec items (see below).
   the v3 MCBPC bit pattern that signals 1-MV vs 4-MV mode (an open spec
   gap).
 - **V1 / V2 I-frames and intra-in-P MBs**: gated behind a documented
-  `Unsupported` error — the v1/v2 DC-prediction replacement rule for the
-  shared intra kernel is not yet documented in the staged spec material.
+  `Unsupported` error, now narrowed to a **single** trace target. The
+  intra block path is otherwise fully shared with v3 and already wired:
+  the AC run/level/last kernel `0x1c216d97` is the common v1/v2/v3 intra
+  kernel, the DC-predictor gradient routine `0x1c20aef0` carries no
+  version gate, and the intra-DC-size VLC descriptor binding (all four
+  luma/chroma × selector tables) is enumerated in the staged spec. The
+  one remaining unknown is the **construction-time default of the
+  intra-DC-size selector `[esi+0x8bc]`** — that bit is read from the
+  bitstream only on `version == 3`, so on v1/v2 the slot keeps its
+  constructor value, which no staged chapter traces. (The CBP
+  spatial-prediction LUT pair `0x1c23a788 / 0x1c23a7b0` that v1 omits is
+  the *CBP* predictor, not a DC-prediction LUT, so its absence does not
+  block intra DC decode.)
 - **V1 non-zero inter sub-types** (`mb_type ∈ {1, 2, 4, 5}`): the
   per-sub-type side reads are not yet traced.
 

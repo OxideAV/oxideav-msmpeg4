@@ -12,10 +12,16 @@
 //! descriptor to G4 (spec/14 §3.1).
 //!
 //! Still gated with a documented `Unsupported` (asserted below):
-//! I-frames + intra-in-P MBs (the v1/v2 DC-prediction rule is not in
-//! the staged trace — spec/07 §1.6 only pins the *absence* of the v3
-//! spatial-prediction LUT pair) and the v1 non-zero inter sub-types
-//! (spec/07 §1.4 asserts the H.263 Table-8 lineage only structurally).
+//! I-frames + intra-in-P MBs and the v1 non-zero inter sub-types.
+//! Round 317 narrowed the I-frame/intra-in-P gap: the intra kernel
+//! `0x1c216d97`, the DC-predictor gradient routine `0x1c20aef0`, and
+//! the four intra-DC-size VLC tables (spec/99 §4.5) are all shared
+//! with v3 and already wired; the single residual blocker is the
+//! untraced construction-time default of the intra-DC-size selector
+//! `[esi+0x8bc]`, which spec/01 §1.4 shows is bitstream-read only on
+//! `version == 3`. The v1 non-zero inter sub-types remain blocked on
+//! the per-sub-type side reads (spec/07 §1.4 asserts the H.263
+//! Table-8 lineage only structurally).
 
 use oxideav_core::bits::BitReader;
 use oxideav_msmpeg4::header::PictureType;
@@ -279,13 +285,15 @@ fn v1_iframe_unsupported_with_docs_gap_diagnostic() {
     let mut br = BitReader::new(&bytes);
     let err = decode_picture_v1v2(&mut br, dims, MsV1V2Version::V1, None).unwrap_err();
     let msg = format!("{err}");
+    // Narrowed gap (round 317): the residual blocker is the untraced
+    // construction-time default of the intra-DC-size selector
+    // [esi+0x8bc], which spec/01 §1.4 shows is only bitstream-read on
+    // version==3. The intra kernel / DC-predictor / DC-size VLC tables
+    // are all shared with v3 and wired.
     assert!(
-        msg.contains("DC-prediction") && msg.contains("spec/07"),
-        "I-frame gate must cite the DC-prediction docs gap; got: {msg}"
-    );
-    assert!(
-        msg.contains("0x1c23a788"),
-        "I-frame gate must cite the spatial-prediction LUT VMA; got: {msg}"
+        msg.contains("[esi+0x8bc]") && msg.contains("spec/01 §1.4"),
+        "I-frame gate must cite the narrowed [esi+0x8bc] default gap and \
+         spec/01 §1.4; got: {msg}"
     );
 }
 
@@ -306,8 +314,9 @@ fn v2_pframe_intra_in_p_unsupported_with_docs_gap_diagnostic() {
     let err = decode_picture_v1v2(&mut br, dims, MsV1V2Version::V2, Some(&reference)).unwrap_err();
     let msg = format!("{err}");
     assert!(
-        msg.contains("intra-in-P") && msg.contains("spec/07"),
-        "intra-in-P gate must cite the docs gap; got: {msg}"
+        msg.contains("intra-in-P") && msg.contains("[esi+0x8bc]"),
+        "intra-in-P gate must cite the narrowed [esi+0x8bc] default gap; \
+         got: {msg}"
     );
 }
 
@@ -366,7 +375,8 @@ fn send_packet_v2_iframe_surfaces_docs_gap() {
     let err = dec.send_packet(&pkt).unwrap_err();
     let msg = format!("{err}");
     assert!(
-        msg.contains("DC-prediction") && msg.contains("spec/07"),
-        "send_packet v2 I-frame must surface the docs-gap diagnostic; got: {msg}"
+        msg.contains("[esi+0x8bc]") && msg.contains("spec/01 §1.4"),
+        "send_packet v2 I-frame must surface the narrowed [esi+0x8bc] \
+         docs-gap diagnostic; got: {msg}"
     );
 }

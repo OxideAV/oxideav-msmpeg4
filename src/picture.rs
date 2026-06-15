@@ -725,13 +725,32 @@ pub enum MsV1V2Version {
 ///
 /// **Still gated (documented `Unsupported`):**
 ///
-/// * **I-frames and intra-in-P MBs** — the staged trace pins that
-///   v1/v2 do *not* load the v3 spatial-prediction LUT pair at
-///   `0x1c23a788 / 0x1c23a7b0` (spec/07 §1.6), but no chapter
-///   documents the replacement DC-prediction rule the shared intra
-///   kernel (`0x1c216d97`, spec/99 §6) uses on the v1/v2 path, nor
-///   the v1/v2 intra DC-size descriptor binding. Decoding intra
-///   pixels would be guesswork; we surface the precise gap instead.
+/// * **I-frames and intra-in-P MBs** — the staged trace establishes
+///   that the intra block path is otherwise *fully shared* with v3:
+///   the AC run/level/last kernel `0x1c216d97` is the common
+///   v1/v2/v3 intra kernel (spec/04 §2.6, spec/08 §1.2); the
+///   DC-predictor gradient routine `0x1c20aef0` (`|DC_left −
+///   DC_diag_top|` vs `|DC_top − DC_diag_left|`, spec/99 §4.4) is
+///   documented with **no** version gate; and the intra-DC-size VLC
+///   descriptor binding is enumerated in spec/99 §4.5 (selector-0
+///   luma `0x1c25fcd8` / chroma `0x1c2600a0`, selector-1 luma
+///   `0x1c260468` / chroma `0x1c260830`), with all four tables
+///   already wired in [`crate::mb::decode_intra_dc_diff_v3`]. The CBP
+///   spatial-prediction LUT pair at `0x1c23a788 / 0x1c23a7b0` that v1
+///   omits (spec/07 §1.6) is the *CBP* predictor (patent 7,054,494),
+///   **not** a DC-prediction LUT — so its absence does not block
+///   intra DC decode.
+///
+///   The single residual gap is the construction-time **default value
+///   of the intra-DC-size selector `[esi+0x8bc]`** on the v1/v2 path.
+///   spec/01 §1.4 establishes that the `0x8bc` bit is read from the
+///   bitstream only when `version == 3` (gate at `1c211fdd`), so on
+///   v1/v2 the slot retains whatever the constructor left it at — but
+///   no staged chapter traces the constructor's initialisation of
+///   `0x8bc`. If it defaults to 0 the v1/v2 intra path is the v3
+///   `dc_size_sel = 0` path verbatim; assuming that default rather
+///   than tracing it would be guesswork, so we surface the narrowed
+///   gap instead of decoding against an unverified table choice.
 /// * **v1 non-zero inter MB sub-types** (`mb_type` ∈ {1, 2, 4, 5}) —
 ///   spec/07 §1.4 pins only the `mb_type = mcbpc >> 2` decomposition
 ///   and the H.263 Table-8 *lineage* ("structural, value-level match
@@ -754,13 +773,17 @@ pub fn decode_picture_v1v2(
     match hdr.picture_type {
         PictureType::I => Err(Error::unsupported(format!(
             "{codec}: parsed I-frame picture header (quant={}) but the \
-             v1/v2 intra pixel pipeline is gated on a docs gap: spec/07 \
-             §1.6 pins that v1/v2 do not load the v3 spatial-prediction \
-             LUT pair at 0x1c23a788 / 0x1c23a7b0, and no staged chapter \
-             documents the replacement DC-prediction rule or the v1/v2 \
-             intra DC-size descriptor binding for the shared intra \
-             kernel 0x1c216d97 (spec/99 §6). P-frame skip + inter MBs \
-             decode end-to-end.",
+             v1/v2 intra pixel pipeline is gated on a single narrowed \
+             docs gap: the construction-time DEFAULT of the intra-DC-size \
+             selector [esi+0x8bc]. spec/01 §1.4 pins that the 0x8bc bit \
+             is read from the bitstream only when version==3 (gate at \
+             1c211fdd), so on v1/v2 the slot keeps its constructor \
+             value, but no staged chapter traces that initialisation. \
+             Everything else is shared with v3: intra kernel 0x1c216d97 \
+             (spec/04 §2.6), DC-predictor gradient 0x1c20aef0 \
+             (spec/99 §4.4, no version gate), and the intra-DC-size VLC \
+             descriptor binding (spec/99 §4.5, all four tables wired). \
+             P-frame skip + inter MBs decode end-to-end.",
             hdr.quant,
         ))),
         PictureType::P => {
@@ -865,14 +888,18 @@ fn decode_pframe_mb_v1v2(
     }
 
     if decode.is_intra {
-        // Intra-in-P: same docs gap as v1/v2 I-frames — the v1/v2
-        // DC-prediction rule and intra DC-size descriptor binding are
-        // not in the staged trace (see `decode_picture_v1v2`).
+        // Intra-in-P: same narrowed docs gap as v1/v2 I-frames — the
+        // construction-time default of the intra-DC-size selector
+        // [esi+0x8bc] (read from the bitstream only on version==3 per
+        // spec/01 §1.4) is untraced. The intra kernel, DC-predictor,
+        // and the four intra-DC-size VLC tables are all shared with v3
+        // and already wired (see `decode_picture_v1v2`).
         return Err(Error::unsupported(format!(
             "{codec}: intra-in-P MB at ({mb_x}, {mb_y}) — the v1/v2 \
-             intra pixel pipeline is gated on the spec/07 §1.6 \
-             DC-prediction docs gap (see decode_picture_v1v2). Skip + \
-             inter MBs decode end-to-end.",
+             intra pixel pipeline is gated on the untraced \
+             construction-time default of intra-DC-size selector \
+             [esi+0x8bc] (see decode_picture_v1v2). Skip + inter MBs \
+             decode end-to-end.",
         )));
     }
 

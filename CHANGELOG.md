@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Other
+
+- round 317: narrow the v1/v2 I-frame & intra-in-P docs gap to the
+  single untraced construction-time default of intra-DC-size selector
+  `[esi+0x8bc]`; correct the prior diagnostic that misattributed the
+  CBP spatial-prediction LUT pair `0x1c23a788/0x1c23a7b0` (patent
+  7,054,494) as a DC-prediction blocker. The intra kernel, DC-predictor
+  gradient routine, and all four intra-DC-size VLC tables are confirmed
+  shared with v3 and already wired (spec/01 §1.4, spec/04 §2.6, spec/99
+  §4.4/§4.5).
+
 ## [0.0.8](https://github.com/OxideAV/oxideav-msmpeg4/compare/v0.0.7...v0.0.8) - 2026-06-15
 
 ### Other
