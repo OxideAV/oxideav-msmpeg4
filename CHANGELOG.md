@@ -32,6 +32,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 309 — G3 intra-luma I-frame end-to-end through the
+  `decode_picture` `FromHeader` boundary** (2026-06-15): closes the
+  coverage gap between round 234 (which wired the G0..G3 packed-Huffman
+  primary VLCs into `AcVlcTable::v3_intra_g{0,1,2,3}`) and the
+  production decode entry point. Until this round the only G0..G3
+  coverage was per-table / per-symbol (`tests/g0_g3_extended.rs`); no
+  test drove a real-table G3-coded I-frame through the shipping public
+  `picture::decode_picture` with the default
+  `picture::AcSelection::FromHeader`. New `tests/g3_iframe_end_to_end.rs`
+  (3 tests) builds a single-macroblock 16×16 v3 I-frame with
+  `ac_luma_sel == 0` (→ G3 per
+  `docs/video/msmpeg4/spec/14-pri-ab-runtime-binding.md` §3.1) whose
+  luma block 0 carries two real G3 AC tokens — one sub-A continuing
+  token (idx 0 = `(last=false, run=0, level=1)` per spec/09 §2) and one
+  sub-B terminator (spec/13 §2: G3 `count_A=132, count_B=84`, sub-B is
+  `last=true`) — decodes it through `decode_picture`, and asserts the
+  coded block reconstructs **non-DC-only** pel content (the G3 133-entry
+  canonical-Huffman walker actually consumed the AC bits). A companion
+  test decodes the same stream with `AcSelection::Placeholder` (empty
+  table) and asserts the DC-only fallback produces a spatially-uniform
+  block, so the non-uniformity in the FromHeader case is attributable to
+  the real G3 AC walk. A structural guard pins the G3 alphabet at
+  133 entries with `lmax`/`rmax` present (spec/11 §5 row 4 / spec/08
+  §4.1). The MCBPCY symbol is encoded by using the production
+  `mcbpcy::decode_mcbpcy` as a black-box oracle (no dependency on the
+  private canonical-table builder). Also corrects stale doc comments on
+  `AcSelection::FromHeader`, `picture::{luma,chroma}_ac_table_for`, the
+  four `AcVlcTable::v3_intra_g{0,1,2,3}` constructors, and the
+  `build_g_extended_synthetic` helper, all of which still claimed
+  G0..G3 "fall back to DC-only reconstruction" / "packed-Huffman sources
+  not yet extracted / flagged suspect" — factually false since round
+  234. Integration tests +3; no runtime path is rewired, no new tables.
+
 - **Round 299 — 3-tier ESC LMAX/RMAX validated against the binary's
   authoritative ESC-extension arrays** (2026-06-14): a new lib test
   `ac::tests::esc_ext_arrays_match_derived_lmax_rmax_all_g` pins the

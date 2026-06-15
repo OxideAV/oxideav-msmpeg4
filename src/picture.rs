@@ -174,15 +174,15 @@ pub enum AcSelection {
     /// spec/14 §3.1. The dispatch routes through the named
     /// [`AcVlcTable::v3_intra_g0`] / [`v3_intra_g1`] /
     /// [`v3_intra_g2`] / [`v3_intra_g3`] / [`v3_intra_g5`] /
-    /// [`g4_inter`] constructors. **G0..G3 fall back to DC-only
-    /// reconstruction** today because their packed-Huffman
-    /// bit-length sources at file offsets `0x57a30 / 0x57f80 /
-    /// 0x58558 / 0x58a08` are flagged "suspect" in their meta files
-    /// (only the `(idx → (run, level, last))` enumerations are
-    /// present, in [`crate::g_enum`]). When those extractions land,
-    /// the swap happens inside the four `v3_intra_g{0,1,2,3}()`
-    /// constructors — this dispatch is already correctly wired and
-    /// will pick up the real tables automatically.
+    /// [`g4_inter`] constructors. As of round 234 all six families
+    /// carry their real packed-Huffman primary VLC — the four
+    /// extended-alphabet sources at file offsets `0x57a30 / 0x57f80
+    /// / 0x58558 / 0x58a08` (spec/11 §5 row 1-4) are wired through
+    /// `v3_intra_g{0,1,2,3}()`, so every `ac_luma_sel` / `ac_chroma_sel`
+    /// value decodes its coded AC blocks through the spec-correct
+    /// G-family rather than the DC-only fallback. End-to-end coverage
+    /// of the G3 (`ac_luma_sel == 0`) path through this dispatch lives
+    /// in `tests/g3_iframe_end_to_end.rs`.
     #[default]
     FromHeader,
     /// Real G5 primary VLC built from the packed-Huffman source at file
@@ -259,20 +259,17 @@ pub fn decode_picture_with_ac(
 /// `ac_luma_sel` ∈ {0, 1, 2} field selects between {G3, G1, G5}
 /// respectively, dispatched through the named
 /// [`AcVlcTable::v3_intra_g3`] / [`v3_intra_g1`] / [`v3_intra_g5`]
-/// constructors. G5 is the v1/v2 default and the only G-family with a
-/// fully-extracted packed-Huffman primary VLC source today; G3 / G1
-/// return placeholder tables (DC-only reconstruction) because their
-/// packed-Huffman bit-length sources are not yet extracted — see the
-/// per-constructor doc-comments for the exact extraction blocker.
+/// constructors. As of round 234 all three luma families carry their
+/// real packed-Huffman primary VLC (G3 source at file `0x58a08`, G1 at
+/// `0x57f80`, G5 at `0x59178` — spec/11 §5), so a coded luma block
+/// decodes its AC through the spec-correct family for every
+/// `ac_luma_sel` value rather than the DC-only fallback.
 fn luma_ac_table_for(selection: AcSelection, hdr: &MsV3PictureHeader) -> AcVlcTable {
     match selection {
         AcSelection::FromHeader => match hdr.ac_luma_sel {
-            // Spec/14 §3.1: 0 → G3, 1 → G1, 2 → G5. G3 and G1 currently
-            // route to placeholders that fall back to DC-only
-            // reconstruction (see [`AcVlcTable::v3_intra_g3`] /
-            // [`v3_intra_g1`] for the extraction blocker). When the
-            // packed-Huffman sources land, the constructors swap in
-            // the real VLC and this dispatch is unchanged.
+            // Spec/14 §3.1: 0 → G3, 1 → G1, 2 → G5. All three carry
+            // their real packed-Huffman primary VLC (round 234), so the
+            // AC walk runs end-to-end for each.
             0 => AcVlcTable::v3_intra_g3(),
             1 => AcVlcTable::v3_intra_g1(),
             2 => AcVlcTable::v3_intra_g5(),
@@ -293,21 +290,17 @@ fn luma_ac_table_for(selection: AcSelection, hdr: &MsV3PictureHeader) -> AcVlcTa
 /// picture-header `ac_chroma_sel` ∈ {0, 1, 2} field selects between
 /// {G2, G0, G4} respectively, dispatched through the named
 /// [`AcVlcTable::v3_intra_g2`] / [`v3_intra_g0`] / [`g4_inter`]
-/// constructors. G4 is the v1/v2 default and the only chroma-side
-/// G-family with a fully-extracted packed-Huffman primary VLC source
-/// today; G2 / G0 return placeholder tables (DC-only reconstruction)
-/// because their packed-Huffman bit-length sources are not yet
-/// extracted — see the per-constructor doc-comments for the exact
-/// extraction blocker.
+/// constructors. As of round 234 all three chroma families carry their
+/// real packed-Huffman primary VLC (G2 source at file `0x58558`, G0 at
+/// `0x57a30`, G4 at `0x58e38` — spec/11 §5), so a coded chroma block
+/// decodes its AC through the spec-correct family for every
+/// `ac_chroma_sel` value rather than the DC-only fallback.
 fn chroma_ac_table_for(selection: AcSelection, hdr: &MsV3PictureHeader) -> AcVlcTable {
     match selection {
         AcSelection::FromHeader => match hdr.ac_chroma_sel {
-            // Spec/14 §3.1: 0 → G2, 1 → G0, 2 → G4. G2 and G0
-            // currently route to placeholders that fall back to
-            // DC-only reconstruction (see [`AcVlcTable::v3_intra_g2`]
-            // / [`v3_intra_g0`] for the extraction blocker). When
-            // the packed-Huffman sources land, the constructors swap
-            // in the real VLC and this dispatch is unchanged.
+            // Spec/14 §3.1: 0 → G2, 1 → G0, 2 → G4. All three carry
+            // their real packed-Huffman primary VLC (round 234), so the
+            // AC walk runs end-to-end for each.
             0 => AcVlcTable::v3_intra_g2(),
             1 => AcVlcTable::v3_intra_g0(),
             2 => AcVlcTable::g4_inter(),

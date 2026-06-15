@@ -236,46 +236,28 @@ impl AcVlcTable {
     }
 
     /// Build the **G0 (chroma + all-inter, class 1) DCT AC TCOEF
-    /// primary VLC** table — placeholder until the packed-Huffman
-    /// bit-length source is extracted.
+    /// primary VLC** table.
     ///
     /// Per spec/14 §3.1, G0 is selected when the picture-header
     /// `ac_chroma_sel` field equals 1. Per spec/15 §7 G0's alphabet
     /// shape is `(count_A=168, count_B=98)` and its `(idx → (run,
     /// level, last))` enumeration is wired through
     /// [`crate::g_enum::g0_decode`] / [`crate::g_enum::GExtended::G0`]
-    /// (round 29). What's missing is the canonical-Huffman bit-length
-    /// array — the per-symbol bit-length source.
+    /// (round 29).
     ///
-    /// **Extraction blocker.** Per spec/99 §10 row 1058 the candidate
-    /// packed-Huffman input for G0 lives at file offset `0x57a30` /
-    /// VMA `0x1c258630`. The Extractor's structural sanity check on
-    /// that region (`docs/video/msmpeg4/tables/region_057a30.meta`)
-    /// flags it as `verdict: suspect` because the bit_length histogram
-    /// has values out of the canonical 1..32 range. The constructor
-    /// algorithm at `0x1c210dab..0x1c210f0a` that turns the packed
-    /// input into a runtime decoder object has not been disassembled
-    /// either, so the per-G0 packed-Huffman record format is
-    /// unconfirmed. Until both land we cannot wire G0's primary VLC.
-    ///
-    /// **What this constructor does today.** Returns the same empty-
-    /// `entries` placeholder as [`AcVlcTable::V3_INTRA_PLACEHOLDER`]
-    /// so the per-block AC walker bails to DC-only reconstruction
-    /// when [`crate::picture::AcSelection::FromHeader`] dispatches a
-    /// chroma block to G0. The named constructor is the future
-    /// drop-in for when the packed-Huffman source lands.
+    /// **Round 234 wiring.** spec/11 §5 row 1 identifies the G0
+    /// packed-Huffman source at file `0x57a30` / VMA `0x1c258630`; the
+    /// build-time emitter verifies it as a Kraft-saturated
+    /// canonical-Huffman over 169 symbols (count_A=168 plus one ESC at
+    /// idx 168). `entries` is wired from that source via
+    /// `g0_primary_entries`, so a coded chroma block dispatched here by
+    /// [`crate::picture::AcSelection::FromHeader`] decodes its AC walk
+    /// end-to-end (no DC-only fallback). The `lmax` / `rmax` tables are
+    /// routed through the G0 enumeration for the 3-tier ESC body.
     ///
     /// FROM: `docs/video/msmpeg4/spec/14-pri-ab-runtime-binding.md` §3 (selector → G mapping)
     /// FROM: `docs/video/msmpeg4/spec/15-count-ab-per-g-family.md` §7 (count_A=168, count_B=98)
-    /// FROM: `docs/video/msmpeg4/spec/99-current-understanding.md` §10 row 1058 (G0 source VMA)
-    ///
-    /// **Round 234 update**: spec/11 §5 row 1 now identifies the
-    /// G0 packed-Huffman source at file `0x57a30` / VMA `0x1c258630`
-    /// and the build-time emitter verifies the source as a
-    /// Kraft-saturated canonical-Huffman over 169 symbols
-    /// (count_A=168 plus one ESC at idx 168). `entries` is now wired
-    /// from that source via `g0_primary_entries`; the `lmax` / `rmax`
-    /// tables stay routed through the G0 enumeration as before.
+    /// FROM: `docs/video/msmpeg4/spec/11-walker-format-resolved.md` §5 row 1 (G0 source VMA)
     pub fn v3_intra_g0() -> AcVlcTable {
         AcVlcTable {
             entries: g0_primary_entries(),
@@ -304,8 +286,7 @@ impl AcVlcTable {
     }
 
     /// Build the **G1 (intra-luma, class 1) DCT AC TCOEF primary
-    /// VLC** table — placeholder until the packed-Huffman bit-length
-    /// source is extracted.
+    /// VLC** table.
     ///
     /// Per spec/14 §3.1, G1 is selected when the picture-header
     /// `ac_luma_sel` field equals 1. Alphabet shape per spec/15 §7
@@ -313,23 +294,17 @@ impl AcVlcTable {
     /// last))` enumeration is wired through
     /// [`crate::g_enum::g1_decode`] (round 29).
     ///
-    /// **Extraction blocker** identical to [`v3_intra_g0`]: candidate
-    /// packed-Huffman input at file `0x57f80` / VMA `0x1c258b80`
-    /// (spec/99 §10 row 1059) is flagged `suspect` in
-    /// `region_057f80.meta`. Until that region is resolved into a
-    /// canonical bit-length array, this returns the empty-`entries`
-    /// placeholder.
+    /// **Round 234 wiring** (identical shape to [`v3_intra_g0`]):
+    /// spec/11 §5 row 2 identifies the G1 packed-Huffman source at file
+    /// `0x57f80` / VMA `0x1c258b80` (Kraft-saturated, 186 symbols,
+    /// count_A=185 plus one ESC at idx 185). `entries` is wired through
+    /// `g1_primary_entries`, so a coded luma block dispatched here
+    /// decodes its AC walk end-to-end; the synthetic variant stays
+    /// available for regression baseline tests.
     ///
     /// FROM: `docs/video/msmpeg4/spec/14-pri-ab-runtime-binding.md` §3
     /// FROM: `docs/video/msmpeg4/spec/15-count-ab-per-g-family.md` §7
-    /// FROM: `docs/video/msmpeg4/spec/99-current-understanding.md` §10 row 1059
-    ///
-    /// **Round 234 update**: spec/11 §5 row 2 now identifies the
-    /// G1 packed-Huffman source at file `0x57f80` / VMA `0x1c258b80`
-    /// (Kraft-saturated, 186 symbols, count_A=185 plus one ESC at
-    /// idx 185). `entries` is now wired through `g1_primary_entries`;
-    /// the synthetic variant stays available for regression baseline
-    /// tests.
+    /// FROM: `docs/video/msmpeg4/spec/11-walker-format-resolved.md` §5 row 2
     pub fn v3_intra_g1() -> AcVlcTable {
         AcVlcTable {
             entries: g1_primary_entries(),
@@ -354,8 +329,7 @@ impl AcVlcTable {
     }
 
     /// Build the **G2 (chroma + all-inter, class 0) DCT AC TCOEF
-    /// primary VLC** table — placeholder until the packed-Huffman
-    /// bit-length source is extracted.
+    /// primary VLC** table.
     ///
     /// Per spec/14 §3.1, G2 is selected when the picture-header
     /// `ac_chroma_sel` field equals 0 (the default for v3 chroma when
@@ -364,20 +338,16 @@ impl AcVlcTable {
     /// the `(idx → (run, level, last))` enumeration is wired through
     /// [`crate::g_enum::g2_decode`] (round 29).
     ///
-    /// **Extraction blocker** identical to [`v3_intra_g0`]: candidate
-    /// packed-Huffman input at file `0x58558` / VMA `0x1c259158`
-    /// (spec/99 §10 row 1060) is flagged `suspect` in
-    /// `region_058558.meta`. Until that region is resolved this
-    /// returns the empty-`entries` placeholder.
+    /// **Round 234 wiring** (identical shape to [`v3_intra_g0`]):
+    /// spec/11 §5 row 3 identifies the G2 packed-Huffman source at file
+    /// `0x58558` / VMA `0x1c259158` (Kraft-saturated, 149 symbols,
+    /// count_A=148 plus one ESC at idx 148). `entries` is wired through
+    /// `g2_primary_entries`, so a coded chroma block dispatched here
+    /// decodes its AC walk end-to-end.
     ///
     /// FROM: `docs/video/msmpeg4/spec/14-pri-ab-runtime-binding.md` §3
     /// FROM: `docs/video/msmpeg4/spec/15-count-ab-per-g-family.md` §7
-    /// FROM: `docs/video/msmpeg4/spec/99-current-understanding.md` §10 row 1060
-    ///
-    /// **Round 234 update**: spec/11 §5 row 3 now identifies the
-    /// G2 packed-Huffman source at file `0x58558` / VMA `0x1c259158`
-    /// (Kraft-saturated, 149 symbols, count_A=148 plus one ESC at
-    /// idx 148). `entries` is now wired through `g2_primary_entries`.
+    /// FROM: `docs/video/msmpeg4/spec/11-walker-format-resolved.md` §5 row 3
     pub fn v3_intra_g2() -> AcVlcTable {
         AcVlcTable {
             entries: g2_primary_entries(),
@@ -402,8 +372,7 @@ impl AcVlcTable {
     }
 
     /// Build the **G3 (intra-luma, class 0) DCT AC TCOEF primary
-    /// VLC** table — placeholder until the packed-Huffman bit-length
-    /// source is extracted.
+    /// VLC** table.
     ///
     /// Per spec/14 §3.1, G3 is selected when the picture-header
     /// `ac_luma_sel` field equals 0 (the default for v3 luma when the
@@ -415,23 +384,19 @@ impl AcVlcTable {
     /// (run, level, last))` enumeration is wired through
     /// [`crate::g_enum::g3_decode`] (round 29).
     ///
-    /// **Extraction blocker** identical to [`v3_intra_g0`]: candidate
-    /// packed-Huffman input at file `0x58a08` / VMA `0x1c259608`
-    /// (spec/99 §10 row 1061) is flagged `suspect` in
-    /// `region_058a08.meta`. Until that region is resolved this
-    /// returns the empty-`entries` placeholder, and mp43.wmv I-frame
-    /// luma blocks fall back to DC-only reconstruction.
+    /// **Round 234 wiring** (identical shape to [`v3_intra_g0`]):
+    /// spec/11 §5 row 4 identifies the G3 packed-Huffman source at file
+    /// `0x58a08` / VMA `0x1c259608` (Kraft-saturated, 133 symbols,
+    /// count_A=132 plus one ESC at idx 132). `entries` is wired through
+    /// `g3_primary_entries`, closing the mp43.wmv I-frame luma
+    /// DC-only-fallback observed in the round-5 static analysis: a coded
+    /// luma block dispatched here decodes its AC walk end-to-end.
+    /// End-to-end coverage through the public `decode_picture`
+    /// `FromHeader` boundary lives in `tests/g3_iframe_end_to_end.rs`.
     ///
     /// FROM: `docs/video/msmpeg4/spec/14-pri-ab-runtime-binding.md` §3
     /// FROM: `docs/video/msmpeg4/spec/15-count-ab-per-g-family.md` §7
-    /// FROM: `docs/video/msmpeg4/spec/99-current-understanding.md` §10 row 1061
-    ///
-    /// **Round 234 update**: spec/11 §5 row 4 now identifies the
-    /// G3 packed-Huffman source at file `0x58a08` / VMA `0x1c259608`
-    /// (Kraft-saturated, 133 symbols, count_A=132 plus one ESC at
-    /// idx 132). `entries` is now wired through `g3_primary_entries`.
-    /// This closes the mp43.wmv I-frame luma DC-only-fallback observed
-    /// in the round-5 implementer's static analysis.
+    /// FROM: `docs/video/msmpeg4/spec/11-walker-format-resolved.md` §5 row 4
     pub fn v3_intra_g3() -> AcVlcTable {
         AcVlcTable {
             entries: g3_primary_entries(),
@@ -939,11 +904,11 @@ pub(crate) fn g3_rmax() -> &'static RunLimitTable {
 /// regression tests.
 ///
 /// The resulting table is **only** used by [`AcVlcTable::v3_intra_g0_synthetic`]
-/// / `_g1_synthetic` / `_g2_synthetic` / `_g3_synthetic` (not by the
-/// production [`v3_intra_g0`] / `v3_intra_g1` / `v3_intra_g2` /
-/// `v3_intra_g3` placeholders) — production decode of streams that
-/// select G0..G3 still bails to DC-only reconstruction until the real
-/// bit-length array is wired.
+/// / `_g1_synthetic` / `_g2_synthetic` / `_g3_synthetic` for regression
+/// baselines. Production decode uses the real packed-Huffman primary VLC
+/// wired into [`v3_intra_g0`] / `v3_intra_g1` / `v3_intra_g2` /
+/// `v3_intra_g3` (round 234), which is bit-exact against the binary's
+/// source and is what the `FromHeader` dispatch selects.
 ///
 /// Per spec/09 §10 "Implementer notes" the alphabet is fully
 /// reconstructible from `(count_A, count_B, per-run LMAX)`; this

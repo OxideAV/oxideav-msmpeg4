@@ -60,6 +60,7 @@ right decoder when a packet arrives.
 | 4-MV stateful predict / commit driver           | `Macroblock4MvDecoderNeighbours` (round 221) |
 | Picture-wide MV grid → `NeighbourSet` builder    | `MvGrid` + `MvGridCell` (round 227)          |
 | G0..G3 packed-Huffman primary VLC                | wired (round 234, all 4 sources Kraft=1)     |
+| G3 intra-luma I-frame end-to-end via `decode_picture` `FromHeader` | exercised (round 309, `tests/g3_iframe_end_to_end.rs`) |
 | `decode_pframe` MV cache routed through `MvGrid` | wired (round 240, replaces parallel `Vec<Option<Mv>>`) |
 | Per-MB 4-MV decoder → `MvGridCell` one-shot bridge | `finalise_to_grid_cell` on both 4-MV decoders (round 243) |
 | `MvGrid` video-packet / GOB boundary-reset helpers + raster iter | `clear_cell` / `clear_row` / `clear_all` + `iter_cells` (round 246) |
@@ -823,6 +824,32 @@ picks each documented bordering cell. Lib tests 401 → 403 (+2). No
 runtime behavioural change on the 1-MV path; the FourMv arm is
 exercised only once 4-MV-per-MB bitstream signalling is wired (still
 gated on the v3 MCBPC 1-MV/4-MV bit pattern, an open spec item).
+
+Round-309 (2026-06-15) closes the coverage gap between round 234 (which
+wired the **G0..G3 packed-Huffman primary VLCs**) and the production
+decode entry point. The shipping default
+[`picture::AcSelection::FromHeader`] already routes `ac_luma_sel == 0`
+to the real 133-entry G3 table and `ac_chroma_sel == 0` to G2 (per
+`docs/video/msmpeg4/spec/14-pri-ab-runtime-binding.md` §3.1), but until
+this round the only G0..G3 coverage was at the per-table / per-symbol
+level (`tests/g0_g3_extended.rs`) — nothing drove a real-table
+G3-coded I-frame through the public `decode_picture` boundary. New
+`tests/g3_iframe_end_to_end.rs` (3 tests) builds a single-MB 16×16 v3
+I-frame whose luma block 0 carries two real G3 AC tokens (a sub-A
+continuing token + a sub-B `last=true` terminator, spec/13 §2 with G3
+`count_A=132, count_B=84`), decodes it through `decode_picture`, and
+asserts the coded block reconstructs **non-DC-only** pel content — i.e.
+the G3 canonical-Huffman walker consumed the AC bits end-to-end. A
+companion test decodes the same stream with `AcSelection::Placeholder`
+and asserts the DC-only fallback produces a spatially-uniform block, so
+the non-uniformity is attributable to the real G3 AC walk. The round
+also corrects stale doc comments across `AcSelection::FromHeader`,
+`picture::{luma,chroma}_ac_table_for`, the four
+`AcVlcTable::v3_intra_g{0,1,2,3}` constructors, and the
+`build_g_extended_synthetic` helper that still claimed G0..G3 "fall
+back to DC-only reconstruction" / "packed-Huffman sources not yet
+extracted" — false since round 234. Integration tests +3; no runtime
+path is rewired and no new tables are introduced.
 
 ## License
 
