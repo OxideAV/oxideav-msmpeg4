@@ -538,8 +538,9 @@ fn pframe_smoke_32x32_decodes() {
             }
         }
         Err(e) => {
-            // Documented boundaries for P-frame decode:
-            //   * mv_table_sel=1 (alternate MV VLC) — not extracted
+            // Documented boundaries for P-frame decode (the alternate
+            // MV VLC, mv_table_sel=1, is now wired — spec/16 §1 — so it
+            // no longer appears here; the remaining gaps are):
             //   * intra-in-P with coded CBP → AC placeholder
             //   * inter MB with coded CBP — would need inter AC VLC
             //     (also OPEN)

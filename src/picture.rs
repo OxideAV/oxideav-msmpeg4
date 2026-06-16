@@ -44,10 +44,11 @@
 //! Round 9 wires the P-frame skeleton around the intra pipeline
 //! (spec/05 §3.2, spec/06 §§1–3):
 //!
-//!   1. [`MsV3PictureHeader::parse`] now reads the `mv_table_sel` bit
-//!      for P-frames; we currently accept only `mv_table_sel == 0`
-//!      because the alternate MV VLC source at VMA `0x1c25a0b8` is
-//!      truncated in the extraction (see `tables/region_0594b8.meta`).
+//!   1. [`MsV3PictureHeader::parse`] reads the `mv_table_sel` bit for
+//!      P-frames; both `mv_table_sel == 0` (default) and `== 1`
+//!      (alternate) MV VLC variants now decode end-to-end — the
+//!      alternate source at VMA `0x1c25a0b8` was re-extracted at full
+//!      size in Extractor 07 (spec/16 §1, `tables/region_0594b8_mvvlc.csv`).
 //!   2. Per-MB loop — [`decode_pframe_mb`] reads the 1-bit skip flag,
 //!      then the 128-entry joint MCBPCY (shared with I-frames), then
 //!      the 1-bit `ac_pred` flag.
@@ -434,9 +435,9 @@ fn decode_pframe(
     let mut mv_grid = crate::mv_pred::MvGrid::new(mb_w, mb_h);
 
     // Spec/06 §2.1: per-frame `mv_table_sel` ∈ {0, 1} picks between
-    // the default and alternate v3 MV VLC sources. Default is fully
-    // wired; alternate is a placeholder until the extraction lands
-    // (see [`crate::mv::MvTable::Alternate`] doc).
+    // the default and alternate v3 MV VLC sources. Both are now fully
+    // wired (the alternate VLC source landed in Extractor 07 / spec/16
+    // §1; see [`crate::mv::MvTable::Alternate`] doc).
     let mv_table = if hdr.mv_table_sel == 0 {
         crate::mv::MvTable::Default
     } else {
@@ -553,10 +554,9 @@ fn decode_pframe_mb(
 
     // Inter MB: decode the joint MV VLC using the median predictor.
     // The `mv_table` selector threads the picture-header
-    // `mv_table_sel` bit through to the MV decoder; sel=1 currently
-    // routes to a placeholder that returns Error::Unsupported with
-    // the extractor-blocker diagnostic (see
-    // `crate::mv::MvTable::Alternate`).
+    // `mv_table_sel` bit through to the MV decoder; sel=1 routes to the
+    // alternate VLC variant (now fully wired — Extractor 07 / spec/16
+    // §1; see `crate::mv::MvTable::Alternate`).
     //
     // The 1-MV-per-MB case (which is the only mode currently shipping
     // for v3) is the Figure 7-34 top-left sub-diagram per
@@ -1744,13 +1744,17 @@ mod tests {
             .expect("all-skip P-frame with mv_table_sel=1 must decode (alt MV not exercised)");
     }
 
-    /// Round 32 piece 3: when `mv_table_sel = 1` AND the P-frame has
-    /// at least one inter (non-skipped) MB, the MV decoder fires the
-    /// extractor-blocker diagnostic from `crate::mv::MvTable::Alternate`.
-    /// Verifies the full diagnostic content so callers can grep for
-    /// the actionable extraction file path.
+    /// Round 326: when `mv_table_sel = 1` AND the P-frame has at least
+    /// one inter (non-skipped) MB, the alternate MV VLC now decodes
+    /// end-to-end (Extractor 07 / spec/16 §1). A single inter MB whose
+    /// alternate-MV symbol is index 0 (canonical 2-bit code `00`, alt
+    /// byte LUT index 0 = `0x20`/`0x20` → MV = (0, 0) after the bias
+    /// subtraction) with a zero predictor produces an identity MC copy,
+    /// so the decoded picture equals the reference. This pins that the
+    /// previously-`Unsupported` alternate path is wired and selects the
+    /// alternate table rather than the default.
     #[test]
-    fn pframe_alternate_mv_table_inter_mb_errors_with_diagnostic() {
+    fn pframe_alternate_mv_table_inter_mb_decodes() {
         use oxideav_core::bits::BitReader;
 
         fn pack(fields: &[(u32, u32)]) -> Vec<u8> {
@@ -1804,32 +1808,48 @@ mod tests {
             .map(|(bl, code, _)| (*bl as u32, *code))
             .expect("symbol 0 in canonical MCBPCY");
 
+        // Alternate MV VLC symbol 0 canonical code is the 2-bit `00`
+        // (the shortest code; alt bit-lengths start at 2). Encoding two
+        // copies of it gives MVDx symbol 0 and MVDy is part of the same
+        // joint symbol — the joint table emits one symbol carrying both
+        // components, so a single 2-bit `00` read suffices.
         let dims = PictureDims::new(16, 16).unwrap();
-        let reference = Picture::alloc(dims, PictureType::I);
-        // P-frame: mv_table_sel = 1, single inter MB (no skip).
+        let mut reference = Picture::alloc(dims, PictureType::I);
+        // Give the reference a non-trivial pattern so an identity copy
+        // is a meaningful equality check (an all-zero copy would pass
+        // trivially against an all-zero reference).
+        for (i, px) in reference.y.iter_mut().enumerate() {
+            *px = (i % 251) as u8;
+        }
+        for (i, px) in reference.cb.iter_mut().enumerate() {
+            *px = (i % 199) as u8;
+        }
+        for (i, px) in reference.cr.iter_mut().enumerate() {
+            *px = (i % 197) as u8;
+        }
+
+        // P-frame: mv_table_sel = 1, single inter MB (no skip), alt MV
+        // joint symbol 0 (code `00`).
         let fields: Vec<(u32, u32)> = vec![
             (1, 2),               // P
             (8, 5),               // quant
             (0, 1),               // ac_chroma_sel
             (0, 1),               // dc_size_sel
             (1, 1),               // mv_table_sel = 1 (alternate)
-            (0, 1),               // skip = 0 (will reach MV decode)
+            (0, 1),               // skip = 0 (reaches MV decode)
             (code_sym0, bl_sym0), // MCBPCY sym 0 (inter, CBP=0)
             (0, 1),               // ac_pred (ignored for inter)
-            (0, 32),              // padding for the MV decoder to read
+            (0b00, 2),            // alt MV joint symbol 0 → MV (0, 0)
+            (0, 16),              // trailing padding
         ];
         let bytes = pack(&fields);
         let mut br = BitReader::new(&bytes);
-        let err = decode_picture(&mut br, dims, Some(&reference)).unwrap_err();
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("mv_table_sel=1") || msg.contains("0x1c25a0b8"),
-            "expected alternate-MV diagnostic; got: {msg}"
-        );
-        assert!(
-            msg.contains("region_0594b8"),
-            "diagnostic must cite the extraction-blocker file (region_0594b8); got: {msg}"
-        );
+        let pic = decode_picture(&mut br, dims, Some(&reference))
+            .expect("inter P-frame MB with mv_table_sel=1 must decode (alt MV wired)");
+        // MV = (0, 0) → identity MC copy → decoded picture == reference.
+        assert_eq!(pic.y, reference.y, "alt-MV (0,0) luma must copy reference");
+        assert_eq!(pic.cb, reference.cb, "alt-MV (0,0) Cb must copy reference");
+        assert_eq!(pic.cr, reference.cr, "alt-MV (0,0) Cr must copy reference");
     }
 
     /// Hand-crafted P-frame with a single non-skipped inter MB that

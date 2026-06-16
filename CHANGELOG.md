@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- round 326: wire the v3 alternate joint-MV VLC (`mv_table_sel == 1`,
+  VMA `0x1c25a0b8`) end-to-end. The full 8804-byte source (1100 entries,
+  ESC at index 1099, Kraft = 1.0, bit-lengths 2..15) was re-extracted in
+  Extractor 07 (spec/16 §1, `tables/region_0594b8_mvvlc.csv`),
+  superseding the earlier 256-byte truncation. `build.rs` emits
+  `MV_V3_ALT_RAW` (with build-time Kraft completeness + contiguous-index
+  checks); `mv::decode_mv_with_table(.., MvTable::Alternate)` now decodes
+  through the same canonical-Huffman builder and the already-wired
+  alternate `(MVDx, MVDy)` byte LUTs instead of returning `Unsupported`.
+  P-frames with `mv_table_sel == 1` (e.g. div3.avi frames 37/38/40,
+  div4.avi frames 1/16) no longer reject at the inter-MB MV decode.
 - round 317: narrow the v1/v2 I-frame & intra-in-P docs gap to the
   single untraced construction-time default of intra-DC-size selector
   `[esi+0x8bc]`; correct the prior diagnostic that misattributed the

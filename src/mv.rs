@@ -39,40 +39,36 @@
 //! | `mv_table_sel` | VLC source VMA   | MVDx LUT    | MVDy LUT    | Status |
 //! | -------------- | ---------------- | ----------- | ----------- | ------ |
 //! | 0 (default)    | `0x1c25cbc0`     | `0x1c25ee28`| `0x1c25f278`| **wired** ([`MvTable::Default`]) |
-//! | 1 (alternate)  | `0x1c25a0b8`     | `0x1c25c320`| `0x1c25c770`| byte LUTs landed; VLC source extraction truncated ([`MvTable::Alternate`]) |
+//! | 1 (alternate)  | `0x1c25a0b8`     | `0x1c25c320`| `0x1c25c770`| **wired** ([`MvTable::Alternate`]) |
 //!
-//! [`MvTable::Alternate`] is still not usable end-to-end because the
-//! VLC source at `0x1c25a0b8` only has a 256-byte extraction available
-//! against the 8804-byte source documented in
-//! `docs/video/msmpeg4/spec/11-walker-format-resolved.md` §5 (1100
-//! `(code:u32-LE, bl:u32-LE)` records prefixed by a `count = 1100`
-//! header). The two `(MVDx, MVDy)` byte LUTs at `0x1c25c320` /
-//! `0x1c25c770` **are now extracted** (1104 bytes each, bias-32
-//! distributions matching the default-variant LUTs) and exposed as
+//! Both variants now decode end-to-end. The alternate VLC source at
+//! `0x1c25a0b8` was re-extracted at its full 8804-byte size in
+//! Extractor 07 (`docs/video/msmpeg4/spec/16-mv-vlc-dc-mcbpc-extraction.md`
+//! §1, `tables/region_0594b8_mvvlc.csv` — 1100 entries, ESC at index
+//! 1099, Kraft sum = 1.0, bit-lengths 2..15) — superseding the earlier
+//! 256-byte truncation. The bit-lengths drive the same canonical-Huffman
+//! builder as the default variant; the two `(MVDx, MVDy)` byte LUTs at
+//! `0x1c25c320` / `0x1c25c770` (1104 bytes each, bias-32 residuals) are
+//! exposed as
 //! [`MVDX_V3_ALT_BYTES`](crate::tables_data::MVDX_V3_ALT_BYTES) /
-//! [`MVDY_V3_ALT_BYTES`](crate::tables_data::MVDY_V3_ALT_BYTES). Until
-//! the alt VLC source is re-extracted at full size, [`decode_mv`]
-//! called with [`MvTable::Alternate`] returns the actionable
-//! [`Error::Unsupported`] diagnostic — when that source lands, the
-//! placeholder body is a single canonical-Huffman builder swap (the
-//! byte LUTs are already wired). Streams that use the alternate table
-//! include div3.avi frames 37/38/40 and div4.avi frames 1/16 per
-//! `memory/project_msmpeg4_runtime_binding_clues.md` §2.1; the reject
-//! is the cause of div4.avi's `first_diverge=1` (the very first
-//! P-frame).
+//! [`MVDY_V3_ALT_BYTES`](crate::tables_data::MVDY_V3_ALT_BYTES) and feed
+//! the shared [`decode_mv_variant`] body. Streams that use the alternate
+//! table include div3.avi frames 37/38/40 and div4.avi frames 1/16 per
+//! `memory/project_msmpeg4_runtime_binding_clues.md` §2.1.
 
 use oxideav_core::bits::BitReader;
 use oxideav_core::{Error, Result};
 
 use crate::tables_data::{
-    MVDX_V3_BYTES, MVDY_V3_BYTES, MV_V1_V2_BIAS, MV_V1_V2_RAW, MV_V3_ESC_INDEX, MV_V3_RAW,
+    MVDX_V3_ALT_BYTES, MVDX_V3_BYTES, MVDY_V3_ALT_BYTES, MVDY_V3_BYTES, MV_V1_V2_BIAS,
+    MV_V1_V2_RAW, MV_V3_ALT_RAW, MV_V3_ESC_INDEX, MV_V3_RAW,
 };
 use crate::vlc::{self, VlcEntry};
 
 /// Per-frame MV VLC variant selector. The picture-header
 /// `mv_table_sel` bit picks one of two MV VLC sources for v3 P-frames
-/// (see module-level table). Only the default variant has a
-/// fully-extracted source today; the alternate is a placeholder.
+/// (see module-level table). Both variants now have a fully-extracted
+/// source and decode end-to-end (spec/16 §1 / Extractor 07).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum MvTable {
     /// Default variant — VLC source at file `0x5bfc0` / VMA
@@ -81,14 +77,15 @@ pub enum MvTable {
     /// [`MVDY_V3_BYTES`].
     #[default]
     Default,
-    /// Alternate variant — VLC source candidate at file `0x594b8` /
-    /// VMA `0x1c25a0b8`, byte LUTs at `0x1c25c320` / `0x1c25c770`.
-    /// Currently a placeholder: only a 256-byte over-dump of the VLC
-    /// source exists (per `tables/region_0594b8.meta`), the byte LUTs
-    /// are not extracted, and the per-G-table packed-Huffman →
-    /// runtime constructor is not yet disassembled. [`decode_mv`]
-    /// with this variant returns [`Error::Unsupported`] with an
-    /// actionable extractor-blocker diagnostic.
+    /// Alternate variant — VLC source at file `0x594b8` / VMA
+    /// `0x1c25a0b8`, byte LUTs at `0x1c25c320` / `0x1c25c770`. Wired
+    /// end-to-end: the full 8804-byte VLC source (1100 entries, ESC at
+    /// 1099, Kraft = 1.0) was re-extracted in Extractor 07 (spec/16 §1,
+    /// `tables/region_0594b8_mvvlc.csv`) and feeds the shared
+    /// canonical-Huffman builder via
+    /// [`MV_V3_ALT_RAW`](crate::tables_data::MV_V3_ALT_RAW), paired with
+    /// [`MVDX_V3_ALT_BYTES`](crate::tables_data::MVDX_V3_ALT_BYTES) /
+    /// [`MVDY_V3_ALT_BYTES`](crate::tables_data::MVDY_V3_ALT_BYTES).
     Alternate,
 }
 
@@ -144,11 +141,22 @@ impl MvTable {
 /// 1100 symbols (indices 0..=1099); index 1099 is the ESC sentinel.
 static MV_V3_TABLE: std::sync::OnceLock<Vec<VlcEntry<u16>>> = std::sync::OnceLock::new();
 
-fn build_table() -> Vec<VlcEntry<u16>> {
-    // Canonical-Huffman builder (same shape as mcbpcy.rs): sort by
-    // (bit_length, symbol_index), assign code = 0 for first, then
-    // `code = (code + 1) << (bl_cur - bl_prev)` for each subsequent.
-    let mut symbols: Vec<(u32, u16)> = MV_V3_RAW
+/// Lazy-built canonical-Huffman table for the v3 MV VLC **alternate**
+/// variant (`mv_table_sel == 1`). Same 1100-symbol shape (ESC at 1099),
+/// built from `MV_V3_ALT_RAW` bit-lengths via the shared canonical
+/// builder (spec/16 §1 / Extractor 07, VMA 0x1c25a0b8).
+static MV_V3_ALT_TABLE: std::sync::OnceLock<Vec<VlcEntry<u16>>> = std::sync::OnceLock::new();
+
+/// Canonical-Huffman builder shared by both v3 MV VLC variants (same
+/// shape as mcbpcy.rs): sort by `(bit_length, symbol_index)`, assign
+/// `code = 0` for the first symbol, then `code = (code + 1) << (bl_cur -
+/// bl_prev)` for each subsequent. The `raw` slice carries `(bit_length,
+/// code_value)` pairs indexed by symbol; `code_value` is ignored — codes
+/// are reconstructed canonically (the proven default-variant path, which
+/// the explicit DLL-internal `code_value` column does not match because
+/// the loader uses a different reader convention; spec/16 §1).
+fn build_canonical_mv_table(raw: &[(u32, u32)]) -> Vec<VlcEntry<u16>> {
+    let mut symbols: Vec<(u32, u16)> = raw
         .iter()
         .enumerate()
         .filter_map(|(idx, &(bl, _code))| {
@@ -176,8 +184,20 @@ fn build_table() -> Vec<VlcEntry<u16>> {
     entries
 }
 
+fn build_table() -> Vec<VlcEntry<u16>> {
+    build_canonical_mv_table(MV_V3_RAW)
+}
+
+fn build_alt_table() -> Vec<VlcEntry<u16>> {
+    build_canonical_mv_table(MV_V3_ALT_RAW)
+}
+
 fn table() -> &'static [VlcEntry<u16>] {
     MV_V3_TABLE.get_or_init(build_table)
+}
+
+fn alt_table() -> &'static [VlcEntry<u16>] {
+    MV_V3_ALT_TABLE.get_or_init(build_alt_table)
 }
 
 /// Decoded motion-vector in half-pel units. Both components are in
@@ -232,45 +252,44 @@ pub fn decode_mv(br: &mut BitReader<'_>, predictor: Mv) -> Result<Mv> {
 /// Variant of [`decode_mv`] with explicit MV-VLC selection. The v3
 /// picture decoder threads the per-frame `mv_table_sel` bit through
 /// here so streams with `mv_table_sel == 1` route to
-/// [`MvTable::Alternate`] instead of being rejected at picture
-/// dispatch time. The Alternate path is currently a placeholder that
-/// returns [`Error::Unsupported`] with the extractor-blocker
-/// diagnostic — the dispatch is wired so when the alternate-VLC
-/// extraction lands the swap is local to this function.
+/// [`MvTable::Alternate`]. Both variants are now wired end-to-end: the
+/// alternate VLC source (VMA `0x1c25a0b8`, file `0x594b8`) was
+/// re-extracted at its full 8804-byte size in Extractor 07 (spec/16 §1,
+/// `tables/region_0594b8_mvvlc.csv` — 1100 entries, ESC at 1099,
+/// Kraft = 1.0) and is decoded through the same canonical-Huffman
+/// builder as the default, paired with the alternate `(MVDx, MVDy)`
+/// byte LUTs at VMAs `0x1c25c320` / `0x1c25c770`.
 pub fn decode_mv_with_table(
     br: &mut BitReader<'_>,
     predictor: Mv,
     mv_table: MvTable,
 ) -> Result<Mv> {
     match mv_table {
-        MvTable::Default => decode_mv_default(br, predictor),
-        MvTable::Alternate => Err(Error::unsupported(
-            "msmpeg4v3 mv: alternate MV VLC (mv_table_sel=1, source VMA \
-             0x1c25a0b8) is not yet wired end-to-end. The two byte LUTs \
-             at VMAs 0x1c25c320 / 0x1c25c770 ARE landed as \
-             MVDX_V3_ALT_BYTES / MVDY_V3_ALT_BYTES (round 251). What \
-             remains: the VLC source at file offset 0x594b8 / VMA \
-             0x1c25a0b8 — docs/video/msmpeg4/tables/region_0594b8.hex \
-             is a 256-byte truncation against the 8804-byte source \
-             documented in docs/video/msmpeg4/spec/11-walker-format-\
-             resolved.md §5 (header u32-LE count=1100 then 1100 \
-             (code:u32-LE, bl:u32-LE) records, identical record format \
-             to the default at 0x1c25cbc0). To unblock: re-extract \
-             region_0594b8 at full 8804-byte size, then swap the \
-             placeholder body in mv::decode_mv_with_table for the same \
-             canonical-Huffman builder pattern as decode_mv_default and \
-             route the byte-LUT reads to MVDX_V3_ALT_BYTES / \
-             MVDY_V3_ALT_BYTES. Affected fixtures per \
-             memory/project_msmpeg4_runtime_binding_clues.md §2.1: \
-             div3.avi frames 37/38/40, div4.avi frames 1/16.",
-        )),
+        MvTable::Default => decode_mv_variant(br, predictor, table(), MVDX_V3_BYTES, MVDY_V3_BYTES),
+        MvTable::Alternate => decode_mv_variant(
+            br,
+            predictor,
+            alt_table(),
+            MVDX_V3_ALT_BYTES,
+            MVDY_V3_ALT_BYTES,
+        ),
     }
 }
 
-/// Internal: the default-variant decode body, factored out so
-/// [`decode_mv_with_table`] can dispatch on the `MvTable` selector.
-fn decode_mv_default(br: &mut BitReader<'_>, predictor: Mv) -> Result<Mv> {
-    let idx = vlc::decode(br, table())? as usize;
+/// Internal: the v3 joint-MV decode body, parameterised by the VLC
+/// table and the `(MVDx, MVDy)` byte LUTs so both `mv_table_sel`
+/// variants share one implementation. The ESC path (index 1099) and the
+/// bias/predictor/wrap arithmetic are identical across variants per
+/// spec/06 §3.3 / §3.5 and spec/16 §1 (the alternate's alphabet shape
+/// matches the default — same ESC index, same 6+6-bit FLC tail).
+fn decode_mv_variant(
+    br: &mut BitReader<'_>,
+    predictor: Mv,
+    vlc_table: &[VlcEntry<u16>],
+    mvdx_lut: &[u8; 1104],
+    mvdy_lut: &[u8; 1104],
+) -> Result<Mv> {
+    let idx = vlc::decode(br, vlc_table)? as usize;
 
     let (raw_x, raw_y) = if idx == MV_V3_ESC_INDEX {
         // ESC: two 6-bit FLC reads (spec/06 §3.3).
@@ -282,7 +301,7 @@ fn decode_mv_default(br: &mut BitReader<'_>, predictor: Mv) -> Result<Mv> {
             "msmpeg4v3 mv: decoded index {idx} out of alphabet range"
         )));
     } else {
-        (MVDX_V3_BYTES[idx], MVDY_V3_BYTES[idx])
+        (mvdx_lut[idx], mvdy_lut[idx])
     };
 
     // spec/06 §3.5: subtract bias 32 to get signed residual, add
@@ -727,47 +746,87 @@ mod tests {
         assert_eq!(out.y, -8);
     }
 
-    /// Round 32 piece 3: [`MvTable::Default`] is wired,
-    /// [`MvTable::Alternate`] is a placeholder that returns
-    /// [`Error::Unsupported`] with the actionable extractor-blocker
-    /// diagnostic. Pin the diagnostic content so any future drift in
-    /// the message gets caught — and so that when extraction lands and
-    /// the placeholder body is swapped, the test breaks loudly.
+    // =================================================================
+    // Round 326: alternate-variant VLC source wired end-to-end
+    // (spec/16 §1 / Extractor 07). The alternate MV VLC table now
+    // decodes through the same canonical-Huffman builder as the default.
+    // =================================================================
+
+    /// The alternate MV VLC table builds to a complete 1100-entry
+    /// canonical-Huffman table with the ESC symbol (index 1099) present
+    /// — the same alphabet shape as the default variant.
     #[test]
-    fn mv_table_alternate_is_unsupported_with_diagnostic() {
-        let data = [0xffu8; 8]; // arbitrary; never read because the dispatch errors first.
+    fn alt_mv_vlc_table_has_1100_entries_with_esc() {
+        let t = alt_table();
+        assert_eq!(t.len(), 1100, "alt MV VLC must have 1100 symbols");
+        assert!(
+            t.iter().any(|e| e.value as usize == MV_V3_ESC_INDEX),
+            "alt MV VLC must contain the ESC symbol (index 1099)"
+        );
+    }
+
+    /// The alternate table is prefix-free (canonical-Huffman invariant).
+    #[test]
+    fn alt_mv_vlc_is_prefix_free() {
+        let t = alt_table();
+        for (i, a) in t.iter().enumerate() {
+            for b in &t[i + 1..] {
+                if a.bits == b.bits {
+                    continue;
+                }
+                let (short, long) = if a.bits < b.bits { (a, b) } else { (b, a) };
+                let shift = long.bits - short.bits;
+                let long_prefix = long.code >> shift;
+                assert_ne!(
+                    long_prefix, short.code,
+                    "alt MV: sym {} (bl={}) is a prefix of sym {} (bl={})",
+                    short.value, short.bits, long.value, long.bits,
+                );
+            }
+        }
+    }
+
+    /// `decode_mv_with_table(.., MvTable::Alternate)` no longer errors:
+    /// the alternate joint symbol 0 (canonical 2-bit code `00`, alt byte
+    /// LUT index 0 = `0x20` for both components) decodes to MV = (0, 0)
+    /// with a zero predictor.
+    #[test]
+    fn decode_mv_alternate_symbol_zero_is_zero() {
+        use crate::tables_data::{MVDX_V3_ALT_BYTES, MVDY_V3_ALT_BYTES};
+        // Confirm the precondition the assertion below relies on.
+        assert_eq!(MVDX_V3_ALT_BYTES[0], 32, "alt MVDx idx 0 must be bias 32");
+        assert_eq!(MVDY_V3_ALT_BYTES[0], 32, "alt MVDy idx 0 must be bias 32");
+
+        // Alt bit-lengths start at 2 and symbol 0 sorts first, so its
+        // canonical code is `00` (2 bits). Stream: `00` then padding.
+        let data = [0x00u8, 0x00, 0x00];
         let mut br = BitReader::new(&data);
-        let err = decode_mv_with_table(&mut br, Mv::default(), MvTable::Alternate).unwrap_err();
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("mv_table_sel=1"),
-            "diagnostic must reference the picture-header field; got: {msg}"
+        let out = decode_mv_with_table(&mut br, Mv::default(), MvTable::Alternate).unwrap();
+        assert_eq!(
+            out,
+            Mv { x: 0, y: 0 },
+            "alt sym 0 + zero predictor → (0, 0)"
         );
-        assert!(
-            msg.contains("0x1c25a0b8"),
-            "diagnostic must cite the alternate-VLC source VMA; got: {msg}"
-        );
-        assert!(
-            msg.contains("region_0594b8"),
-            "diagnostic must cite the truncated extraction file; got: {msg}"
-        );
-        assert!(
-            msg.contains("0x1c25c320") && msg.contains("0x1c25c770"),
-            "diagnostic must cite the alternate (MVDx, MVDy) byte LUT VMAs (so re-extraction \
-             knows what to dump); got: {msg}"
-        );
-        // Round 251: diagnostic now records that the byte LUTs landed
-        // and names the only remaining blocker (the VLC source size).
-        assert!(
-            msg.contains("MVDX_V3_ALT_BYTES") && msg.contains("MVDY_V3_ALT_BYTES"),
-            "diagnostic must surface the wired alt byte-LUT constants so a downstream agent \
-             knows the swap is single-emitter; got: {msg}"
-        );
-        assert!(
-            msg.contains("8804"),
-            "diagnostic must cite the spec/11 §5 full-source size so re-extraction has a clear \
-             target byte count; got: {msg}"
-        );
+        // Exactly 2 bits consumed for the joint symbol (no ESC tail).
+        assert_eq!(br.bit_position(), 2, "alt sym 0 must consume only 2 bits");
+    }
+
+    /// The alternate and default tables are genuinely distinct: decoding
+    /// the same 2-bit `00` prefix yields different consumed lengths /
+    /// symbols because the default's symbol 0 is a 1-bit code. This pins
+    /// that the dispatch actually selects the alternate table rather
+    /// than silently falling back to the default.
+    #[test]
+    fn alt_and_default_tables_differ_at_dispatch() {
+        // Default symbol 0 is a 1-bit `0`; alternate symbol 0 is 2-bit
+        // `00`. Feeding `00` to each consumes 1 vs 2 bits respectively.
+        let data = [0x00u8, 0x00, 0x00];
+        let mut br_def = BitReader::new(&data);
+        let mut br_alt = BitReader::new(&data);
+        decode_mv_with_table(&mut br_def, Mv::default(), MvTable::Default).unwrap();
+        decode_mv_with_table(&mut br_alt, Mv::default(), MvTable::Alternate).unwrap();
+        assert_eq!(br_def.bit_position(), 1, "default sym 0 is 1-bit");
+        assert_eq!(br_alt.bit_position(), 2, "alternate sym 0 is 2-bit");
     }
 
     // =================================================================

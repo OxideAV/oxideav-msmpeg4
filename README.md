@@ -41,7 +41,7 @@ few inter sub-types remain gated on open spec items (see below).
 | G0..G5 canonical-Huffman primary AC VLC        | complete   |
 | MS-MPEG4v3 intra 3-tier ESC body               | complete (LMAX/RMAX ground-truth-validated for all 6 G-families) |
 | Inter AC residual (G4 VLC → IDCT → add to MC)  | complete   |
-| P-frame MV VLC + half-pel MC (default table)   | complete   |
+| P-frame MV VLC + half-pel MC (default + alt)   | complete   |
 | P-frame 1-MV predictor (Figure 7-34)           | complete   |
 | 4-MV-per-MB predictor surface + neighbour resolver | wired (per-block bordering-cell pick) |
 | V3 intra-luma I-frame end-to-end via `decode_picture` | complete |
@@ -52,10 +52,6 @@ few inter sub-types remain gated on open spec items (see below).
 
 ## What's still open for real-content decode
 
-- **Alternate MV VLC** (`mv_table_sel == 1`): the byte LUTs are wired,
-  but the VLC source is still a truncated dump, so the alternate-table
-  path returns a typed `Unsupported` diagnostic. Affected fixtures
-  reject at picture-dispatch time.
 - **4-MV-per-MB picture decode**: the predictor / neighbour-resolver
   surface is complete, but wiring it into the picture decoder waits on
   the v3 MCBPC bit pattern that signals 1-MV vs 4-MV mode (an open spec
