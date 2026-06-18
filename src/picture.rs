@@ -751,11 +751,13 @@ pub enum MsV1V2Version {
 ///   `dc_size_sel = 0` path verbatim; assuming that default rather
 ///   than tracing it would be guesswork, so we surface the narrowed
 ///   gap instead of decoding against an unverified table choice.
-/// * **v1 non-zero inter MB sub-types** (`mb_type` ∈ {1, 2, 4, 5}) —
-///   spec/07 §1.4 pins only the `mb_type = mcbpc >> 2` decomposition
-///   and the H.263 Table-8 *lineage* ("structural, value-level match
-///   not asserted"); the per-sub-type side reads (quantiser delta /
-///   per-block MV count) are untraced.
+/// * **v1 inter MB sub-types** — now wired. `spec/16` §3.1 +
+///   `region_053140_mbtype.csv` pin the P-frame MB-type → MV-count map
+///   {1, 1, 4, 0, 0}: type 0 (INTER) and type 1 (INTER+Q) are 1-MV
+///   (the v1 MCBPCY body reads no quantiser-delta bit per spec/07
+///   §1.4), and type 2 (INTER4V) loops the per-component MV decoder 4×
+///   over the Figure 6-8 8x8 blocks. Types 3/4 are intra (handled by
+///   the intra-in-P path).
 pub fn decode_picture_v1v2(
     br: &mut BitReader<'_>,
     dims: PictureDims,
@@ -903,31 +905,65 @@ fn decode_pframe_mb_v1v2(
         )));
     }
 
-    if decode.mb_type != 0 {
-        // spec/07 §1.4 pins only the `mb_type = mcbpc >> 2`
-        // decomposition; the per-sub-type side reads (quantiser
-        // delta / per-block MV count in the H.263 Table-8 lineage)
-        // are untraced, so anything but the plain 1-MV inter type 0
-        // is rejected with the precise gap.
-        return Err(Error::unsupported(format!(
-            "{codec}: inter MB sub-type {} at ({mb_x}, {mb_y}) — \
-             spec/07 §1.4 asserts the H.263 Table-8 lineage only \
-             structurally; the per-sub-type side reads are an open \
-             trace item, so only sub-type 0 (plain 1-MV inter) is \
-             decoded.",
-            decode.mb_type,
-        )));
+    // Per `spec/16` §3.1 + `region_053140_mbtype.csv` the v1 P-frame
+    // MB-type (= mcbpc >> 2) selects the motion mode with traced
+    // motion-vector counts {1, 1, 4, 0, 0}:
+    //   * MB-type 0 (INTER)    — 1 MV.
+    //   * MB-type 1 (INTER+Q)  — 1 MV. spec/07 §1.4 confirms the v1
+    //     MCBPCY body reads NO post-VLC bit (no `call 0x1c215c9b`
+    //     after CBPY), i.e. there is no quantiser-delta read; the
+    //     "+Q" is the H.263-Table-8 lineage name only, and the trace
+    //     decodes it exactly like MB-type 0.
+    //   * MB-type 2 (INTER4V)  — 4 MVs, one per Figure 6-8 8x8 block;
+    //     spec/16 §3.1 says the per-component MV decoder loops 4×.
+    // MB-types 3/4 are intra and are handled by the `is_intra` branch
+    // above. The v2 8-symbol MCBPC alphabet only emits mb_type ∈
+    // {0, 3} (quotient 0/1), so this dispatch is reached with
+    // mb_type ∈ {0, 1, 2} on the inter path.
+    match decode.mb_type {
+        0 | 1 => {
+            // 1-MV inter: §7.6.5 median-of-3 predictor (same helper as
+            // v3 per spec/07 §3.5), two separate component reads against
+            // the shared 65-entry table (spec/07 §3.2), bias subtract +
+            // toroidal wrap inside `decode_mv_v1v2`.
+            let predictor = one_mv_predictor(mv_grid, mb_x, mb_y);
+            let mv = crate::mv::decode_mv_v1v2(br, predictor)?;
+            mv_grid.set_cell(mb_x, mb_y, crate::mv_pred::MvGridCell::OneMv(mv));
+            apply_mc_to_mb(pic, reference, mb_x, mb_y, (mv.x as i32, mv.y as i32));
+        }
+        2 => {
+            // INTER4V: decode one MVD per Figure 6-8 block in raster
+            // order, threading each block's *final* MV back into the
+            // Figure-7-34 within-MB predictor via the
+            // `Macroblock4MvDecoderNeighbours` driver (handles a mix of
+            // 1-MV / 4-MV / absent neighbours per spec §7.6.5).
+            use crate::mv_pred::{Block, Macroblock4MvDecoderNeighbours};
+            let nset = mv_grid.neighbour_set_for(mb_x, mb_y);
+            let mut dec = Macroblock4MvDecoderNeighbours::new(nset);
+            let mut block_mvs = [crate::mv::Mv::default(); 4];
+            for (i, &block) in Block::ALL.iter().enumerate() {
+                let predictor = dec.predictor_for(block);
+                let mv = crate::mv::decode_mv_v1v2(br, predictor)?;
+                dec.commit_block(block, mv);
+                block_mvs[i] = mv;
+            }
+            mv_grid.set_cell(mb_x, mb_y, dec.finalise_to_grid_cell());
+            let mvs_half = [
+                (block_mvs[0].x as i32, block_mvs[0].y as i32),
+                (block_mvs[1].x as i32, block_mvs[1].y as i32),
+                (block_mvs[2].x as i32, block_mvs[2].y as i32),
+                (block_mvs[3].x as i32, block_mvs[3].y as i32),
+            ];
+            apply_mc_4mv_to_mb(pic, reference, mb_x, mb_y, mvs_half);
+        }
+        other => {
+            return Err(Error::invalid(format!(
+                "{codec}: inter MB-type {other} at ({mb_x}, {mb_y}) is \
+                 out of the traced P-frame inter range {{0, 1, 2}} \
+                 (spec/16 §3.1); intra types 3/4 take the is_intra path."
+            )));
+        }
     }
-
-    // Plain inter MB: §7.6.5 1-MV predictor (same helper as v3 per
-    // spec/07 §3.5), two separate component reads against the shared
-    // 65-entry table (spec/07 §3.2), bias subtract + toroidal wrap
-    // inside `decode_mv_v1v2`.
-    let predictor = one_mv_predictor(mv_grid, mb_x, mb_y);
-    let mv = crate::mv::decode_mv_v1v2(br, predictor)?;
-    mv_grid.set_cell(mb_x, mb_y, crate::mv_pred::MvGridCell::OneMv(mv));
-
-    apply_mc_to_mb(pic, reference, mb_x, mb_y, (mv.x as i32, mv.y as i32));
 
     decode_inter_residual_blocks(
         br,
@@ -1032,6 +1068,50 @@ fn apply_mc_to_mb(
         mb_x,
         mb_y,
         mv_half,
+    );
+}
+
+/// Apply INTER4V (MB-type 2) motion compensation to the (mb_x, mb_y) MB:
+/// each of the four 8x8 luma blocks uses its own half-pel MV in Figure
+/// 6-8 raster order, and both chroma blocks use the §7.6.3.4-derived
+/// shared MV. The four MVs are supplied as `(x, y)` half-pel pairs.
+fn apply_mc_4mv_to_mb(
+    pic: &mut Picture,
+    reference: &Picture,
+    mb_x: usize,
+    mb_y: usize,
+    block_mvs_half: [(i32, i32); 4],
+) {
+    let ref_y = crate::mc::RefPlane {
+        data: &reference.y,
+        stride: reference.y_stride,
+        width: reference.width as usize,
+        height: reference.height as usize,
+    };
+    let ref_cb = crate::mc::RefPlane {
+        data: &reference.cb,
+        stride: reference.c_stride,
+        width: (reference.width as usize).div_ceil(2),
+        height: (reference.height as usize).div_ceil(2),
+    };
+    let ref_cr = crate::mc::RefPlane {
+        data: &reference.cr,
+        stride: reference.c_stride,
+        width: (reference.width as usize).div_ceil(2),
+        height: (reference.height as usize).div_ceil(2),
+    };
+    crate::mc::mc_macroblock_4mv(
+        &ref_y,
+        &ref_cb,
+        &ref_cr,
+        &mut pic.y,
+        &mut pic.cb,
+        &mut pic.cr,
+        pic.y_stride,
+        pic.c_stride,
+        mb_x,
+        mb_y,
+        block_mvs_half,
     );
 }
 

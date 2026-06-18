@@ -23,8 +23,9 @@ decoder when a packet arrives.
 ## Status
 
 **In progress.** `classify` and the v3 intra/P-frame pixel pipeline are
-production-ready; v1/v2 P-frames decode to pixels. v1/v2 I-frames and a
-few inter sub-types remain gated on open spec items (see below).
+production-ready; v1/v2 P-frames decode to pixels, including the INTER+Q
+and INTER4V (4-MV) inter sub-types. v1/v2 I-frames and intra-in-P MBs
+remain gated on a single open spec item (see below).
 
 | Piece                                          | Status     |
 | ---------------------------------------------- | ---------- |
@@ -45,17 +46,18 @@ few inter sub-types remain gated on open spec items (see below).
 | P-frame 1-MV predictor (Figure 7-34)           | complete   |
 | 4-MV-per-MB predictor surface + neighbour resolver | wired (per-block bordering-cell pick) |
 | V3 intra-luma I-frame end-to-end via `decode_picture` | complete |
-| V1 / V2 P-frame pixel pipeline                 | complete   |
+| V1 / V2 P-frame pixel pipeline (incl. INTER+Q + INTER4V) | complete |
 | V1 / V2 shared CBPY VLC                         | complete   |
 | Picture-wide MV grid (`MvGrid`)                | complete   |
 | Per-G-family descriptor / runtime-binding accessors | complete |
 
 ## What's still open for real-content decode
 
-- **4-MV-per-MB picture decode**: the predictor / neighbour-resolver
-  surface is complete, but wiring it into the picture decoder waits on
-  the v3 MCBPC bit pattern that signals 1-MV vs 4-MV mode (an open spec
-  gap).
+- **V3 4-MV-per-MB picture decode**: the predictor / neighbour-resolver
+  surface is complete and is now driven from the v1 P-frame INTER4V
+  path (`spec/16` §3.1). Wiring it into the **v3** picture decoder still
+  waits on the v3 MCBPC bit pattern that signals 1-MV vs 4-MV mode (an
+  open v3-specific spec gap; the v1/v2 MB-type → MV-count map is traced).
 - **V1 / V2 I-frames and intra-in-P MBs**: gated behind a documented
   `Unsupported` error, now narrowed to a **single** trace target. The
   intra block path is otherwise fully shared with v3 and already wired:
@@ -70,8 +72,13 @@ few inter sub-types remain gated on open spec items (see below).
   spatial-prediction LUT pair `0x1c23a788 / 0x1c23a7b0` that v1 omits is
   the *CBP* predictor, not a DC-prediction LUT, so its absence does not
   block intra DC decode.)
-- **V1 non-zero inter sub-types** (`mb_type ∈ {1, 2, 4, 5}`): the
-  per-sub-type side reads are not yet traced.
+- **V1 inter sub-types**: now wired. `spec/16` §3.1 +
+  `region_053140_mbtype.csv` pin the P-frame MB-type → MV-count map
+  {1, 1, 4, 0, 0}: MB-type 0 (INTER) and MB-type 1 (INTER+Q) are 1-MV
+  (the v1 MCBPCY body reads no quantiser-delta bit per spec/07 §1.4),
+  and MB-type 2 (INTER4V) loops the per-component MV decoder 4× over the
+  Figure 6-8 8x8 blocks, with the chroma MV derived per §7.6.3.4.
+  MB-types 3/4 are intra (intra-in-P path).
 
 ## License
 

@@ -11,17 +11,22 @@
 //! block — the v1/v2 fallthrough at `0x1c212917` binds the inter
 //! descriptor to G4 (spec/14 §3.1).
 //!
+//! Round 335 wires the v1 inter MB sub-types from the re-extracted
+//! `spec/16` §3.1 + `region_053140_mbtype.csv`: the P-frame MB-type
+//! (= mcbpc >> 2) selects the motion mode with MV-counts {1, 1, 4, 0,
+//! 0}. MB-type 0 (INTER) and MB-type 1 (INTER+Q) are both 1-MV (the v1
+//! MCBPCY body reads no quantiser-delta bit per spec/07 §1.4), and
+//! MB-type 2 (INTER4V) loops the per-component MV decoder 4× over the
+//! Figure 6-8 8x8 blocks, with the chroma MV derived per §7.6.3.4.
+//!
 //! Still gated with a documented `Unsupported` (asserted below):
-//! I-frames + intra-in-P MBs and the v1 non-zero inter sub-types.
-//! Round 317 narrowed the I-frame/intra-in-P gap: the intra kernel
-//! `0x1c216d97`, the DC-predictor gradient routine `0x1c20aef0`, and
-//! the four intra-DC-size VLC tables (spec/99 §4.5) are all shared
+//! I-frames + intra-in-P MBs. Round 317 narrowed that gap: the intra
+//! kernel `0x1c216d97`, the DC-predictor gradient routine `0x1c20aef0`,
+//! and the four intra-DC-size VLC tables (spec/99 §4.5) are all shared
 //! with v3 and already wired; the single residual blocker is the
 //! untraced construction-time default of the intra-DC-size selector
 //! `[esi+0x8bc]`, which spec/01 §1.4 shows is bitstream-read only on
-//! `version == 3`. The v1 non-zero inter sub-types remain blocked on
-//! the per-sub-type side reads (spec/07 §1.4 asserts the H.263
-//! Table-8 lineage only structurally).
+//! `version == 3`.
 
 use oxideav_core::bits::BitReader;
 use oxideav_msmpeg4::header::PictureType;
@@ -321,23 +326,100 @@ fn v2_pframe_intra_in_p_unsupported_with_docs_gap_diagnostic() {
 }
 
 #[test]
-fn v1_pframe_nonzero_subtype_unsupported_with_diagnostic() {
+fn v1_pframe_inter_plus_q_subtype_one_mv_zero_copies_reference() {
+    // spec/16 §3.1: MB-type 1 (INTER+Q) is a 1-MV inter MB decoded
+    // exactly like MB-type 0 (the v1 MCBPCY body reads no quantiser
+    // delta per spec/07 §1.4). MCBPC sym 4 → mb_type = 1, CBPC = 0.
     let (dims, reference) = gradient_reference();
-    // v1 MCBPC sym 4 → mb_type = 1 (untraced sub-type).
     let (mcbpc_code, mcbpc_bl) = code_for(MCBPC_V1_RAW, 4);
-    let (cbpy_code, cbpy_bl) = code_for(CBPY_V1_V2_RAW, 15);
+    let (cbpy_code, cbpy_bl) = code_for(CBPY_V1_V2_RAW, 15); // post-wrap 0
+    let (mv0_code, mv0_bl) = code_for(MV_V1_V2_RAW, 32); // MVD 0
     let mut fields = v1_pframe_header(8);
     fields.push((0, 1)); // skip = 0
     fields.push((mcbpc_code, mcbpc_bl));
     fields.push((cbpy_code, cbpy_bl));
+    fields.push((mv0_code, mv0_bl)); // MVDx = 0
+    fields.push((mv0_code, mv0_bl)); // MVDy = 0
     let bytes = pack(&fields);
     let mut br = BitReader::new(&bytes);
-    let err = decode_picture_v1v2(&mut br, dims, MsV1V2Version::V1, Some(&reference)).unwrap_err();
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("sub-type 1") && msg.contains("spec/07 §1.4"),
-        "v1 sub-type gate must cite spec/07 §1.4; got: {msg}"
-    );
+    let pic = decode_picture_v1v2(&mut br, dims, MsV1V2Version::V1, Some(&reference))
+        .expect("v1 INTER+Q (mb_type 1) MV=(0,0) decode");
+    assert_eq!(pic.picture_type, PictureType::P);
+    assert_eq!(pic.y, reference.y, "INTER+Q MV=(0,0), CBP=0 must be a copy");
+    assert_eq!(pic.cb, reference.cb);
+    assert_eq!(pic.cr, reference.cr);
+}
+
+#[test]
+fn v1_pframe_inter4v_zero_mvs_copies_reference() {
+    // spec/16 §3.1: MB-type 2 (INTER4V) loops the per-component MV
+    // decoder 4×, one MV per Figure 6-8 8x8 block. MCBPC sym 8 →
+    // mb_type = 2, CBPC = 0. Four (0,0) MVs ⇒ every block copies the
+    // reference verbatim; CBPY post-wrap 0 ⇒ no residual.
+    let (dims, reference) = gradient_reference();
+    let (mcbpc_code, mcbpc_bl) = code_for(MCBPC_V1_RAW, 8);
+    let (cbpy_code, cbpy_bl) = code_for(CBPY_V1_V2_RAW, 15); // post-wrap 0
+    let (mv0_code, mv0_bl) = code_for(MV_V1_V2_RAW, 32); // MVD 0
+    let mut fields = v1_pframe_header(8);
+    fields.push((0, 1)); // skip = 0
+    fields.push((mcbpc_code, mcbpc_bl));
+    fields.push((cbpy_code, cbpy_bl));
+    // 4 blocks × (MVDx, MVDy), all zero.
+    for _ in 0..4 {
+        fields.push((mv0_code, mv0_bl));
+        fields.push((mv0_code, mv0_bl));
+    }
+    let bytes = pack(&fields);
+    let mut br = BitReader::new(&bytes);
+    let pic = decode_picture_v1v2(&mut br, dims, MsV1V2Version::V1, Some(&reference))
+        .expect("v1 INTER4V (mb_type 2) four-zero-MV decode");
+    assert_eq!(pic.picture_type, PictureType::P);
+    assert_eq!(pic.y, reference.y, "INTER4V four (0,0) MVs must be a copy");
+    assert_eq!(pic.cb, reference.cb);
+    assert_eq!(pic.cr, reference.cr);
+}
+
+#[test]
+fn v1_pframe_inter4v_per_block_mvs_shift_independently() {
+    // Each 8x8 luma block of an INTER4V MB uses its own MV. Give block
+    // 1 (top-left) an MVDx of +2 half-pel (= +1 full pel). The first MB
+    // has no neighbours, so block 1's §7.6.5 predictor is (0,0) and its
+    // final MV is exactly the decoded MVD = (+2, 0). We assert the
+    // top-left 8x8 sampled one column to the right (the within-MB
+    // predictor threading for the later blocks is exercised by the
+    // dedicated mv_pred unit tests, not re-asserted here).
+    let (dims, reference) = gradient_reference();
+    let (mcbpc_code, mcbpc_bl) = code_for(MCBPC_V1_RAW, 8); // mb_type 2
+    let (cbpy_code, cbpy_bl) = code_for(CBPY_V1_V2_RAW, 15); // post-wrap 0
+    let (mvx_code, mvx_bl) = code_for(MV_V1_V2_RAW, 34); // +2 half-pel
+    let (mv0_code, mv0_bl) = code_for(MV_V1_V2_RAW, 32); // 0
+    let mut fields = v1_pframe_header(8);
+    fields.push((0, 1)); // skip = 0
+    fields.push((mcbpc_code, mcbpc_bl));
+    fields.push((cbpy_code, cbpy_bl));
+    // Block 1: MVDx = +2, MVDy = 0.
+    fields.push((mvx_code, mvx_bl));
+    fields.push((mv0_code, mv0_bl));
+    // Blocks 2..4: MVD 0 each.
+    for _ in 0..3 {
+        fields.push((mv0_code, mv0_bl));
+        fields.push((mv0_code, mv0_bl));
+    }
+    let bytes = pack(&fields);
+    let mut br = BitReader::new(&bytes);
+    let pic = decode_picture_v1v2(&mut br, dims, MsV1V2Version::V1, Some(&reference))
+        .expect("v1 INTER4V per-block MV decode");
+    // Top-left 8x8 block samples the reference one column to the right.
+    for row in 0..8usize {
+        for col in 0..8usize {
+            let src_col = (col + 1).min(15);
+            assert_eq!(
+                pic.y[row * pic.y_stride + col],
+                reference.y[row * reference.y_stride + src_col],
+                "block-1 luma ({row}, {col}) must sample reference column {src_col}",
+            );
+        }
+    }
 }
 
 #[test]

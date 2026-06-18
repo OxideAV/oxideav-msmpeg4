@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- round 335: wire the v1 P-frame inter MB sub-types from the re-extracted
+  `spec/16` §3.1 + `tables/region_053140_mbtype.csv`. The P-frame MB-type
+  (= mcbpc >> 2) now selects the motion mode with the traced MV-count map
+  {1, 1, 4, 0, 0}: MB-type 0 (INTER) and MB-type 1 (INTER+Q) decode as
+  1-MV inter MBs (the v1 MCBPCY body reads no quantiser-delta bit per
+  spec/07 §1.4 — "+Q" is the H.263-Table-8 lineage name only), and
+  MB-type 2 (INTER4V) loops the per-component MV decoder 4× over the
+  Figure 6-8 8x8 blocks, threading each block's final MV through the
+  Figure-7-34 `Macroblock4MvDecoderNeighbours` predictor, applying
+  per-block half-pel luma MC and the §7.6.3.4 sum/2K chroma MV
+  derivation (new `mc::mc_macroblock_4mv` / `chroma_mv_from_four_luma`,
+  Table 7-12 eighth→half rounding). Previously every `mb_type != 0`
+  inter MB returned `Unsupported`; INTER+Q and INTER4V MBs now decode
+  end-to-end. Adds picture-level integration tests (INTER+Q 1-MV,
+  INTER4V four-zero-MV copy, INTER4V per-block MV shift) plus `mc` unit
+  tests for the chroma derivation and 4-MV macroblock MC.
 - round 326: wire the v3 alternate joint-MV VLC (`mv_table_sel == 1`,
   VMA `0x1c25a0b8`) end-to-end. The full 8804-byte source (1100 entries,
   ESC at index 1099, Kraft = 1.0, bit-lengths 2..15) was re-extracted in
