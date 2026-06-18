@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- round 339: unblock the v1/v2 **intra** pixel pipeline (I-frames +
+  intra-in-P MBs), driven by the re-extracted `spec/16` §2 + the
+  binary-extracted DC-size tables (`tables/region_0542c0_dcsize.csv`
+  luma, `region_0543c0_dcsize.csv` chroma). spec/16 §2 established that
+  the v1/v2 intra-block driver gates on version (`cmp [esi+8], 3`): for
+  v < 3 the DC differential is decoded through the classic H.263 §5.4.1
+  / MPEG-4 Part 2 §7.4.3 size+value scheme (`sub_15790`) using the
+  binary's own luma/chroma size-category tables (VMAs `0x1c2542c0` /
+  `0x1c2543c0`), NOT the v3 direct-value DC VLC and NOT the v3
+  `[esi+0x8bc]` `dc_size_sel` selector. The previous gate cited that
+  selector's untraced construction-time default; since v1/v2 never
+  consult it, the gate is dissolved. New `build.rs` emitter
+  (`emit_dc_size_v1v2`) loads the two CSVs into
+  `DC_SIZE_LUMA_V1V2_RAW` / `DC_SIZE_CHROMA_V1V2_RAW` with a
+  prefix-code cross-check; new `mb::decode_intra_dc_diff_v1v2` +
+  `mb::decode_intra_block_full_v1v2` implement the size+value decode
+  with the H.263 signed-DC fixup; `picture::decode_iframe_v1v2` +
+  `decode_intra_mb_v1v2_to_picture` wire the I-frame and intra-in-P
+  paths through the shared spatial DC predictor + intra AC walk (luma
+  G5, chroma G4 per spec/14 §3.2). Replaces the three stale
+  `Unsupported`-gate assertions with positive intra-decode tests
+  (v1/v2 DC-only flat-grey I-frame, non-zero DC luma shift, v2
+  intra-in-P, registered-decoder `send_packet` v2 I-frame). Real-content
+  bit-exactness against an encoder oracle remains a pending Auditor item.
 - round 335: wire the v1 P-frame inter MB sub-types from the re-extracted
   `spec/16` §3.1 + `tables/region_053140_mbtype.csv`. The P-frame MB-type
   (= mcbpc >> 2) now selects the motion mode with the traced MV-count map

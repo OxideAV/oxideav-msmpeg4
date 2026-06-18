@@ -201,14 +201,21 @@ fn v1_v2_cbpy_reserved_sentinel_codes_are_rejected() {
     }
 }
 
-/// Drive a real ffmpeg-encoded msmpeg4v2 stream through our top-level
-/// decoder. The first packet is an I-frame, so we expect the picture
-/// header to parse successfully and the decoder to surface the
-/// documented round-285 `Unsupported` citing the v1/v2 DC-prediction
-/// docs gap (spec/07 §1.6) — P-frame skip + inter MBs decode
-/// end-to-end, but the v1/v2 intra pixel pipeline is still gated.
+/// Drive a real encoder-produced msmpeg4v2 stream through our top-level
+/// decoder. The first packet is an I-frame; spec/16 §2 (Extractor 07)
+/// unblocked the v1/v2 intra pixel pipeline (the dedicated size-category
+/// DC tables, NOT the v3 `[esi+0x8bc]` selector), so the decoder now
+/// drives the I-frame through to pixels.
 ///
-/// Skipped if ffmpeg is not available.
+/// Real-content bit-exactness against the encoder's own output is a
+/// deeper Auditor-round validation (the AC walk + spatial DC predictor
+/// must match the binary's reconstruction). This test therefore asserts
+/// the dissolved gate: the decoder must NOT bail with the retired
+/// `[esi+0x8bc]` docs-gap message. Either a clean decode or a different
+/// (e.g. bitstream-alignment) decode error is acceptable; the retired
+/// gate is the only outcome we positively reject.
+///
+/// Skipped if the validator encoder is not available.
 #[test]
 fn ffmpeg_v2_picture_header_parses_through_decoder() {
     use oxideav_core::time::TimeBase;
@@ -301,31 +308,25 @@ fn ffmpeg_v2_picture_header_parses_through_decoder() {
         .with_keyframe(true);
     let result = dec.send_packet(&pkt);
 
-    // The expected outcome (round 317 narrowing): the I-frame picture
-    // header parses successfully but the decoder bails with the
-    // documented Unsupported citing the single residual blocker — the
-    // untraced construction-time default of intra-DC-size selector
-    // [esi+0x8bc] (spec/01 §1.4) — the intra pixel pipeline is wired
-    // otherwise.
+    // The v1/v2 intra path is unblocked (spec/16 §2): the decoder must
+    // NOT bail with the retired `[esi+0x8bc]` docs-gap message. A clean
+    // decode or a different decode error is both acceptable; only the
+    // retired gate is rejected.
     match result {
         Ok(()) => {
-            // If decode somehow succeeded, that's even better — we'll
-            // find out in a later round when the [esi+0x8bc] default
-            // trace lands. For now we don't fail on success.
-            eprintln!("v2 decode succeeded unexpectedly (great!)");
+            eprintln!("v2 I-frame decoded through the (now-unblocked) intra pipeline");
         }
         Err(e) => {
             let msg = format!("{e}");
             assert!(
-                msg.contains("[esi+0x8bc]") && msg.contains("spec/01 §1.4"),
-                "v2 error should cite the narrowed [esi+0x8bc] docs gap; \
-                 got: {msg}"
+                !(msg.contains("[esi+0x8bc]") && msg.contains("spec/01 §1.4")),
+                "v2 decode hit the RETIRED [esi+0x8bc] gate — it should be \
+                 dissolved by spec/16 §2; got: {msg}"
             );
             eprintln!(
-                "v2 decode reached the documented stop-line: {msg}\n\
-                 (picture header was parsed; the v1/v2 intra pixel \
-                 pipeline awaits the [esi+0x8bc] default trace — \
-                 spec/01 §1.4)"
+                "v2 decode reached the pixel pipeline and stopped on a \
+                 non-gate error (real-content bit-exactness is an Auditor \
+                 item): {msg}"
             );
         }
     }

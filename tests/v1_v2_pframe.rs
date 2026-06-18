@@ -19,19 +19,22 @@
 //! MB-type 2 (INTER4V) loops the per-component MV decoder 4× over the
 //! Figure 6-8 8x8 blocks, with the chroma MV derived per §7.6.3.4.
 //!
-//! Still gated with a documented `Unsupported` (asserted below):
-//! I-frames + intra-in-P MBs. Round 317 narrowed that gap: the intra
-//! kernel `0x1c216d97`, the DC-predictor gradient routine `0x1c20aef0`,
-//! and the four intra-DC-size VLC tables (spec/99 §4.5) are all shared
-//! with v3 and already wired; the single residual blocker is the
-//! untraced construction-time default of the intra-DC-size selector
-//! `[esi+0x8bc]`, which spec/01 §1.4 shows is bitstream-read only on
-//! `version == 3`.
+//! Round 339 unblocks the v1/v2 **intra** path (I-frames + intra-in-P
+//! MBs). spec/16 §2 (Extractor 07) established that v1/v2 decode the
+//! intra DC differential through the classic H.263 size+value scheme
+//! using the binary's own luma/chroma size tables (`region_054{2,3}c0`),
+//! NOT the v3 `[esi+0x8bc]` `dc_size_sel` selector — so the previous
+//! gate (which cited that selector's untraced default) is dissolved.
+//! The spatial DC predictor and AC kernel are shared with v3; luma AC
+//! binds G5, chroma G4 (spec/14 §3.2).
 
 use oxideav_core::bits::BitReader;
 use oxideav_msmpeg4::header::PictureType;
 use oxideav_msmpeg4::picture::{decode_picture_v1v2, MsV1V2Version, Picture, PictureDims};
-use oxideav_msmpeg4::tables_data::{CBPY_V1_V2_RAW, MCBPC_V1_RAW, MCBPC_V2_RAW, MV_V1_V2_RAW};
+use oxideav_msmpeg4::tables_data::{
+    CBPY_V1_V2_RAW, DC_SIZE_CHROMA_V1V2_RAW, DC_SIZE_LUMA_V1V2_RAW, MCBPC_V1_RAW, MCBPC_V2_RAW,
+    MV_V1_V2_RAW,
+};
 
 fn pack(fields: &[(u32, u32)]) -> Vec<u8> {
     let mut out: Vec<u8> = Vec::new();
@@ -283,45 +286,125 @@ fn v2_pframe_inter_mb_zero_mv_copies_reference() {
 }
 
 #[test]
-fn v1_iframe_unsupported_with_docs_gap_diagnostic() {
-    let (dims, _) = gradient_reference();
-    // v1 I-frame header: preamble + type 0 + quant.
-    let bytes = pack(&[(0, 32), (0, 5), (0, 2), (8, 5)]);
+fn v1_iframe_intra_dc_only_decodes_flat_grey() {
+    // spec/16 §2 (Extractor 07): the v1/v2 I-frame intra path is the
+    // H.263 size+value DC scheme with the binary's own luma/chroma size
+    // tables — NOT the v3 `dc_size_sel` selector. A 16x16 I-frame with
+    // one intra MB whose DC-size is 0 for every block reconstructs to a
+    // flat grey MB (DC differential 0 + spatial predictor 1024 → DC =
+    // 1024 → IDCT → 128 per pel).
+    let dims = PictureDims::new(16, 16).unwrap();
+    // v1 I-frame header: 37-bit preamble + type 0 (I) + quant 8.
+    let mut fields: Vec<(u32, u32)> = vec![(0, 32), (0, 5), (0, 2), (8, 5)];
+    // MB header: skip bit 0 (v1 reads the COD bit even on I-frames),
+    // MCBPC sym 12 (mb_type 3 = INTRA, CBPC 0), CBPY raw 15 → post-wrap
+    // 0 (no coded luma).
+    let (mcbpc_code, mcbpc_bl) = code_for(MCBPC_V1_RAW, 12);
+    let (cbpy_code, cbpy_bl) = code_for(CBPY_V1_V2_RAW, 15);
+    fields.push((0, 1)); // skip / COD = 0
+    fields.push((mcbpc_code, mcbpc_bl));
+    fields.push((cbpy_code, cbpy_bl));
+    // 6 DC-size-0 codewords (4 luma + 2 chroma), no value bits.
+    let (luma0_code, luma0_bl) = code_for(DC_SIZE_LUMA_V1V2_RAW, 0);
+    let (chroma0_code, chroma0_bl) = code_for(DC_SIZE_CHROMA_V1V2_RAW, 0);
+    for _ in 0..4 {
+        fields.push((luma0_code, luma0_bl));
+    }
+    for _ in 0..2 {
+        fields.push((chroma0_code, chroma0_bl));
+    }
+    let bytes = pack(&fields);
     let mut br = BitReader::new(&bytes);
-    let err = decode_picture_v1v2(&mut br, dims, MsV1V2Version::V1, None).unwrap_err();
-    let msg = format!("{err}");
-    // Narrowed gap (round 317): the residual blocker is the untraced
-    // construction-time default of the intra-DC-size selector
-    // [esi+0x8bc], which spec/01 §1.4 shows is only bitstream-read on
-    // version==3. The intra kernel / DC-predictor / DC-size VLC tables
-    // are all shared with v3 and wired.
+    let pic = decode_picture_v1v2(&mut br, dims, MsV1V2Version::V1, None)
+        .expect("v1 I-frame intra DC-only decode");
+    assert_eq!(pic.picture_type, PictureType::I);
+    // DC = predictor (1024) + 0 → 1024; intra IDCT yields flat 128.
     assert!(
-        msg.contains("[esi+0x8bc]") && msg.contains("spec/01 §1.4"),
-        "I-frame gate must cite the narrowed [esi+0x8bc] default gap and \
-         spec/01 §1.4; got: {msg}"
+        pic.y.iter().all(|&p| p == 128),
+        "v1 I-frame DC-only luma must reconstruct flat grey 128"
+    );
+    assert!(pic.cb.iter().all(|&p| p == 128));
+    assert!(pic.cr.iter().all(|&p| p == 128));
+}
+
+#[test]
+fn v1_iframe_intra_nonzero_dc_shifts_luma() {
+    // A non-zero DC differential must shift the reconstructed luma away
+    // from flat grey. spec/16 §2.1: size category 1 + value bit `1` →
+    // differential +1 (no negative fixup since 1 >= 2^(1-1) = 1). With
+    // the q=8 luma DC scaler the reconstructed DC moves the whole 8x8
+    // block off 128.
+    let dims = PictureDims::new(16, 16).unwrap();
+    let mut fields: Vec<(u32, u32)> = vec![(0, 32), (0, 5), (0, 2), (8, 5)];
+    let (mcbpc_code, mcbpc_bl) = code_for(MCBPC_V1_RAW, 12); // INTRA
+    let (cbpy_code, cbpy_bl) = code_for(CBPY_V1_V2_RAW, 15); // post-wrap 0
+    fields.push((0, 1));
+    fields.push((mcbpc_code, mcbpc_bl));
+    fields.push((cbpy_code, cbpy_bl));
+    // Luma block 0: size category 1, value bit 1 → diff +1.
+    let (luma1_code, luma1_bl) = code_for(DC_SIZE_LUMA_V1V2_RAW, 1);
+    fields.push((luma1_code, luma1_bl));
+    fields.push((1, 1)); // 1 value bit = `1` → +1
+                         // Luma blocks 1..=3 + 2 chroma: size 0.
+    let (luma0_code, luma0_bl) = code_for(DC_SIZE_LUMA_V1V2_RAW, 0);
+    let (chroma0_code, chroma0_bl) = code_for(DC_SIZE_CHROMA_V1V2_RAW, 0);
+    for _ in 0..3 {
+        fields.push((luma0_code, luma0_bl));
+    }
+    for _ in 0..2 {
+        fields.push((chroma0_code, chroma0_bl));
+    }
+    let bytes = pack(&fields);
+    let mut br = BitReader::new(&bytes);
+    let pic = decode_picture_v1v2(&mut br, dims, MsV1V2Version::V1, None)
+        .expect("v1 I-frame intra non-zero DC decode");
+    // Luma block 0 (top-left 8x8) must have shifted off flat grey.
+    let mut block0_changed = false;
+    for j in 0..8usize {
+        for i in 0..8usize {
+            if pic.y[j * pic.y_stride + i] != 128 {
+                block0_changed = true;
+            }
+        }
+    }
+    assert!(
+        block0_changed,
+        "non-zero DC differential must shift luma block 0 off 128"
     );
 }
 
 #[test]
-fn v2_pframe_intra_in_p_unsupported_with_docs_gap_diagnostic() {
+fn v2_pframe_intra_in_p_decodes() {
+    // spec/16 §2 dissolves the old [esi+0x8bc] gate: the v1/v2 intra-in-P
+    // path decodes through the same size-category DC scheme as I-frames.
+    // v2 MCBPC sym 4 → quotient 1 → intra-in-P (mb_type 3). The decoder
+    // reads ac_pred + CBPY, then the 6 intra blocks.
     let (dims, reference) = gradient_reference();
-    // v2 MCBPC sym 4 → quotient 1 → intra-in-P; the decoder reads the
-    // AC-pred bit + CBPY before our gate fires, so pack those too.
     let (mcbpc_code, mcbpc_bl) = code_for(MCBPC_V2_RAW, 4);
-    let (cbpy_code, cbpy_bl) = code_for(CBPY_V1_V2_RAW, 15);
+    let (cbpy_code, cbpy_bl) = code_for(CBPY_V1_V2_RAW, 15); // post-wrap 0
+    let (luma0_code, luma0_bl) = code_for(DC_SIZE_LUMA_V1V2_RAW, 0);
+    let (chroma0_code, chroma0_bl) = code_for(DC_SIZE_CHROMA_V1V2_RAW, 0);
     let mut fields = v2_pframe_header(8);
     fields.push((0, 1)); // skip = 0
     fields.push((mcbpc_code, mcbpc_bl));
-    fields.push((0, 1)); // ac_pred
+    fields.push((0, 1)); // ac_pred = 0 (zigzag scan)
     fields.push((cbpy_code, cbpy_bl));
+    for _ in 0..4 {
+        fields.push((luma0_code, luma0_bl));
+    }
+    for _ in 0..2 {
+        fields.push((chroma0_code, chroma0_bl));
+    }
     let bytes = pack(&fields);
     let mut br = BitReader::new(&bytes);
-    let err = decode_picture_v1v2(&mut br, dims, MsV1V2Version::V2, Some(&reference)).unwrap_err();
-    let msg = format!("{err}");
+    let pic = decode_picture_v1v2(&mut br, dims, MsV1V2Version::V2, Some(&reference))
+        .expect("v2 intra-in-P MB decode");
+    assert_eq!(pic.picture_type, PictureType::P);
+    // The single intra MB reconstructs DC-only flat grey (DC diff 0 +
+    // predictor 1024 → 128), overwriting the gradient reference.
     assert!(
-        msg.contains("intra-in-P") && msg.contains("[esi+0x8bc]"),
-        "intra-in-P gate must cite the narrowed [esi+0x8bc] default gap; \
-         got: {msg}"
+        pic.y.iter().all(|&p| p == 128),
+        "v2 intra-in-P DC-only luma must reconstruct flat grey 128"
     );
 }
 
@@ -435,10 +518,11 @@ fn v1_pframe_without_reference_requires_reference() {
     );
 }
 
-/// End-to-end through the registered decoder: a v2 I-frame packet must
-/// surface the documented docs-gap `Unsupported` (not a parse error).
+/// End-to-end through the registered decoder: a v2 I-frame packet with
+/// a single DC-only intra MB now decodes to a flat-grey frame (spec/16
+/// §2 unblocks the v1/v2 intra path).
 #[test]
-fn send_packet_v2_iframe_surfaces_docs_gap() {
+fn send_packet_v2_iframe_decodes_intra() {
     use oxideav_core::time::TimeBase;
     use oxideav_core::{CodecId, CodecParameters, CodecRegistry, Packet};
 
@@ -449,16 +533,43 @@ fn send_packet_v2_iframe_surfaces_docs_gap() {
     params.height = Some(16);
     let mut dec = reg.first_decoder(&params).expect("decoder creation");
 
-    // v2 I-frame header: type 0 + quant 8, padded.
-    let bytes = pack(&[(0, 2), (8, 5)]);
+    // v2 I-frame: type 0 + quant 8, then one intra MB (no skip bit on
+    // I-frames): MCBPC sym 4 (quotient 1 → intra), ac_pred 0, CBPY raw
+    // 15 → post-wrap 0, six DC-size-0 codewords.
+    let (mcbpc_code, mcbpc_bl) = code_for(MCBPC_V2_RAW, 4);
+    let (cbpy_code, cbpy_bl) = code_for(CBPY_V1_V2_RAW, 15);
+    let (luma0_code, luma0_bl) = code_for(DC_SIZE_LUMA_V1V2_RAW, 0);
+    let (chroma0_code, chroma0_bl) = code_for(DC_SIZE_CHROMA_V1V2_RAW, 0);
+    let mut fields: Vec<(u32, u32)> = vec![(0, 2), (8, 5)];
+    fields.push((mcbpc_code, mcbpc_bl));
+    fields.push((0, 1)); // ac_pred = 0
+    fields.push((cbpy_code, cbpy_bl));
+    for _ in 0..4 {
+        fields.push((luma0_code, luma0_bl));
+    }
+    for _ in 0..2 {
+        fields.push((chroma0_code, chroma0_bl));
+    }
+    let bytes = pack(&fields);
     let pkt = Packet::new(0, TimeBase::new(1, 25), bytes)
         .with_pts(0)
         .with_keyframe(true);
-    let err = dec.send_packet(&pkt).unwrap_err();
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("[esi+0x8bc]") && msg.contains("spec/01 §1.4"),
-        "send_packet v2 I-frame must surface the narrowed [esi+0x8bc] \
-         docs-gap diagnostic; got: {msg}"
-    );
+    dec.send_packet(&pkt).expect("v2 I-frame send_packet");
+    let frame = dec.receive_frame().expect("a decoded frame");
+    let vf = match frame {
+        oxideav_core::Frame::Video(vf) => vf,
+        other => panic!("expected a video frame, got {other:?}"),
+    };
+    assert_eq!(vf.planes.len(), 3, "YUV420 → 3 planes");
+    // DC-only intra reconstructs flat grey: the 16x16 luma plane (one MB)
+    // must be all 128.
+    for row in 0..16usize {
+        for col in 0..16usize {
+            assert_eq!(
+                vf.planes[0].data[row * vf.planes[0].stride + col],
+                128,
+                "v2 I-frame DC-only luma ({row}, {col}) must be flat grey 128"
+            );
+        }
+    }
 }

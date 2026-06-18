@@ -1,0 +1,20 @@
+# region_0543c0_dcsize.meta
+source_path: /home/magicaltux/projects/oxideav-workspace/docs/video/msmpeg4/reference/binaries/wmpcdcs8-2001/mpg4c32.dll
+source_sha256: aedb4cf3d33c8554ab8acf04afe2d936eaa7c49107c5fefe163bca2e94b3c099
+tool: extract-07.sh + python3 + struct.unpack
+method: flat 2^maxbl direct-lookup array of (u8 bit_length, u8 symbol)
+  pairs indexed by the next maxbl peeked bits (read by sub_15811).
+  Collapsed to distinct (symbol, bit_length, code) prefix-code set.
+kind: v1v2_intra_dc_size_chroma
+vma_start_hex: 0x1c2543c0
+file_offset_start_hex: 0x0537c0
+file_offset_end_exclusive_hex: 0x0539c0
+lut_byte_length: 512
+max_bit_length: 8
+symbol_count: 9
+symbol_min: 0
+symbol_max: 8
+lut_slice_sha256: b36595fdc4fadff801b0f69be8153649f15852aae8bd69775b5e155f9e5ccb41
+kraft_sum: 0.996094
+note: H.263 DC-size category VLC (chroma)
+verdict: pass

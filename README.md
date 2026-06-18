@@ -24,8 +24,12 @@ decoder when a packet arrives.
 
 **In progress.** `classify` and the v3 intra/P-frame pixel pipeline are
 production-ready; v1/v2 P-frames decode to pixels, including the INTER+Q
-and INTER4V (4-MV) inter sub-types. v1/v2 I-frames and intra-in-P MBs
-remain gated on a single open spec item (see below).
+and INTER4V (4-MV) inter sub-types. As of round 339 the **v1/v2 I-frame
+and intra-in-P intra pixel pipeline** decodes end-to-end too — spec/16 §2
+established that v1/v2 use a dedicated H.263 size+value DC scheme
+(`region_054{2,3}c0`), not the v3 `dc_size_sel` selector, dissolving the
+previous gate. Real-content bit-exactness against an encoder oracle is a
+pending Auditor item.
 
 | Piece                                          | Status     |
 | ---------------------------------------------- | ---------- |
@@ -47,6 +51,8 @@ remain gated on a single open spec item (see below).
 | 4-MV-per-MB predictor surface + neighbour resolver | wired (per-block bordering-cell pick) |
 | V3 intra-luma I-frame end-to-end via `decode_picture` | complete |
 | V1 / V2 P-frame pixel pipeline (incl. INTER+Q + INTER4V) | complete |
+| V1 / V2 intra pipeline (I-frame + intra-in-P)  | complete (size+value DC, spec/16 §2) |
+| V1 / V2 intra DC-size category VLCs (luma/chroma) | complete (binary-extracted, spec/16 §2) |
 | V1 / V2 shared CBPY VLC                         | complete   |
 | Picture-wide MV grid (`MvGrid`)                | complete   |
 | Per-G-family descriptor / runtime-binding accessors | complete |
@@ -58,20 +64,21 @@ remain gated on a single open spec item (see below).
   path (`spec/16` §3.1). Wiring it into the **v3** picture decoder still
   waits on the v3 MCBPC bit pattern that signals 1-MV vs 4-MV mode (an
   open v3-specific spec gap; the v1/v2 MB-type → MV-count map is traced).
-- **V1 / V2 I-frames and intra-in-P MBs**: gated behind a documented
-  `Unsupported` error, now narrowed to a **single** trace target. The
-  intra block path is otherwise fully shared with v3 and already wired:
-  the AC run/level/last kernel `0x1c216d97` is the common v1/v2/v3 intra
-  kernel, the DC-predictor gradient routine `0x1c20aef0` carries no
-  version gate, and the intra-DC-size VLC descriptor binding (all four
-  luma/chroma × selector tables) is enumerated in the staged spec. The
-  one remaining unknown is the **construction-time default of the
-  intra-DC-size selector `[esi+0x8bc]`** — that bit is read from the
-  bitstream only on `version == 3`, so on v1/v2 the slot keeps its
-  constructor value, which no staged chapter traces. (The CBP
-  spatial-prediction LUT pair `0x1c23a788 / 0x1c23a7b0` that v1 omits is
-  the *CBP* predictor, not a DC-prediction LUT, so its absence does not
-  block intra DC decode.)
+- **V1 / V2 I-frames and intra-in-P MBs**: now decode to pixels (round
+  339). spec/16 §2 (Extractor 07) established that the v1/v2 intra-block
+  driver gates on version (`cmp [esi+8], 3`): for v < 3 it decodes the DC
+  differential through the classic H.263 §5.4.1 / MPEG-4 Part 2 §7.4.3
+  size+value scheme (`sub_15790`) using the binary's own luma/chroma
+  size-category tables (`region_0542c0` / `region_0543c0`, VMAs
+  `0x1c2542c0` / `0x1c2543c0`) — **not** the v3 direct-value DC VLC and
+  **not** the v3 `[esi+0x8bc]` `dc_size_sel` selector. The previous gate
+  cited that selector's untraced construction-time default; since v1/v2
+  never consult it, the gate is dissolved. The spatial DC-predictor
+  gradient `0x1c20aef0` and intra AC kernel `0x1c216d97` are shared with
+  v3 (no version gate); v1/v2 default luma AC = G5, chroma = G4 (spec/14
+  §3.2). Real-content bit-exactness against an encoder oracle (the AC
+  walk + spatial-predictor reconstruction matching the binary) is a
+  pending Auditor-round validation.
 - **V1 inter sub-types**: now wired. `spec/16` §3.1 +
   `region_053140_mbtype.csv` pin the P-frame MB-type → MV-count map
   {1, 1, 4, 0, 0}: MB-type 0 (INTER) and MB-type 1 (INTER+Q) are 1-MV

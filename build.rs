@@ -480,7 +480,191 @@ fn main() {
         &out_dir.join("esc_ext_cluster.rs"),
     );
 
+    // v1/v2 intra (I-frame) DC-size category VLCs — region_0542c0 (luma,
+    // VMA 0x1c2542c0) + region_0543c0 (chroma, VMA 0x1c2543c0), Extractor
+    // 07 / spec/16 §2. MS-MPEG4 v1 and v2 SHARE the H.263 §5.4.1 /
+    // MPEG-4 Part 2 §7.4.3 DC-size-then-value intra-DC coding (the
+    // intra-block driver gates `cmp [esi+8],3`: v<3 → sub_15790 with
+    // these two size tables). This is DISTINCT from v3's direct-value
+    // DC VLC (the 0x77-ESC kernel handled by `decode_intra_dc_diff_v3`)
+    // and has nothing to do with the v3 `dc_size_sel` 4-table selection.
+    //
+    // Each CSV row is `symbol_dec,bit_length,code_bin` for 9 size
+    // categories (0..=8): symbol = size category, bit_length = code
+    // length, code_bin = the canonical bit-pattern as a binary string.
+    // The runtime path (`crate::mb::decode_intra_dc_diff_v1v2`) decodes a
+    // size category `s`, then (if s>0) reads `s` raw bits and applies the
+    // H.263 signed-DC fixup `if value < 2^(s-1): value -= 2^s - 1`.
+    //
+    // FROM: docs/video/msmpeg4/spec/16-mv-vlc-dc-mcbpc-extraction.md §2
+    // FROM: docs/video/msmpeg4/tables/region_054{2,3}c0_dcsize.csv
+    let dc_size_luma_v1v2 = tables_dir.join("region_0542c0_dcsize.csv");
+    let dc_size_chroma_v1v2 = tables_dir.join("region_0543c0_dcsize.csv");
+    println!("cargo:rerun-if-changed={}", dc_size_luma_v1v2.display());
+    println!("cargo:rerun-if-changed={}", dc_size_chroma_v1v2.display());
+    emit_dc_size_v1v2(
+        &dc_size_luma_v1v2,
+        &out_dir.join("dc_size_luma_v1v2.rs"),
+        "DC_SIZE_LUMA_V1V2_RAW",
+        "luma",
+        "region_0542c0_dcsize.csv",
+        "0x1c2542c0",
+    );
+    emit_dc_size_v1v2(
+        &dc_size_chroma_v1v2,
+        &out_dir.join("dc_size_chroma_v1v2.rs"),
+        "DC_SIZE_CHROMA_V1V2_RAW",
+        "chroma",
+        "region_0543c0_dcsize.csv",
+        "0x1c2543c0",
+    );
+
     println!("cargo:rerun-if-changed=build.rs");
+}
+
+/// Parse a v1/v2 intra DC-size category CSV
+/// (`region_054{2,3}c0_dcsize.csv`, columns
+/// `symbol_dec,bit_length,code_bin`) and emit a `(symbol, bit_length,
+/// canonical_code)` triple array.
+///
+/// The 9 rows are the size categories 0..=8 in symbol order. `code_bin`
+/// is the canonical Huffman bit-pattern as a binary string; we parse it
+/// to a `u32` and cross-check that it fits within `bit_length` bits and
+/// that the set of codes forms a valid prefix code (no code is a prefix
+/// of another). Per spec/16 §2 these tables do NOT saturate Kraft to 1
+/// (the size alphabet has an unused tail — luma Kraft = 0.992, chroma =
+/// 0.996), so we assert prefix-freeness rather than Kraft == 1.
+///
+/// FROM: docs/video/msmpeg4/spec/16-mv-vlc-dc-mcbpc-extraction.md §2
+fn emit_dc_size_v1v2(
+    csv_path: &Path,
+    out_path: &Path,
+    const_name: &str,
+    plane: &str,
+    csv_basename: &str,
+    vma_hex: &str,
+) {
+    let text = fs::read_to_string(csv_path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", csv_path.display()));
+
+    let mut records: Vec<(u8, u8, u32)> = Vec::with_capacity(9);
+    for (line_no, line) in text.lines().enumerate() {
+        if line_no == 0 {
+            continue; // CSV column header: symbol_dec,bit_length,code_bin
+        }
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = line.split(',').collect();
+        if parts.len() < 3 {
+            panic!(
+                "{plane} DC-size: malformed row at line {}: {line}",
+                line_no + 1
+            );
+        }
+        let symbol: u8 = parts[0].parse().unwrap_or_else(|_| {
+            panic!(
+                "{plane} DC-size: bad symbol_dec at line {}: {}",
+                line_no + 1,
+                parts[0]
+            )
+        });
+        let bit_length: u8 = parts[1].parse().unwrap_or_else(|_| {
+            panic!(
+                "{plane} DC-size: bad bit_length at line {}: {}",
+                line_no + 1,
+                parts[1]
+            )
+        });
+        let code_bin = parts[2].trim();
+        if code_bin.len() != bit_length as usize {
+            panic!(
+                "{plane} DC-size: code_bin '{code_bin}' length {} != bit_length {bit_length} \
+                 at line {}",
+                code_bin.len(),
+                line_no + 1
+            );
+        }
+        let code = u32::from_str_radix(code_bin, 2).unwrap_or_else(|_| {
+            panic!(
+                "{plane} DC-size: non-binary code_bin '{code_bin}' at line {}",
+                line_no + 1
+            )
+        });
+        records.push((symbol, bit_length, code));
+    }
+
+    // The 9 size categories must be present, in symbol order 0..=8.
+    if records.len() != 9 {
+        panic!(
+            "{plane} DC-size: expected 9 size categories (0..=8) in {}, got {}",
+            csv_path.display(),
+            records.len()
+        );
+    }
+    for (pos, &(sym, _, _)) in records.iter().enumerate() {
+        if sym as usize != pos {
+            panic!(
+                "{plane} DC-size: row {pos} has symbol {sym}; rows must be the \
+                 contiguous size sequence 0..=8 in order"
+            );
+        }
+    }
+
+    // Prefix-freeness: no code is a prefix of any other. This is the
+    // property the linear-scan VLC decoder relies on for unambiguous
+    // decode. (These tables intentionally do NOT saturate Kraft to 1 —
+    // the size alphabet has an unused tail per spec/16 §2 — so a Kraft
+    // == 1 assertion would wrongly fail here; prefix-freeness is the
+    // correct invariant.)
+    for (i, &(_, bla, ca)) in records.iter().enumerate() {
+        for (j, &(_, blb, cb)) in records.iter().enumerate() {
+            if i == j || bla == blb {
+                continue;
+            }
+            let (short_bl, short_c, long_bl, long_c) = if bla < blb {
+                (bla, ca, blb, cb)
+            } else {
+                (blb, cb, bla, ca)
+            };
+            let shift = long_bl - short_bl;
+            if (long_c >> shift) == short_c {
+                panic!(
+                    "{plane} DC-size: code 0b{short_c:0width$b} (bl {short_bl}) is a prefix \
+                     of 0b{long_c:0longw$b} (bl {long_bl}) — not a valid prefix code",
+                    width = short_bl as usize,
+                    longw = long_bl as usize,
+                );
+            }
+        }
+    }
+
+    let mut f = fs::File::create(out_path)
+        .unwrap_or_else(|e| panic!("failed to create {}: {e}", out_path.display()));
+    writeln!(
+        f,
+        "// Auto-generated by build.rs from \
+         docs/video/msmpeg4/tables/{csv_basename}\n\
+         // (copied to crates/oxideav-msmpeg4/tables/). DO NOT EDIT.\n\
+         // Source binary: mpg4c32.dll SHA-256 \
+         aedb4cf3d33c8554ab8acf04afe2d936eaa7c49107c5fefe163bca2e94b3c099\n\
+         // Role: v1/v2 intra (I-frame) DC-size category VLC, {plane} plane,\n\
+         // VMA {vma_hex} (per spec/16 §2, Extractor 07). 9 size categories\n\
+         // 0..=8 read by the H.263 §5.4.1 / MPEG-4 Part 2 §7.4.3\n\
+         // DC-size-then-value scheme (shared by v1 and v2; distinct from\n\
+         // v3's direct-value DC VLC).\n\
+         \n\
+         /// (size_category, bit_length, canonical_code) triples for the\n\
+         /// v1/v2 intra {plane} DC-size VLC. Consumed by\n\
+         /// `crate::mb::decode_intra_dc_diff_v1v2`.\n\
+         pub const {const_name}: &[(u8, u8, u32)] = &["
+    )
+    .unwrap();
+    for &(sym, bl, code) in &records {
+        writeln!(f, "    ({sym}, {bl}, 0x{code:x}),").unwrap();
+    }
+    writeln!(f, "];").unwrap();
 }
 
 /// Parse `region_05eac8.csv` and emit a Rust file with the raw

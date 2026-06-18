@@ -138,6 +138,93 @@ pub fn decode_intra_dc_diff(br: &mut BitReader<'_>, block_idx: usize) -> Result<
 }
 
 // ====================================================================
+// MS-MPEG4 v1/v2 intra-DC size-category VLC (spec/16 §2 / Extractor 07).
+// ====================================================================
+//
+// Per `docs/video/msmpeg4/spec/16-mv-vlc-dc-mcbpc-extraction.md` §2 the
+// MS-MPEG4 v1 and v2 intra-block driver decodes the DC differential
+// through the classic H.263 §5.4.1 / MPEG-4 Part 2 §7.4.3
+// DC-size-then-value scheme (kernel `sub_15790`), NOT the v3
+// direct-value VLC. The intra-block driver gates on version
+// (`cmp [esi+8], 3`): v < 3 → this size+value path with the binary's
+// own luma/chroma size tables (`region_0542c0` / `region_0543c0`, VMAs
+// 0x1c2542c0 / 0x1c2543c0), distinct from the four v3 `dc_size_sel`
+// tables consumed by `decode_intra_dc_diff_v3`.
+//
+// The size tables are loaded from the binary in `build.rs` as
+// `DC_SIZE_LUMA_V1V2_RAW` / `DC_SIZE_CHROMA_V1V2_RAW`. They differ from
+// the MPEG-4-Part-2 Annex-B `DC_SIZE_LUMA_TABLE` / `DC_SIZE_CHROMA_TABLE`
+// in `tables.rs` (e.g. v1/v2 binary luma size 0 = `100`, whereas the
+// MPEG-4-P2 Annex-B luma size 0 = `011`); the v1/v2 path therefore
+// cannot reuse `decode_intra_dc_diff` and binds its own tables here.
+
+static DC_SIZE_LUMA_V1V2_TABLE: OnceLock<Vec<VlcEntry<u8>>> = OnceLock::new();
+static DC_SIZE_CHROMA_V1V2_TABLE: OnceLock<Vec<VlcEntry<u8>>> = OnceLock::new();
+
+fn build_dc_size_v1v2(raw: &[(u8, u8, u32)]) -> Vec<VlcEntry<u8>> {
+    raw.iter()
+        .map(|&(sym, bl, code)| VlcEntry::new(bl, code, sym))
+        .collect()
+}
+
+fn dc_size_v1v2_table(block_idx: usize) -> &'static [VlcEntry<u8>] {
+    if block_idx < 4 {
+        DC_SIZE_LUMA_V1V2_TABLE
+            .get_or_init(|| build_dc_size_v1v2(crate::tables_data::DC_SIZE_LUMA_V1V2_RAW))
+            .as_slice()
+    } else {
+        DC_SIZE_CHROMA_V1V2_TABLE
+            .get_or_init(|| build_dc_size_v1v2(crate::tables_data::DC_SIZE_CHROMA_V1V2_RAW))
+            .as_slice()
+    }
+}
+
+/// Decode one v1/v2 intra-DC differential via the H.263 size-category
+/// scheme (spec/16 §2, kernel `sub_15790`).
+///
+/// `block_idx` 0..=3 selects the luma size table, 4..=5 selects chroma.
+///
+/// Output is the signed DC *differential* (NOT yet added to the spatial
+/// predictor and NOT yet multiplied by the DC scaler — the caller does
+/// both via [`reconstruct_intra_dc`], exactly as on the v3 path).
+///
+/// The decode sequence (spec/16 §2.1):
+///   1. Decode a size category `s` from the binary-extracted size VLC.
+///   2. If `s == 0` → differential = 0 (no value bits consumed).
+///   3. Else read `s` raw bits → `value`, then apply the standard
+///      H.263 signed-DC fixup: if `value < 2^(s-1)` then
+///      `value -= 2^s - 1`. (The binary realises this at `0x1580a`.)
+///
+/// There is **no** start-code-emulation marker bit for `s > 8` — the
+/// MS-MPEG4 stream has no start-code layer (same reasoning as the v3 and
+/// legacy paths in this module).
+pub fn decode_intra_dc_diff_v1v2(br: &mut BitReader<'_>, block_idx: usize) -> Result<i32> {
+    let table = dc_size_v1v2_table(block_idx);
+    let size = vlc::decode(br, table)? as u32;
+    if size == 0 {
+        return Ok(0);
+    }
+    if size > 11 {
+        // Size categories are 0..=8 in the binary tables; a decode above
+        // that is a corrupt bitstream / table mismatch. Guard the shift.
+        return Err(Error::invalid(format!(
+            "msmpeg4 v1/v2 intra DC: size category {size} out of range (0..=8 \
+             per spec/16 §2)"
+        )));
+    }
+    let value = br.read_u32(size)? as i32;
+    // H.263 §5.4.1 negative-value reconstruction (spec/16 §2.1 step 3):
+    // values in the lower half of the 2^size range are negative.
+    let half = 1i32 << (size - 1);
+    let fixed = if value < half {
+        value - ((1 << size) - 1)
+    } else {
+        value
+    };
+    Ok(fixed)
+}
+
+// ====================================================================
 // MS-MPEG4 v3 custom intra-DC differential VLC (round 28 / task #113).
 // ====================================================================
 //
@@ -347,6 +434,40 @@ pub fn decode_intra_block_full_v3(
     if cbp_set {
         out.ac_nonzero = decode_intra_ac(br, &mut out.coeffs, scan, ac_table, 1)?;
         // H.263 dequant for AC (level_start=1 skips DC).
+        dequantise_h263(&mut out.coeffs, quant, 1)?;
+    }
+
+    Ok(out)
+}
+
+/// Variant of [`decode_intra_block_full`] for the MS-MPEG4 **v1/v2**
+/// intra path: the DC differential is decoded through the H.263
+/// size-category VLC ([`decode_intra_dc_diff_v1v2`], spec/16 §2) using
+/// the binary-extracted v1/v2 size tables, then the AC walk runs through
+/// the supplied table (the shared G-family intra/inter VLCs).
+///
+/// This is the v1/v2 analogue of [`decode_intra_block_full_v3`]; the
+/// only difference is the DC-differential decoder (v1/v2 size+value vs
+/// v3 direct-value). The spatial-predictor reconstruction, AC walk, and
+/// H.263 dequant are all shared with v3 per spec/99 §4.4 (the
+/// DC-predictor gradient routine has no version gate) and spec/04 §2.6.
+pub fn decode_intra_block_full_v1v2(
+    br: &mut BitReader<'_>,
+    block_idx: usize,
+    pred_dc: i32,
+    quant: u32,
+    cbp_set: bool,
+    scan: Scan,
+    ac_table: &AcVlcTable,
+) -> Result<DecodedIntraBlock> {
+    let dc_diff = decode_intra_dc_diff_v1v2(br, block_idx)?;
+    let dc = reconstruct_intra_dc(dc_diff, pred_dc, block_idx, quant);
+
+    let mut out = DecodedIntraBlock::default();
+    out.coeffs[0] = dc;
+
+    if cbp_set {
+        out.ac_nonzero = decode_intra_ac(br, &mut out.coeffs, scan, ac_table, 1)?;
         dequantise_h263(&mut out.coeffs, quant, 1)?;
     }
 
