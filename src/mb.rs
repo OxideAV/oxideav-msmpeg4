@@ -816,4 +816,83 @@ mod tests {
         let mut br = BitReader::new(&bytes);
         assert_eq!(decode_intra_dc_diff_v3(&mut br, 4, 0).unwrap(), 0);
     }
+
+    // ==== v1/v2 intra DC size-category decode (spec/16 §2) ====
+    //
+    // Luma size codes (spec/16 §2 table): 0=`100`, 1=`00`, 2=`01`.
+    // Chroma size codes: 0=`00`, 1=`01`, 2=`10`.
+
+    #[test]
+    fn dc_diff_v1v2_luma_size_zero_is_zero() {
+        // Luma size 0 = code `100` (3 bits), no value bits.
+        let bytes = pack(&[(0b100, 3), (0, 8)]);
+        let mut br = BitReader::new(&bytes);
+        assert_eq!(decode_intra_dc_diff_v1v2(&mut br, 0).unwrap(), 0);
+    }
+
+    #[test]
+    fn dc_diff_v1v2_luma_size_1_positive_and_negative() {
+        // Luma size 1 = code `00` (2 bits). Value bit `1` → 1 >= 2^0=1 → +1.
+        let bytes = pack(&[(0b00, 2), (0b1, 1), (0, 8)]);
+        let mut br = BitReader::new(&bytes);
+        assert_eq!(decode_intra_dc_diff_v1v2(&mut br, 0).unwrap(), 1);
+
+        // Value bit `0` → 0 < 1 → 0 - (2^1 - 1) = -1.
+        let bytes = pack(&[(0b00, 2), (0b0, 1), (0, 8)]);
+        let mut br = BitReader::new(&bytes);
+        assert_eq!(decode_intra_dc_diff_v1v2(&mut br, 0).unwrap(), -1);
+    }
+
+    #[test]
+    fn dc_diff_v1v2_luma_size_2_signed_fixup() {
+        // Luma size 2 = code `01`. Value `11` = 3 → 3 >= 2^1=2 → +3.
+        let bytes = pack(&[(0b01, 2), (0b11, 2), (0, 8)]);
+        let mut br = BitReader::new(&bytes);
+        assert_eq!(decode_intra_dc_diff_v1v2(&mut br, 0).unwrap(), 3);
+
+        // Value `00` = 0 → 0 < 2 → 0 - (2^2 - 1) = -3.
+        let bytes = pack(&[(0b01, 2), (0b00, 2), (0, 8)]);
+        let mut br = BitReader::new(&bytes);
+        assert_eq!(decode_intra_dc_diff_v1v2(&mut br, 0).unwrap(), -3);
+
+        // Value `01` = 1 → 1 < 2 → 1 - 3 = -2.
+        let bytes = pack(&[(0b01, 2), (0b01, 2), (0, 8)]);
+        let mut br = BitReader::new(&bytes);
+        assert_eq!(decode_intra_dc_diff_v1v2(&mut br, 0).unwrap(), -2);
+    }
+
+    #[test]
+    fn dc_diff_v1v2_chroma_uses_chroma_table() {
+        // Chroma size 0 = code `00` (2 bits) → DC 0, no value bits.
+        // block_idx 4 selects the chroma table; if the luma table were
+        // (wrongly) used, `00` is not a valid luma prefix → would error
+        // or decode to a different size. Asserting 0 confirms the chroma
+        // table is bound for chroma blocks.
+        let bytes = pack(&[(0b00, 2), (0, 8)]);
+        let mut br = BitReader::new(&bytes);
+        assert_eq!(decode_intra_dc_diff_v1v2(&mut br, 4).unwrap(), 0);
+
+        // Chroma size 1 = code `01`, value bit `1` → +1.
+        let bytes = pack(&[(0b01, 2), (0b1, 1), (0, 8)]);
+        let mut br = BitReader::new(&bytes);
+        assert_eq!(decode_intra_dc_diff_v1v2(&mut br, 5).unwrap(), 1);
+    }
+
+    #[test]
+    fn dc_diff_v1v2_tables_distinct_from_mpeg4_p2_annex_b() {
+        // spec/16 §2: the v1/v2 binary luma size-0 code is `100`, whereas
+        // the MPEG-4-P2 Annex-B luma size-0 code (DC_SIZE_LUMA_TABLE) is
+        // `011`. Decoding the binary `100` through the v1/v2 path must
+        // give size 0 (DC 0); the same bits through the legacy path would
+        // NOT decode as size 0. This locks in that the two table sets are
+        // genuinely different and the v1/v2 path binds the binary tables.
+        let bytes = pack(&[(0b100, 3), (0, 8)]);
+        let mut br = BitReader::new(&bytes);
+        assert_eq!(decode_intra_dc_diff_v1v2(&mut br, 0).unwrap(), 0);
+
+        // The MPEG-4-P2 Annex-B luma table decodes `011` as size 0.
+        let bytes = pack(&[(0b011, 3), (0, 8)]);
+        let mut br = BitReader::new(&bytes);
+        assert_eq!(decode_intra_dc_diff(&mut br, 0).unwrap(), 0);
+    }
 }

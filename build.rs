@@ -612,6 +612,58 @@ fn emit_dc_size_v1v2(
         }
     }
 
+    // Cross-check the extracted codes against the spec/16 §2 documented
+    // code-assignment table (the prose companion to this Extractor
+    // output). This guards against a CSV row swap / column mis-parse: if
+    // the binary's pre-expanded LUT ever drifts from the spec/16 §2
+    // assignments the build breaks with a precise per-size mismatch.
+    // FROM: docs/video/msmpeg4/spec/16-mv-vlc-dc-mcbpc-extraction.md §2
+    //       (and tables/README-07.md §2 "Code assignments").
+    let expected: &[(u8, u8, u32)] = if plane == "luma" {
+        // size: (bl, code) — luma: 0=`100`,1=`00`,2=`01`,3=`101`,4=`110`,
+        // 5=`1110`,6=`11110`,7=`111110`,8=`1111110`.
+        &[
+            (0, 3, 0b100),
+            (1, 2, 0b00),
+            (2, 2, 0b01),
+            (3, 3, 0b101),
+            (4, 3, 0b110),
+            (5, 4, 0b1110),
+            (6, 5, 0b11110),
+            (7, 6, 0b111110),
+            (8, 7, 0b1111110),
+        ]
+    } else {
+        // chroma: 0=`00`,1=`01`,2=`10`,3=`110`,4=`1110`,5=`11110`,
+        // 6=`111110`,7=`1111110`,8=`11111110`.
+        &[
+            (0, 2, 0b00),
+            (1, 2, 0b01),
+            (2, 2, 0b10),
+            (3, 3, 0b110),
+            (4, 4, 0b1110),
+            (5, 5, 0b11110),
+            (6, 6, 0b111110),
+            (7, 7, 0b1111110),
+            (8, 8, 0b11111110),
+        ]
+    };
+    for (got, exp) in records.iter().zip(expected.iter()) {
+        if got != exp {
+            panic!(
+                "{plane} DC-size: binary-vs-spec/16-§2 mismatch at size {}: \
+                 binary (bl={}, code=0b{:0width$b}) vs spec/16 §2 (bl={}, \
+                 code=0b{:0width$b})",
+                exp.0,
+                got.1,
+                got.2,
+                exp.1,
+                exp.2,
+                width = exp.1 as usize,
+            );
+        }
+    }
+
     // Prefix-freeness: no code is a prefix of any other. This is the
     // property the linear-scan VLC decoder relies on for unambiguous
     // decode. (These tables intentionally do NOT saturate Kraft to 1 —
