@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- round 352: ground the v1 P-frame MB-type decomposition in the
+  re-extracted authoritative table `tables/region_053140_mbtype.csv`
+  (Extractor 07 / `spec/16` §3). New `build.rs` emitter (`emit_mbtype_v1`)
+  loads the 21-symbol map into `MB_TYPE_V1_INFO`
+  `[(mb_type, is_intra, num_motion_vectors); 21]`, cross-checking the
+  `spec/16` §3.1 decomposition (`mb_type == symbol >> 2`), the
+  {1, 1, 4, 0, 0} MV-count map, and the intra classification at build
+  time. `mcbpcy::decode_mcbpcy_v1` now classifies `is_intra` and exposes
+  `num_motion_vectors` from this table instead of the implicit
+  `mb_type == 3` test — fixing a correctness bug where MB-type 4
+  (INTRA+Q, symbols 16..=19) was mis-classified as inter and v1 I-frame
+  MBs carrying it were wrongly rejected. The v1 P-frame INTER4V dispatch
+  in `picture::decode_pframe_mb_v1v2` is now driven by
+  `num_motion_vectors` (1 → 1-MV, 4 → INTER4V) so the two stay in lock
+  step with the extracted table. STUFFING/ESC (symbol 20) is rejected
+  explicitly. New tests:
+  `mcbpcy::v1_mbtype_table_pins_inter4v_and_intra_plus_q`,
+  `v1_v2_pframe::v1_iframe_intra_plus_q_mb_type_4_decodes`; the existing
+  `v1_mcbpc_round_trip_every_symbol` now cross-checks every symbol's
+  `(mb_type, is_intra, num_motion_vectors)` against `MB_TYPE_V1_INFO`.
 - round 339: unblock the v1/v2 **intra** pixel pipeline (I-frames +
   intra-in-P MBs), driven by the re-extracted `spec/16` §2 + the
   binary-extracted DC-size tables (`tables/region_0542c0_dcsize.csv`

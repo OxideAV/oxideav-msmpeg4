@@ -920,8 +920,14 @@ fn decode_pframe_mb_v1v2(
     // above. The v2 8-symbol MCBPC alphabet only emits mb_type ∈
     // {0, 3} (quotient 0/1), so this dispatch is reached with
     // mb_type ∈ {0, 1, 2} on the inter path.
-    match decode.mb_type {
-        0 | 1 => {
+    //
+    // The 1-MV vs 4-MV decision is driven by `decode.num_motion_vectors`
+    // (sourced from `MB_TYPE_V1_INFO` per spec/16 §3.1's {1, 1, 4, 0, 0}
+    // map) rather than re-deriving it from `mb_type`: that keeps the
+    // dispatch grounded in the extracted table and the two stay in lock
+    // step by construction.
+    match decode.num_motion_vectors {
+        1 => {
             // 1-MV inter: §7.6.5 median-of-3 predictor (same helper as
             // v3 per spec/07 §3.5), two separate component reads against
             // the shared 65-entry table (spec/07 §3.2), bias subtract +
@@ -931,7 +937,7 @@ fn decode_pframe_mb_v1v2(
             mv_grid.set_cell(mb_x, mb_y, crate::mv_pred::MvGridCell::OneMv(mv));
             apply_mc_to_mb(pic, reference, mb_x, mb_y, (mv.x as i32, mv.y as i32));
         }
-        2 => {
+        4 => {
             // INTER4V: decode one MVD per Figure 6-8 block in raster
             // order, threading each block's *final* MV back into the
             // Figure-7-34 within-MB predictor via the
@@ -958,9 +964,11 @@ fn decode_pframe_mb_v1v2(
         }
         other => {
             return Err(Error::invalid(format!(
-                "{codec}: inter MB-type {other} at ({mb_x}, {mb_y}) is \
-                 out of the traced P-frame inter range {{0, 1, 2}} \
-                 (spec/16 §3.1); intra types 3/4 take the is_intra path."
+                "{codec}: inter MB-type {} at ({mb_x}, {mb_y}) implies \
+                 {other} motion vectors, outside the traced map \
+                 {{1, 4}} (spec/16 §3.1); intra types 3/4 take the \
+                 is_intra path.",
+                decode.mb_type,
             )));
         }
     }

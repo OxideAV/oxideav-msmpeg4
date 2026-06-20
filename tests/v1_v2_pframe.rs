@@ -374,6 +374,44 @@ fn v1_iframe_intra_nonzero_dc_shifts_luma() {
 }
 
 #[test]
+fn v1_iframe_intra_plus_q_mb_type_4_decodes() {
+    // Regression for the spec/16 §3.2 `is_intra` correction. MCBPC
+    // symbol 16 decodes to MB-type 4 (INTRA+Q): the authoritative
+    // `region_053140_mbtype.csv` marks it `is_intra = 1`. The previous
+    // `is_intra = mb_type == 3` test mis-classified it as inter, so
+    // `decode_iframe_v1v2` rejected the MB. With the table-driven
+    // classification it now reconstructs the same flat-grey DC-only MB
+    // as the MB-type 3 case (the INTRA / INTRA+Q distinction is the
+    // quant lineage name only at the DC-decode site).
+    let dims = PictureDims::new(16, 16).unwrap();
+    let mut fields: Vec<(u32, u32)> = vec![(0, 32), (0, 5), (0, 2), (8, 5)];
+    let (mcbpc_code, mcbpc_bl) = code_for(MCBPC_V1_RAW, 16); // mb_type 4
+    let (cbpy_code, cbpy_bl) = code_for(CBPY_V1_V2_RAW, 15); // post-wrap 0
+    fields.push((0, 1)); // skip / COD = 0
+    fields.push((mcbpc_code, mcbpc_bl));
+    fields.push((cbpy_code, cbpy_bl));
+    let (luma0_code, luma0_bl) = code_for(DC_SIZE_LUMA_V1V2_RAW, 0);
+    let (chroma0_code, chroma0_bl) = code_for(DC_SIZE_CHROMA_V1V2_RAW, 0);
+    for _ in 0..4 {
+        fields.push((luma0_code, luma0_bl));
+    }
+    for _ in 0..2 {
+        fields.push((chroma0_code, chroma0_bl));
+    }
+    let bytes = pack(&fields);
+    let mut br = BitReader::new(&bytes);
+    let pic = decode_picture_v1v2(&mut br, dims, MsV1V2Version::V1, None)
+        .expect("v1 I-frame INTRA+Q (mb_type 4) must decode, not be rejected as inter");
+    assert_eq!(pic.picture_type, PictureType::I);
+    assert!(
+        pic.y.iter().all(|&p| p == 128),
+        "v1 INTRA+Q DC-only luma must reconstruct flat grey 128"
+    );
+    assert!(pic.cb.iter().all(|&p| p == 128));
+    assert!(pic.cr.iter().all(|&p| p == 128));
+}
+
+#[test]
 fn v2_pframe_intra_in_p_decodes() {
     // spec/16 §2 dissolves the old [esi+0x8bc] gate: the v1/v2 intra-in-P
     // path decodes through the same size-category DC scheme as I-frames.

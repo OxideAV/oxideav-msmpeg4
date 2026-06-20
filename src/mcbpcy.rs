@@ -28,7 +28,9 @@ use oxideav_core::bits::BitReader;
 use oxideav_core::{Error, Result};
 
 use crate::tables::CBPY_INTRA_TABLE;
-use crate::tables_data::{MCBPCY_V3_PARTITION, MCBPCY_V3_RAW, MCBPC_V1_RAW, MCBPC_V2_RAW};
+use crate::tables_data::{
+    MB_TYPE_V1_INFO, MCBPCY_V3_PARTITION, MCBPCY_V3_RAW, MCBPC_V1_RAW, MCBPC_V2_RAW,
+};
 use crate::vlc::{self, VlcEntry};
 
 /// Canonical-Huffman VLC table built from `MCBPCY_V3_RAW` bit lengths.
@@ -236,10 +238,18 @@ pub struct V1V2McbpcyDecode {
     /// "intra-in-P"), 4 is intra-with-quant, 5 is reserved.
     /// Value `0` is also returned on a skipped MB.
     pub mb_type: u8,
-    /// True if this is an intra MB (mb_type == 3 in v1 — sub-types 4 and
-    /// 5 are also intra-flavoured per spec/07 §1.4 / §2.4 but mb_type 3
-    /// is the canonical "intra in P-frame" classification).
+    /// True if this is an intra MB. Per the authoritative v1 MB-type
+    /// table (`MB_TYPE_V1_INFO`, spec/16 §3.2) both mb_type 3 (INTRA)
+    /// and mb_type 4 (INTRA+Q) are intra; the previous `mb_type == 3`
+    /// test mis-classified INTRA+Q as inter.
     pub is_intra: bool,
+    /// Number of motion vectors the MB-type implies: 1 for INTER /
+    /// INTER+Q (mb_type 0, 1), 4 for INTER4V (mb_type 2), 0 for the
+    /// intra mb_types (3, 4) and skip MBs. Sourced from
+    /// `MB_TYPE_V1_INFO` (spec/16 §3.1's {1, 1, 4, 0, 0} map) for v1;
+    /// the v2 8-symbol alphabet emits only mb_type ∈ {0, 3} so its
+    /// inter MBs are always 1-MV.
+    pub num_motion_vectors: u8,
     /// 4-bit luma CBPY (post one's-complement wrap). Bit `i` (MSB-first
     /// at bit 3 = Y0) is 1 iff luma block `i` has coded AC.
     pub cbpy: u8,
@@ -261,6 +271,7 @@ impl V1V2McbpcyDecode {
             skip: true,
             mb_type: 0,
             is_intra: false,
+            num_motion_vectors: 0,
             cbpy: 0,
             cbp_cb: false,
             cbp_cr: false,
@@ -327,13 +338,25 @@ pub fn decode_mcbpcy_v1(br: &mut BitReader<'_>) -> Result<V1V2McbpcyDecode> {
             "msmpeg4 v1 mcbpc: decoded {mcbpc} > 20 (range check at 1c217224)"
         )));
     }
+    // Symbol 20 is the STUFFING/ESC entry (`MB_TYPE_V1_INFO[20].0 ==
+    // 0xff`). It carries no MB-type / CBP payload; the v1 decoder body
+    // never produces a valid MB from it, so reject it explicitly rather
+    // than feeding a bogus mb_type into the dispatcher.
+    let (mb_type, is_intra, num_mv) = MB_TYPE_V1_INFO[mcbpc as usize];
+    if mb_type == 0xff {
+        return Err(Error::invalid(
+            "msmpeg4 v1 mcbpc: decoded the STUFFING/ESC symbol (20); \
+             it is not a valid macroblock type (spec/16 §3.2)"
+                .to_string(),
+        ));
+    }
     let cbpy = decode_cbpy_with_wrap(br, true)?;
-    let mb_type = mcbpc >> 2;
     let cbpc = mcbpc & 0b11;
     Ok(V1V2McbpcyDecode {
         skip: false,
         mb_type,
-        is_intra: mb_type == 3,
+        is_intra,
+        num_motion_vectors: num_mv,
         cbpy,
         cbp_cb: (cbpc & 0b10) != 0,
         cbp_cr: (cbpc & 0b01) != 0,
@@ -404,10 +427,16 @@ pub fn decode_mcbpcy_v2(
     };
 
     let cbpy = decode_cbpy_with_wrap(br, apply_wrap)?;
+    // The v2 8-symbol P-frame MCBPC alphabet only emits mb_type ∈ {0, 3}
+    // (quotient 0 = inter, quotient 1 = intra-in-P) — there is no INTER4V
+    // code in the 8-symbol set (spec/16 §3.3). So inter MBs are always
+    // 1-MV and intra MBs decode no MV.
+    let num_motion_vectors = if is_intra { 0 } else { 1 };
     Ok(V1V2McbpcyDecode {
         skip: false,
         mb_type,
         is_intra,
+        num_motion_vectors,
         cbpy,
         cbp_cb: (remainder & 0b10) != 0,
         cbp_cr: (remainder & 0b01) != 0,
@@ -669,14 +698,55 @@ mod tests {
     #[test]
     fn v1_mcbpc_round_trip_every_symbol() {
         // Every (sym, bl, code) in MCBPC_V1_RAW must round-trip through
-        // the linear-scan VLC decoder.
+        // the linear-scan VLC decoder and decompose exactly as the
+        // authoritative `MB_TYPE_V1_INFO` table says (spec/16 §3).
         for &(sym, bl, code) in MCBPC_V1_RAW {
             let (cb_bl, cb_code) = cbpy_for(15);
             let bytes = pack(&[(0, 1), (code, bl as u32), (cb_code, cb_bl as u32)]);
             let mut br = BitReader::new(&bytes);
+            let (mb_type, is_intra, num_mv) = MB_TYPE_V1_INFO[sym as usize];
+            if mb_type == 0xff {
+                // STUFFING/ESC (symbol 20) is not a valid MB; the decoder
+                // must reject it.
+                assert!(
+                    decode_mcbpcy_v1(&mut br).is_err(),
+                    "sym {sym}: STUFFING/ESC must be rejected"
+                );
+                continue;
+            }
             let dec = decode_mcbpcy_v1(&mut br).unwrap();
             assert_eq!(dec.mb_type, sym >> 2, "sym {sym}: mb_type mismatch");
+            assert_eq!(dec.mb_type, mb_type, "sym {sym}: table mb_type mismatch");
+            assert_eq!(dec.is_intra, is_intra, "sym {sym}: is_intra mismatch");
+            assert_eq!(
+                dec.num_motion_vectors, num_mv,
+                "sym {sym}: num_motion_vectors mismatch"
+            );
         }
+    }
+
+    #[test]
+    fn v1_mbtype_table_pins_inter4v_and_intra_plus_q() {
+        // The newly-extracted `region_053140_mbtype.csv` (spec/16 §3)
+        // is the value-level closure for the v1 inter sub-types. Pin the
+        // two corrections it carries over the old `mb_type == 3` test:
+        //   * MB-type 2 (INTER4V) implies 4 motion vectors;
+        //   * MB-type 4 (INTRA+Q) is intra (the old test missed this).
+        // Symbols 8..=11 are mb_type 2; 16..=19 are mb_type 4.
+        for sym in 8u8..=11 {
+            let (mb_type, is_intra, num_mv) = MB_TYPE_V1_INFO[sym as usize];
+            assert_eq!(mb_type, 2, "sym {sym} should be INTER4V");
+            assert!(!is_intra, "sym {sym} INTER4V is not intra");
+            assert_eq!(num_mv, 4, "sym {sym} INTER4V is 4-MV");
+        }
+        for sym in 16u8..=19 {
+            let (mb_type, is_intra, num_mv) = MB_TYPE_V1_INFO[sym as usize];
+            assert_eq!(mb_type, 4, "sym {sym} should be INTRA+Q");
+            assert!(is_intra, "sym {sym} INTRA+Q must be intra");
+            assert_eq!(num_mv, 0, "sym {sym} intra decodes no MV");
+        }
+        // Symbol 20 is the STUFFING/ESC sentinel.
+        assert_eq!(MB_TYPE_V1_INFO[20].0, 0xff, "symbol 20 = STUFFING/ESC");
     }
 
     #[test]

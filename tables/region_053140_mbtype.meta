@@ -1,0 +1,12 @@
+# region_053140_mbtype.meta
+source_path: /home/magicaltux/projects/oxideav-workspace/docs/video/msmpeg4/reference/binaries/wmpcdcs8-2001/mpg4c32.dll
+source_sha256: aedb4cf3d33c8554ab8acf04afe2d936eaa7c49107c5fefe163bca2e94b3c099
+tool: extract-07.sh + python3 + struct.unpack
+method: interpretation of region_053140_mcbpc.csv; mb_type=symbol>>2, cbpc=symbol&3.
+  P-frame MB-type semantics: 0=INTER(1MV) 1=INTER+Q(1MV)
+  2=INTER4V(4MV) 3=INTRA 4=INTRA+Q; top symbol = stuffing/ESC.
+  num_motion_vectors=4 only for MB-type 2 (the 4-MV / INTER4V mode).
+vma_start_hex: 0x1c253d40
+file_offset_start_hex: 0x053140
+symbol_count: 21
+verdict: pass

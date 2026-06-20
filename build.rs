@@ -519,7 +519,163 @@ fn main() {
         "0x1c2543c0",
     );
 
+    // v1 P-frame MB-type info table — region_053140_mbtype.csv (Extractor
+    // 07 / spec/16 §3.1-§3.2). This is the authoritative, decoder-relevant
+    // decomposition of the 21-symbol v1 P-frame MCBPC alphabet into
+    // (mb_type_index, is_intra, num_motion_vectors, CBPC bits) per symbol.
+    // It pins the INTER4V (MB-type 2) 4-MV mode and the INTRA / INTRA+Q
+    // (MB-types 3, 4) intra classification at value level, replacing the
+    // implicit `mb_type == 3` intra test that previously mis-classified
+    // MB-type 4 (INTRA+Q) as inter.
+    //
+    // FROM: docs/video/msmpeg4/spec/16-mv-vlc-dc-mcbpc-extraction.md §3
+    // FROM: docs/video/msmpeg4/tables/region_053140_mbtype.csv
+    let mbtype_v1_csv = tables_dir.join("region_053140_mbtype.csv");
+    println!("cargo:rerun-if-changed={}", mbtype_v1_csv.display());
+    emit_mbtype_v1(&mbtype_v1_csv, &out_dir.join("mbtype_v1.rs"));
+
     println!("cargo:rerun-if-changed=build.rs");
+}
+
+/// Parse the v1 P-frame MB-type info CSV
+/// (`region_053140_mbtype.csv`, columns
+/// `symbol_dec,bit_length,code_bin,mb_type_index,mb_type_name,is_intra,
+/// num_motion_vectors,cbpc_cb,cbpc_cr`) and emit a per-symbol
+/// `(mb_type, is_intra, num_motion_vectors)` info array indexed by the
+/// MCBPC symbol 0..=20.
+///
+/// Symbol 20 is the STUFFING/ESC entry (no MB-type / MV-count); it is
+/// emitted with `mb_type = 0xff` sentinel and `num_motion_vectors = 0`
+/// so the runtime decoder can reject it explicitly.
+///
+/// Cross-checks performed against the extracted table:
+///   * exactly 21 symbol rows (0..=20) in symbol order;
+///   * the `mb_type_index >> 0` relationship `mb_type == symbol >> 2`
+///     holds for every non-stuffing symbol (the §3.1 decomposition);
+///   * `num_motion_vectors == 4` iff `mb_type == 2` (INTER4V), `== 0`
+///     iff intra, `== 1` otherwise (the §3.1/§3.2 MV-count map
+///     {1, 1, 4, 0, 0});
+///   * `is_intra` is set iff `mb_type ∈ {3, 4}`.
+///
+/// FROM: docs/video/msmpeg4/spec/16-mv-vlc-dc-mcbpc-extraction.md §3
+fn emit_mbtype_v1(csv_path: &Path, out_path: &Path) {
+    let text = fs::read_to_string(csv_path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", csv_path.display()));
+
+    // (mb_type, is_intra, num_motion_vectors) per symbol 0..=20.
+    let mut records: Vec<(u8, bool, u8)> = Vec::with_capacity(21);
+    for (line_no, line) in text.lines().enumerate() {
+        if line_no == 0 {
+            continue; // CSV header row.
+        }
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = line.split(',').collect();
+        // Columns: symbol_dec,bit_length,code_bin,mb_type_index,
+        // mb_type_name,is_intra,num_motion_vectors,cbpc_cb,cbpc_cr
+        if parts.len() < 9 {
+            panic!("v1 mbtype: malformed row at line {}: {line}", line_no + 1);
+        }
+        let symbol: usize = parts[0]
+            .trim()
+            .parse()
+            .unwrap_or_else(|_| panic!("v1 mbtype: bad symbol_dec at line {}", line_no + 1));
+        // The STUFFING/ESC row leaves mb_type_index / is_intra /
+        // num_motion_vectors blank.
+        if parts[3].trim().is_empty() {
+            // Stuffing/ESC sentinel.
+            if symbol != records.len() {
+                panic!(
+                    "v1 mbtype: stuffing row symbol {symbol} out of order at line {}",
+                    line_no + 1
+                );
+            }
+            records.push((0xff, false, 0));
+            continue;
+        }
+        let mb_type: u8 = parts[3]
+            .trim()
+            .parse()
+            .unwrap_or_else(|_| panic!("v1 mbtype: bad mb_type_index at line {}", line_no + 1));
+        let is_intra: bool = match parts[5].trim() {
+            "0" => false,
+            "1" => true,
+            other => panic!("v1 mbtype: bad is_intra '{other}' at line {}", line_no + 1),
+        };
+        let num_mv: u8 = parts[6].trim().parse().unwrap_or_else(|_| {
+            panic!("v1 mbtype: bad num_motion_vectors at line {}", line_no + 1)
+        });
+
+        if symbol != records.len() {
+            panic!(
+                "v1 mbtype: symbol {symbol} out of order (expected {}) at line {}",
+                records.len(),
+                line_no + 1
+            );
+        }
+
+        // Cross-check the §3.1 decomposition: mb_type == symbol >> 2.
+        let expected_mb_type = (symbol >> 2) as u8;
+        if mb_type != expected_mb_type {
+            panic!(
+                "v1 mbtype: symbol {symbol} mb_type {mb_type} != symbol>>2 \
+                 {expected_mb_type} (spec/16 §3.1 decomposition broken)"
+            );
+        }
+        // Cross-check the MV-count map {1, 1, 4, 0, 0}.
+        let expected_num_mv = match mb_type {
+            0 | 1 => 1,
+            2 => 4,
+            3 | 4 => 0,
+            other => panic!("v1 mbtype: unexpected mb_type {other} at symbol {symbol}"),
+        };
+        if num_mv != expected_num_mv {
+            panic!(
+                "v1 mbtype: symbol {symbol} num_motion_vectors {num_mv} != \
+                 expected {expected_num_mv} for mb_type {mb_type} \
+                 (spec/16 §3.1 MV-count map broken)"
+            );
+        }
+        // Cross-check intra classification.
+        let expected_intra = matches!(mb_type, 3 | 4);
+        if is_intra != expected_intra {
+            panic!(
+                "v1 mbtype: symbol {symbol} is_intra {is_intra} != expected \
+                 {expected_intra} for mb_type {mb_type} (spec/16 §3.2)"
+            );
+        }
+
+        records.push((mb_type, is_intra, num_mv));
+    }
+
+    if records.len() != 21 {
+        panic!(
+            "v1 mbtype: expected 21 symbol rows (0..=20) in {}, got {}",
+            csv_path.display(),
+            records.len()
+        );
+    }
+
+    let mut out = String::new();
+    out.push_str(
+        "// @generated by build.rs from\n\
+         // docs/video/msmpeg4/tables/region_053140_mbtype.csv. DO NOT EDIT.\n\
+         //\n\
+         // Per-symbol MB-type info for the 21-symbol v1 P-frame MCBPC\n\
+         // alphabet (Extractor 07 / spec/16 §3). Index = MCBPC symbol\n\
+         // 0..=20; tuple = (mb_type, is_intra, num_motion_vectors).\n\
+         // Symbol 20 is STUFFING/ESC (mb_type = 0xff sentinel).\n",
+    );
+    out.push_str("pub static MB_TYPE_V1_INFO: [(u8, bool, u8); 21] = [\n");
+    for (mb_type, is_intra, num_mv) in &records {
+        out.push_str(&format!("    ({mb_type}, {is_intra}, {num_mv}),\n"));
+    }
+    out.push_str("];\n");
+
+    fs::write(out_path, out)
+        .unwrap_or_else(|e| panic!("failed to write {}: {e}", out_path.display()));
 }
 
 /// Parse a v1/v2 intra DC-size category CSV
