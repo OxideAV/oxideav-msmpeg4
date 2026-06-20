@@ -51,6 +51,7 @@ pending Auditor item.
 | 4-MV-per-MB predictor surface + neighbour resolver | wired (per-block bordering-cell pick) |
 | V3 intra-luma I-frame end-to-end via `decode_picture` | complete |
 | V1 / V2 P-frame pixel pipeline (incl. INTER+Q + INTER4V) | complete |
+| V1 P-frame MB-type table (`MB_TYPE_V1_INFO`)   | complete (binary-extracted, spec/16 §3) |
 | V1 / V2 intra pipeline (I-frame + intra-in-P)  | complete (size+value DC, spec/16 §2) |
 | V1 / V2 intra DC-size category VLCs (luma/chroma) | complete (binary-extracted, spec/16 §2) |
 | V1 / V2 shared CBPY VLC                         | complete   |
@@ -60,10 +61,17 @@ pending Auditor item.
 ## What's still open for real-content decode
 
 - **V3 4-MV-per-MB picture decode**: the predictor / neighbour-resolver
-  surface is complete and is now driven from the v1 P-frame INTER4V
-  path (`spec/16` §3.1). Wiring it into the **v3** picture decoder still
-  waits on the v3 MCBPC bit pattern that signals 1-MV vs 4-MV mode (an
-  open v3-specific spec gap; the v1/v2 MB-type → MV-count map is traced).
+  surface is complete and is now exercised end-to-end on the v1 P-frame
+  INTER4V path (`spec/16` §3.1). Wiring it into the **v3** picture
+  decoder is a docs gap: the v3 joint 128-entry MCBPCY alphabet
+  (`region_05eac8`, `audit/02` §4) encodes only an intra/inter split
+  (64 I-type + 64 P-type CBPCY patterns = 2 MB-types × 64 CBPCY), so it
+  carries **no** INTER4V code, and the v3 per-MB driver's 1-MV vs 4-MV
+  decision (`spec/06` §1.3 "for each MV needed by the decoded MB-type")
+  is not traced to a concrete signal. The v3 MV decoder itself already
+  supports the 4-MV output layout (`spec/06` §3.6 "first of four (or
+  one)") — only the trigger is missing. Until the docs resolve where v3
+  signals INTER4V, the v3 picture decoder stays 1-MV-per-MB.
 - **V1 / V2 I-frames and intra-in-P MBs**: now decode to pixels (round
   339). spec/16 §2 (Extractor 07) established that the v1/v2 intra-block
   driver gates on version (`cmp [esi+8], 3`): for v < 3 it decodes the DC
@@ -79,13 +87,20 @@ pending Auditor item.
   §3.2). Real-content bit-exactness against an encoder oracle (the AC
   walk + spatial-predictor reconstruction matching the binary) is a
   pending Auditor-round validation.
-- **V1 inter sub-types**: now wired. `spec/16` §3.1 +
+- **V1 inter sub-types**: wired and table-grounded. `spec/16` §3.1 +
   `region_053140_mbtype.csv` pin the P-frame MB-type → MV-count map
-  {1, 1, 4, 0, 0}: MB-type 0 (INTER) and MB-type 1 (INTER+Q) are 1-MV
-  (the v1 MCBPCY body reads no quantiser-delta bit per spec/07 §1.4),
-  and MB-type 2 (INTER4V) loops the per-component MV decoder 4× over the
-  Figure 6-8 8x8 blocks, with the chroma MV derived per §7.6.3.4.
-  MB-types 3/4 are intra (intra-in-P path).
+  {1, 1, 4, 0, 0}; round 352 loads that 21-symbol map into the
+  build-time `MB_TYPE_V1_INFO` table (cross-checked for the `>> 2`
+  decomposition, the MV-count map, and intra classification) and drives
+  `decode_mcbpcy_v1`'s `is_intra` / `num_motion_vectors` plus the
+  INTER4V dispatch from it. MB-type 0 (INTER) and 1 (INTER+Q) are 1-MV
+  (the v1 MCBPCY body reads no quantiser-delta bit per spec/07 §1.4);
+  MB-type 2 (INTER4V) loops the per-component MV decoder 4× over the
+  Figure 6-8 8x8 blocks with the chroma MV derived per §7.6.3.4;
+  MB-types 3 (INTRA) **and 4 (INTRA+Q)** are intra. The earlier
+  `is_intra = mb_type == 3` shortcut mis-classified MB-type 4 as inter
+  (rejecting v1 I-frame MBs that carried it); the table closes that.
+  The STUFFING/ESC symbol (20) is rejected explicitly.
 
 ## License
 
