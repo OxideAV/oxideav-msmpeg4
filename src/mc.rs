@@ -22,11 +22,11 @@
 //! # Out-of-bounds handling
 //!
 //! Reference samples that fall outside the decoded reference picture
-//! are clamped to the nearest valid sample (edge-extend). This is
-//! what ffmpeg's msmpeg4 decoder does for unrestricted MVs and is
-//! what the spec/06 §3.5 wrap range `[-63, +63]` half-pel (= ±32
-//! integer pixels) is designed to cover on sub-QCIF streams. For
-//! larger pictures the wrap fits within the picture easily.
+//! are clamped to the nearest valid sample (edge-extend) — the
+//! unrestricted-MV behaviour the spec/06 §3.5 wrap range `[-63, +63]`
+//! half-pel (= ±32 integer pixels) is designed to cover on sub-QCIF
+//! streams. For larger pictures the wrap fits within the picture
+//! easily.
 
 /// One reference sample plane (luma or chroma), stride-indexed.
 pub struct RefPlane<'a> {
@@ -51,9 +51,9 @@ impl<'a> RefPlane<'a> {
 /// each component is in half-pel units (i.e. `mv_x_half = 2 *
 /// integer_mv + half_pel_bit`).
 ///
-/// Half-pel rounding: ffmpeg / H.263 uses the "rounded average"
+/// Half-pel rounding: the H.263 / MPEG-4 §7.6.3.1 "rounded average"
 /// `(a + b + 1) >> 1`. For 2D half-pel we average 4 samples with
-/// `+2 >> 2`. This mirrors MPEG-4 §7.6.3.1.
+/// `+2 >> 2`.
 #[allow(clippy::too_many_arguments)]
 pub fn mc_block(
     reference: &RefPlane<'_>,
@@ -117,9 +117,9 @@ pub fn mc_block(
 /// [`chroma_mv_from_four_luma`].
 pub fn chroma_mv_from_luma(luma_mv_half: (i32, i32)) -> (i32, i32) {
     // For 1-MV MBs the averaging is a no-op; halve to map from luma
-    // half-pel to chroma half-pel. Use shift right (arithmetic) for
-    // toward-negative-infinity; ffmpeg matches this by dividing then
-    // adjusting. For our purposes integer-halving via `>>1` is OK.
+    // half-pel to chroma half-pel. Arithmetic shift right rounds toward
+    // negative infinity; integer-halving via `>>1` is the §7.6.3.4
+    // default for the single-MV reduction.
     (luma_mv_half.0 >> 1, luma_mv_half.1 >> 1)
 }
 

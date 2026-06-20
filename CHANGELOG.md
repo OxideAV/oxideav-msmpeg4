@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- round 352: scrub external-implementation naming from `src/` doc
+  comments (`mc.rs`, `ac.rs`) — the half-pel rounding, unrestricted-MV
+  edge-extend, and chroma-MV reduction are re-cited to their H.263 /
+  MPEG-4 §7.6.3.x spec authority instead of naming a third-party
+  decoder. Comments only; no behaviour change.
 - round 352: ground the v1 P-frame MB-type decomposition in the
   re-extracted authoritative table `tables/region_053140_mbtype.csv`
   (Extractor 07 / `spec/16` §3). New `build.rs` emitter (`emit_mbtype_v1`)

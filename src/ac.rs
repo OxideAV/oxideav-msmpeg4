@@ -470,8 +470,8 @@ impl AcVlcTable {
     /// so a stream encoding `(last=0, run=0, level=1)` lines up with the
     /// shortest codeword (idx=0).
     ///
-    /// This is **not bit-exact** against ffmpeg / msmpeg4v3 reference
-    /// content; it's a structurally-valid candidate that exercises the
+    /// This is **not bit-exact** against real msmpeg4v3 content; it's a
+    /// structurally-valid candidate that exercises the
     /// AC pipeline end-to-end on synthetic streams. Producing real-file
     /// parity requires either (a) confirmed pri_A / pri_B for the
     /// matching G-descriptor, or (b) the full constructor algorithm at
