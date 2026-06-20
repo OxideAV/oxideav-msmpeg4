@@ -59,7 +59,7 @@ fn fixture_dir(name: &str) -> PathBuf {
 }
 
 /// Extract every `00dc` (video) payload from an AVI file in stream
-/// order. Mirror of the helper in `tests/ffmpeg_roundtrip.rs`.
+/// order. Mirror of the helper in `tests/reference_roundtrip.rs`.
 fn all_video_chunks(avi: &[u8]) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
     let mut i = 12;

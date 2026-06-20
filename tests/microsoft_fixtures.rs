@@ -241,7 +241,7 @@ fn fetch_fixture(fix: &Fixture) -> Option<Vec<u8>> {
 }
 
 // ---------------------------------------------------------------------------
-// AVI parsing (copied from `tests/docs_corpus.rs` / `tests/ffmpeg_roundtrip.rs`
+// AVI parsing (copied from `tests/docs_corpus.rs` / `tests/reference_roundtrip.rs`
 // to keep this test file self-contained; no new dep on `oxideav-avi`).
 // ---------------------------------------------------------------------------
 
