@@ -9,9 +9,13 @@
 //!
 //! * `mcbpcy_v3.rs` — v3 joint-MCBPCY VLC source (`region_05eac8.csv`,
 //!   spec/99 §3.1 / §8.1). 128 `(bit_length, code_value)` pairs.
-//! * `mv_v3.rs` — v3 joint (X, Y) MV VLC source default variant
-//!   (`region_05bfc0.csv`, spec/06 §2.1, VMA `0x1c25cbc0`). 1100
-//!   `(bit_length, code_value)` pairs; index 1099 is ESC.
+//! * `mv_v3.rs` / `mv_v3_alt.rs` — v3 joint (X, Y) MV VLC source,
+//!   default (`region_05bfc0_mvvlc.csv`, VMA `0x1c25cbc0`) and alternate
+//!   (`region_0594b8_mvvlc.csv`, VMA `0x1c25a0b8`) variants, per spec/16
+//!   §1 / Extractor 07. 1100 `(bit_length, code)` pairs each indexed by
+//!   symbol; index 1099 is ESC. `code` is the actual DLL wire pattern
+//!   (a complete prefix code, NOT textbook-canonical) consumed directly
+//!   by the runtime per spec/12 §2.
 //! * `mv_lut_v3.rs` — MVDx/MVDy byte LUTs default variant (from
 //!   `region_05e228.hex` / `region_05e678.hex`, VMAs `0x1c25ee28` /
 //!   `0x1c25f278`). 1104 bytes each; only indices 0..1099 are read by
@@ -30,12 +34,16 @@
 //!   constructor (`AcVlcTable::v3_intra_candidate`) so callers opt in
 //!   explicitly.
 //!
-//! The CSV column naming is historically mis-labelled: the `symbol_dec`
-//! column holds the `bit_length`, the `bit_length` column holds the
-//! `code_value`. See `docs/video/msmpeg4/spec/99-current-understanding.md`
-//! §8.1 for the full provenance chain. Canonical Huffman codes are
-//! derived from the `bit_length` array alone, so the `code_value` column
-//! is carried through but not consumed by the runtime decoder.
+//! Some older CSVs (MCBPCY, intra-AC candidate) have a historically
+//! mis-labelled column naming where `symbol_dec` holds the `bit_length`
+//! and `bit_length` holds the `code_value`; see
+//! `docs/video/msmpeg4/spec/99-current-understanding.md` §8.1 for the
+//! provenance chain. For those, canonical-Huffman codes are derived from
+//! the `bit_length` array. The Extractor-07 `_mvvlc.csv` re-extractions
+//! use the cleaner `symbol_index,file_offset_hex,code_dec,code_bin,
+//! bit_length` layout and their `code_dec` IS consumed: spec/12 §2 shows
+//! the per-slot walker builder is fed the actual `(code, bl)` records,
+//! and the codes are not a textbook-canonical assignment.
 
 use std::env;
 use std::fs;
@@ -108,10 +116,18 @@ fn main() {
     println!("cargo:rerun-if-changed={}", mcbpcy_csv.display());
     emit_mcbpcy_v3(&mcbpcy_csv, &out_dir.join("mcbpcy_v3.rs"));
 
-    // v3 joint-MV VLC default variant — 05bfc0.
-    let mv_csv = tables_dir.join("region_05bfc0.csv");
+    // v3 joint-MV VLC default variant — region_05bfc0_mvvlc.csv (VMA
+    // 0x1c25cbc0, file 0x5bfc0). The Extractor-07 re-extraction
+    // (spec/16 §1) supersedes the earlier `region_05bfc0.csv`, which
+    // mis-decoded BOTH the bit-lengths and the codes (its symbol 0
+    // showed bl=1/code=3 — impossible for a 1-bit code). The corrected
+    // CSV carries the real DLL-internal wire codes consumed by the
+    // walker builder (spec/12 §2 `emit_walker_entry(this, code, bl, …)`);
+    // they are NOT a textbook-canonical assignment, so the runtime must
+    // use the `code_dec` column, not reconstruct from bit-lengths.
+    let mv_csv = tables_dir.join("region_05bfc0_mvvlc.csv");
     println!("cargo:rerun-if-changed={}", mv_csv.display());
-    emit_mv_v3(&mv_csv, &out_dir.join("mv_v3.rs"));
+    emit_mv_v3_packed(&mv_csv, &out_dir.join("mv_v3.rs"), MvVariant::Default);
 
     // MVDx / MVDy byte LUTs default variant — 05e228 + 05e678.
     let mvdx_hex = tables_dir.join("region_05e228.hex");
@@ -145,7 +161,11 @@ fn main() {
     // 1100 (bit_length, code_value) pairs in the same shape as MV_V3_RAW.
     let mv_alt_csv = tables_dir.join("region_0594b8_mvvlc.csv");
     println!("cargo:rerun-if-changed={}", mv_alt_csv.display());
-    emit_mv_v3_alt(&mv_alt_csv, &out_dir.join("mv_v3_alt.rs"));
+    emit_mv_v3_packed(
+        &mv_alt_csv,
+        &out_dir.join("mv_v3_alt.rs"),
+        MvVariant::Alternate,
+    );
 
     // Intra AC candidate primary VLC — 05eed0 (VMA 0x1c25fad0).
     // 64-entry canonical Huffman; role attribution OPEN per spec/99 §0.1.
@@ -952,104 +972,35 @@ fn emit_mcbpcy_v3(csv_path: &Path, out_path: &Path) {
     writeln!(f, "];").unwrap();
 }
 
-/// Parse `region_05bfc0.csv` and emit the v3 joint-MV VLC table as raw
-/// `(bit_length, code_value)` pairs. Record 0 is the alphabet header
-/// `(1100, 1)`; records 1..=1100 are the 1100 canonical-Huffman payload
-/// entries (index 1099 = ESC).
-fn emit_mv_v3(csv_path: &Path, out_path: &Path) {
-    let text = fs::read_to_string(csv_path)
-        .unwrap_or_else(|e| panic!("failed to read {}: {e}", csv_path.display()));
-
-    let mut records: Vec<(u32, u32)> = Vec::with_capacity(1101);
-    for (line_no, line) in text.lines().enumerate() {
-        if line_no == 0 {
-            continue; // CSV column header
-        }
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let parts: Vec<&str> = line.split(',').collect();
-        if parts.len() < 5 {
-            panic!("malformed row at line {}: {line}", line_no + 1);
-        }
-        // Same column convention as MCBPCY: symbol_dec = bit_length,
-        // bit_length = code_value.
-        let bit_length: u32 = parts[3]
-            .parse()
-            .unwrap_or_else(|_| panic!("bad bit_length at line {}: {}", line_no + 1, parts[3]));
-        let code_value: u32 = parts[4]
-            .parse()
-            .unwrap_or_else(|_| panic!("bad code_value at line {}: {}", line_no + 1, parts[4]));
-        records.push((bit_length, code_value));
-    }
-
-    if records.len() != 1101 {
-        panic!(
-            "expected 1101 records in {} (1 header + 1100 payload), got {}",
-            csv_path.display(),
-            records.len()
-        );
-    }
-
-    let (alphabet_size, _marker) = records[0];
-    if alphabet_size != 1100 {
-        panic!(
-            "unexpected alphabet size {alphabet_size} in {} (expected 1100)",
-            csv_path.display()
-        );
-    }
-
-    let mut f = fs::File::create(out_path)
-        .unwrap_or_else(|e| panic!("failed to create {}: {e}", out_path.display()));
-    writeln!(
-        f,
-        "// Auto-generated by build.rs from \
-         docs/video/msmpeg4/tables/region_05bfc0.csv. DO NOT EDIT.\n\
-         // Source binary: mpg4c32.dll SHA-256 \
-         aedb4cf3d33c8554ab8acf04afe2d936eaa7c49107c5fefe163bca2e94b3c099\n\
-         // Role: v3 joint (X, Y) MV VLC source default variant (VMA\n\
-         // 0x1c25cbc0, per spec/06 §2.1). Index 1099 is the ESC\n\
-         // sentinel; ESC tail is 6 bits MVDx + 6 bits MVDy.\n\
-         \n\
-         pub const MV_V3_ALPHABET_SIZE: usize = {};\n\
-         pub const MV_V3_ESC_INDEX: usize = 1099;\n\
-         \n\
-         /// 1100 × (bit_length, code_value) canonical-Huffman entries.\n\
-         /// Index 1099 is ESC (any bit_length maps to ESC fallthrough);\n\
-         /// indices 0..=1098 are non-ESC joint (MVDx, MVDy) codes.\n\
-         pub const MV_V3_RAW: &[(u32, u32)] = &[",
-        alphabet_size,
-    )
-    .unwrap();
-    for &(bl, code) in &records[1..] {
-        writeln!(f, "    ({bl}, {code}),").unwrap();
-    }
-    writeln!(f, "];").unwrap();
+/// Which v3 joint-MV VLC variant a packed-table emit is for.
+#[derive(Clone, Copy)]
+enum MvVariant {
+    /// `mv_table_sel == 0`, VMA 0x1c25cbc0, file 0x5bfc0.
+    Default,
+    /// `mv_table_sel == 1`, VMA 0x1c25a0b8, file 0x594b8.
+    Alternate,
 }
 
-/// Parse `region_0594b8_mvvlc.csv` and emit the v3 joint-MV VLC
-/// **alternate** variant source as raw `(bit_length, code_value)` pairs.
+/// Parse an Extractor-07 `region_*_mvvlc.csv` (columns
+/// `symbol_index,file_offset_hex,code_dec,code_bin,bit_length`, 1100 data
+/// rows for symbols 0..=1099, index 1099 = ESC) and emit the v3 joint-MV
+/// VLC table as raw `(bit_length, code)` pairs indexed by symbol.
 ///
-/// Unlike the default-variant CSV (`region_05bfc0.csv`, old extractor
-/// format with a packed `(1100, 1)` header row and the historically
-/// mis-labelled `symbol_dec`/`bit_length` columns), this Extractor-07
-/// re-extraction uses the cleaner column layout
-/// `symbol_index,file_offset_hex,code_dec,code_bin,bit_length` with no
-/// packed header row: the 1100 data rows are the symbols 0..=1099 in
-/// index order (index 1099 is ESC). The runtime decoder (mv::build_alt_table)
-/// reconstructs canonical-Huffman codes from the `bit_length` column
-/// alone — identical to the default-variant path — so the `code_dec`
-/// column (the DLL-internal bit pattern under the loader's own reader
-/// convention) is carried through but not consumed.
+/// The `code` is the **actual DLL-internal wire bit-pattern** (MSB-first)
+/// that the per-slot walker builder consumes — `emit_walker_entry(this,
+/// record.code, record.bl, sym, …)` (spec/12 §2), decoded MSB-first by
+/// `0x1c219351` (spec/12 §3). It is a complete prefix code (Kraft = 1.0)
+/// but NOT the textbook-canonical assignment, so the runtime decodes
+/// against this `code`, not a value reconstructed from bit-lengths alone.
+/// This matches the v1/v2 per-component MV path, which already consumes
+/// its extracted codes directly (`mv::build_v1v2_table`).
 ///
-/// Provenance: `docs/video/msmpeg4/tables/region_0594b8_mvvlc.csv` —
-/// extracted from `mpg4c32.dll` (SHA-256 `aedb4cf3...b3c099`) at file
-/// offset `0x594b8`, VMA `0x1c25a0b8`, per spec/16 §1 (Extractor 07).
-/// The bit-lengths are cross-checked at build time: exactly 1100 rows,
-/// Kraft sum over the bit-lengths == 1 (complete prefix code), ESC at
-/// index 1099.
-fn emit_mv_v3_alt(csv_path: &Path, out_path: &Path) {
+/// Provenance: `region_0594b8_mvvlc.csv` (VMA 0x1c25a0b8, alternate) and
+/// `region_05bfc0_mvvlc.csv` (VMA 0x1c25cbc0, default), extracted from
+/// `mpg4c32.dll` (SHA-256 `aedb4cf3...b3c099`) per spec/16 §1
+/// (Extractor 07). The default's predecessor `region_05bfc0.csv` is
+/// retired: it mis-decoded both bit-lengths and codes.
+fn emit_mv_v3_packed(csv_path: &Path, out_path: &Path, variant: MvVariant) {
     let text = fs::read_to_string(csv_path)
         .unwrap_or_else(|e| panic!("failed to read {}: {e}", csv_path.display()));
 
@@ -1070,13 +1021,13 @@ fn emit_mv_v3_alt(csv_path: &Path, out_path: &Path) {
         let idx: u32 = parts[0]
             .parse()
             .unwrap_or_else(|_| panic!("bad symbol_index at line {}: {}", line_no + 1, parts[0]));
-        let code_value: u32 = parts[2]
+        let code: u32 = parts[2]
             .parse()
             .unwrap_or_else(|_| panic!("bad code_dec at line {}: {}", line_no + 1, parts[2]));
         let bit_length: u32 = parts[4]
             .parse()
             .unwrap_or_else(|_| panic!("bad bit_length at line {}: {}", line_no + 1, parts[4]));
-        records.push((idx, bit_length, code_value));
+        records.push((idx, bit_length, code));
     }
 
     if records.len() != 1100 {
@@ -1087,8 +1038,8 @@ fn emit_mv_v3_alt(csv_path: &Path, out_path: &Path) {
         );
     }
 
-    // The rows must be the contiguous symbol indices 0..=1099 in order
-    // (the runtime canonical builder indexes MV_V3_ALT_RAW by position).
+    // Rows must be the contiguous symbol indices 0..=1099 in order — the
+    // runtime indexes the emitted slice by symbol position.
     for (pos, &(idx, _, _)) in records.iter().enumerate() {
         if idx as usize != pos {
             panic!(
@@ -1100,9 +1051,7 @@ fn emit_mv_v3_alt(csv_path: &Path, out_path: &Path) {
     }
 
     // Cross-check the prefix-code completeness from the bit-lengths
-    // alone (the property the canonical builder relies on). Kraft sum
-    // = Σ 2^-bl must equal exactly 1 for a complete code. We compute it
-    // in fixed point against 2^maxbl to avoid float rounding.
+    // (Kraft sum Σ 2^-bl == 1, fixed-point against 2^maxbl).
     let max_bl = records.iter().map(|&(_, bl, _)| bl).max().unwrap();
     if max_bl == 0 || max_bl > 24 {
         panic!(
@@ -1123,26 +1072,74 @@ fn emit_mv_v3_alt(csv_path: &Path, out_path: &Path) {
         );
     }
 
+    // Cross-check the actual codes form a prefix-free set: extend each
+    // code to `max_bl` bits and confirm the [lo, hi) leaf ranges are
+    // pairwise disjoint. A canonical reconstruction could mask a
+    // mis-extracted code; this validates the codes we actually emit.
+    let mut ranges: Vec<(u64, u64)> = records
+        .iter()
+        .map(|&(_, bl, code)| {
+            let span = 1u64 << (max_bl - bl);
+            let lo = (code as u64) << (max_bl - bl);
+            (lo, lo + span)
+        })
+        .collect();
+    ranges.sort_unstable();
+    for w in ranges.windows(2) {
+        if w[1].0 < w[0].1 {
+            panic!(
+                "{}: extracted codes are not prefix-free (leaf ranges \
+                 [{}, {}) and [{}, {}) overlap)",
+                csv_path.display(),
+                w[0].0,
+                w[0].1,
+                w[1].0,
+                w[1].1
+            );
+        }
+    }
+
+    let (src_name, vma, role, extra_consts) = match variant {
+        MvVariant::Default => (
+            "region_05bfc0_mvvlc.csv",
+            "0x1c25cbc0",
+            "default variant (mv_table_sel == 0)",
+            "pub const MV_V3_ALPHABET_SIZE: usize = 1100;\n\
+             pub const MV_V3_ESC_INDEX: usize = 1099;\n\
+             \n",
+        ),
+        MvVariant::Alternate => (
+            "region_0594b8_mvvlc.csv",
+            "0x1c25a0b8",
+            "ALTERNATE variant (mv_table_sel == 1)",
+            "",
+        ),
+    };
+    let raw_name = match variant {
+        MvVariant::Default => "MV_V3_RAW",
+        MvVariant::Alternate => "MV_V3_ALT_RAW",
+    };
+
     let mut f = fs::File::create(out_path)
         .unwrap_or_else(|e| panic!("failed to create {}: {e}", out_path.display()));
     writeln!(
         f,
         "// Auto-generated by build.rs from \
-         docs/video/msmpeg4/tables/region_0594b8_mvvlc.csv. DO NOT EDIT.\n\
+         docs/video/msmpeg4/tables/{src_name}. DO NOT EDIT.\n\
          // Source binary: mpg4c32.dll SHA-256 \
          aedb4cf3d33c8554ab8acf04afe2d936eaa7c49107c5fefe163bca2e94b3c099\n\
-         // Role: v3 joint (X, Y) MV VLC source ALTERNATE variant (VMA\n\
-         // 0x1c25a0b8, file 0x594b8, per spec/16 §1 / Extractor 07).\n\
-         // Selected by the per-frame `mv_table_sel == 1` bit. Index 1099\n\
-         // is the ESC sentinel; ESC tail is 6 bits MVDx + 6 bits MVDy,\n\
-         // identical to the default variant. Codes are reconstructed\n\
-         // canonically from the bit_length column at runtime.\n\
+         // Role: v3 joint (X, Y) MV VLC source {role} (VMA {vma}, per\n\
+         // spec/16 §1 / Extractor 07). Index 1099 is the ESC sentinel;\n\
+         // ESC tail is 6 bits MVDx + 6 bits MVDy.\n\
          \n\
-         /// 1100 × (bit_length, code_value) entries for the alternate\n\
-         /// joint-MV VLC. Index 1099 is ESC; indices 0..=1098 are\n\
-         /// non-ESC joint (MVDx, MVDy) codes. Only the bit_length is\n\
-         /// consumed by the runtime canonical-Huffman builder.\n\
-         pub const MV_V3_ALT_RAW: &[(u32, u32)] = &["
+         {extra_consts}\
+         /// 1100 × (bit_length, code) entries indexed by symbol. `code`\n\
+         /// is the actual DLL wire bit-pattern (MSB-first), a complete\n\
+         /// prefix code but not the textbook-canonical assignment; the\n\
+         /// runtime decodes against it directly (spec/16 §1, spec/12 §2).\n\
+         /// Index 1099 is ESC; indices 0..=1098 are non-ESC joint\n\
+         /// (MVDx, MVDy) codes.\n\
+         pub const {raw_name}: &[(u32, u32)] = &[",
     )
     .unwrap();
     for &(_, bl, code) in &records {

@@ -5,7 +5,7 @@
 //! drives the **full predict → bitstream-decode → commit** loop for a
 //! single 16x16 macroblock encoded in 4-MV mode using real codes from
 //! the v3 default joint-MV VLC (table at VMA `0x1c25cbc0`, 1100-entry
-//! canonical-Huffman). Each block's predictor is computed from whatever
+//! prefix code). Each block's predictor is computed from whatever
 //! has been committed before it per Figure 7-34 of ISO/IEC 14496-2:2004(E)
 //! §7.6.5; the per-axis MVD then comes from [`mv::decode_mv`] which
 //! reads the joint VLC against the actual `MV_V3_RAW` /
@@ -23,8 +23,8 @@
 //!   (`0x1c217f5a`), the joint VLC + ESC + predictor-add + toroidal wrap.
 //! - `docs/video/mpeg4-visual/figure-7-34-mv-predictor-layout.md` —
 //!   per-block neighbour layout + four substitution rules + median.
-//! - `docs/video/msmpeg4/tables/region_05bfc0.csv` — VLC source (default
-//!   variant) parsed by `build.rs::emit_mv_v3`.
+//! - `docs/video/msmpeg4/tables/region_05bfc0_mvvlc.csv` — VLC source
+//!   (default variant, spec/16 §1) parsed by `build.rs::emit_mv_v3_packed`.
 
 use oxideav_core::bits::BitReader;
 use oxideav_msmpeg4::mv::{decode_mv, Mv};
@@ -61,38 +61,20 @@ fn pack(fields: &[(u32, u32)]) -> Vec<u8> {
     out
 }
 
-/// Walk the canonical-Huffman table built from `MV_V3_RAW` and return
-/// the `(bit_length, canonical_code)` of the joint symbol at the given
+/// Return the `(bit_length, code)` of the joint MV symbol at the given
 /// alphabet index (0..=1098 for payload, [`MV_V3_ESC_INDEX`] for ESC).
 ///
-/// The canonical builder in `mv::build_table()` sorts symbols by
-/// `(bit_length, alphabet_index)`, assigns code 0 to the first, and
-/// `code = (code + 1) << (bl_cur - bl_prev)` to each subsequent. We
-/// replay that here on `MV_V3_RAW` (which is keyed by alphabet index)
-/// so the test can find the canonical code for any symbol it wants to
-/// stream into the decoder.
-fn canonical_code_for(idx: usize) -> (u32, u32) {
-    let mut symbols: Vec<(u32, usize)> = MV_V3_RAW
-        .iter()
-        .enumerate()
-        .filter_map(|(i, &(bl, _))| if bl == 0 { None } else { Some((bl, i)) })
-        .collect();
-    symbols.sort_by_key(|&(bl, i)| (bl, i));
-
-    let mut code: u32 = 0;
-    let mut prev_bl: u32 = 0;
-    for (n, &(bl, i)) in symbols.iter().enumerate() {
-        if n == 0 {
-            code = 0;
-        } else {
-            code = (code + 1) << (bl - prev_bl);
-        }
-        if i == idx {
-            return (bl, code);
-        }
-        prev_bl = bl;
-    }
-    panic!("alphabet index {idx} not present in MV_V3_RAW (bit_length == 0?)");
+/// `MV_V3_RAW` is keyed by alphabet index and carries the actual DLL
+/// wire codes (spec/16 §1), which `mv::build_table()` uses verbatim — so
+/// the test streams the same code the decoder matches against, exercising
+/// the real bit patterns rather than a canonical reconstruction.
+fn code_for(idx: usize) -> (u32, u32) {
+    let (bl, code) = MV_V3_RAW[idx];
+    assert!(
+        bl != 0,
+        "alphabet index {idx} not present in MV_V3_RAW (bit_length == 0?)"
+    );
+    (bl, code)
 }
 
 /// Decode the (signed, post-bias, post-wrap) MV that the in-tree
@@ -150,7 +132,7 @@ fn pick_payload_indices() -> [usize; 4] {
         .find(|&&(bl, _)| bl == 1)
         .map(|&(_, i)| i)
         .expect("MV_V3_RAW must contain a 1-bit code (most-probable symbol)");
-    // First 3-bit code (the shortest non-1-bit per the canonical layout).
+    // First code of bit-length >= 3.
     let s3 = by_bl
         .iter()
         .find(|&&(bl, _)| bl >= 3)
@@ -190,7 +172,7 @@ fn macroblock_4mv_bitstream_round_trip_zero_neighbours() {
     // is in the payload range).
     let mut fields: Vec<(u32, u32)> = Vec::with_capacity(4);
     for &idx in &chosen {
-        let (bl, code) = canonical_code_for(idx);
+        let (bl, code) = code_for(idx);
         fields.push((code, bl));
     }
     let data = pack(&fields);
@@ -236,7 +218,7 @@ fn macroblock_4mv_bitstream_round_trip_zero_neighbours() {
     // the trailing zero-bit padding inside the final byte). Compute
     // the total bit-length of the four codes and check the reader's
     // position matches.
-    let expected_bits: u32 = chosen.iter().map(|&i| canonical_code_for(i).0).sum::<u32>();
+    let expected_bits: u32 = chosen.iter().map(|&i| code_for(i).0).sum::<u32>();
     assert_eq!(
         br.bit_position() as u32,
         expected_bits,
@@ -285,7 +267,7 @@ fn macroblock_4mv_bitstream_with_full_neighbours_drives_figure_layout() {
 
     let mut fields: Vec<(u32, u32)> = Vec::with_capacity(4);
     for &idx in &chosen {
-        let (bl, code) = canonical_code_for(idx);
+        let (bl, code) = code_for(idx);
         fields.push((code, bl));
     }
     let data = pack(&fields);
@@ -352,7 +334,7 @@ fn macroblock_4mv_bitstream_zero_mvd_chain_produces_constant_neighbour_mv() {
         // the predict-decode-commit cycle on whatever the LUT contains.
         return;
     };
-    let (bl, code) = canonical_code_for(zero_idx);
+    let (bl, code) = code_for(zero_idx);
 
     let neighbours = MacroblockCandidates {
         left_mb: Some(Mv { x: 7, y: -4 }),
@@ -412,7 +394,7 @@ fn predict_block_mv_loop_with_bitstream_matches_decoder_helper() {
 
     let mut fields: Vec<(u32, u32)> = Vec::with_capacity(4);
     for &idx in &chosen {
-        let (bl, code) = canonical_code_for(idx);
+        let (bl, code) = code_for(idx);
         fields.push((code, bl));
     }
     let data = pack(&fields);

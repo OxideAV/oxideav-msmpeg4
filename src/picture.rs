@@ -2174,8 +2174,12 @@ mod tests {
             .map(|(bl, code, _)| (*bl as u32, *code))
             .expect("symbol 0 in canonical MCBPCY");
 
-        // MV VLC symbol 0 (1-bit code 0) → MVDx/MVDy raw = 0x20 = 32.
-        // Pred (0,0), 32 - 32 = 0 → MV output = (0, 0).
+        // MV VLC symbol 0 → MVDx/MVDy raw = 0x20 = 32. Pred (0,0),
+        // 32 - 32 = 0 → MV output = (0, 0). The default joint-MV table's
+        // symbol-0 wire code is the actual extracted pattern (spec/16 §1,
+        // region_05bfc0_mvvlc) — read it from MV_V3_RAW rather than
+        // assuming a canonical value.
+        let (mv0_bl, mv0_code) = crate::tables_data::MV_V3_RAW[0];
 
         // P-frame header: P, q=8, ac_chroma=0, dc_size_sel=0, mv_table_sel=0.
         let mut fields: Vec<(u32, u32)> = vec![
@@ -2185,11 +2189,11 @@ mod tests {
             (0, 1), // dc_size_sel = 0
             (0, 1), // mv_table_sel = 0 (default)
         ];
-        // 1 MB: skip-bit=0, MCBPCY sym 0, ac_pred bit, MV sym 0 (1 bit `0`).
+        // 1 MB: skip-bit=0, MCBPCY sym 0, ac_pred bit, MV sym 0.
         fields.push((0, 1)); // skip = 0
         fields.push((code_sym0, bl_sym0));
         fields.push((0, 1)); // ac_pred (ignored for inter)
-        fields.push((0, 1)); // MV sym 0 (canonical code = 0)
+        fields.push((mv0_code, mv0_bl)); // MV sym 0 → MV (0,0)
         fields.push((0, 16));
         let bytes = pack(&fields);
         let mut br = BitReader::new(&bytes);
@@ -2319,11 +2323,12 @@ mod tests {
             (0, 1), // dc_size_sel = 0
             (0, 1), // mv_table_sel = 0
         ];
+        let (mv0_bl, mv0_code) = crate::tables_data::MV_V3_RAW[0];
         fields.push((0, 1)); // skip = 0
         fields.push((code_mb, bl_mb)); // MCBPCY idx 32 (inter, Y0 coded)
         fields.push((0, 1)); // ac_pred (ignored for inter)
-        fields.push((0, 1)); // MV sym 0 → MV (0,0)
-                             // Luma block 0 residual: single sub-class-B terminator + sign 0.
+        fields.push((mv0_code, mv0_bl)); // MV sym 0 → MV (0,0)
+                                         // Luma block 0 residual: single sub-class-B terminator + sign 0.
         fields.push((term_entry.code, term_entry.bits as u32));
         fields.push((0, 1)); // sign = positive
         fields.push((0, 16)); // tail padding

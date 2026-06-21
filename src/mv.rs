@@ -137,59 +137,46 @@ impl MvTable {
     }
 }
 
-/// Lazy-built canonical-Huffman table for the v3 MV VLC default variant.
+/// Lazy-built prefix-code table for the v3 MV VLC default variant.
 /// 1100 symbols (indices 0..=1099); index 1099 is the ESC sentinel.
+/// Built from `MV_V3_RAW`'s extracted `(bit_length, code)` pairs.
 static MV_V3_TABLE: std::sync::OnceLock<Vec<VlcEntry<u16>>> = std::sync::OnceLock::new();
 
-/// Lazy-built canonical-Huffman table for the v3 MV VLC **alternate**
-/// variant (`mv_table_sel == 1`). Same 1100-symbol shape (ESC at 1099),
-/// built from `MV_V3_ALT_RAW` bit-lengths via the shared canonical
-/// builder (spec/16 §1 / Extractor 07, VMA 0x1c25a0b8).
+/// Lazy-built prefix-code table for the v3 MV VLC **alternate** variant
+/// (`mv_table_sel == 1`). Same 1100-symbol shape (ESC at 1099), built
+/// from `MV_V3_ALT_RAW`'s extracted `(bit_length, code)` pairs via the
+/// shared builder (spec/16 §1 / Extractor 07, VMA 0x1c25a0b8).
 static MV_V3_ALT_TABLE: std::sync::OnceLock<Vec<VlcEntry<u16>>> = std::sync::OnceLock::new();
 
-/// Canonical-Huffman builder shared by both v3 MV VLC variants (same
-/// shape as mcbpcy.rs): sort by `(bit_length, symbol_index)`, assign
-/// `code = 0` for the first symbol, then `code = (code + 1) << (bl_cur -
-/// bl_prev)` for each subsequent. The `raw` slice carries `(bit_length,
-/// code_value)` pairs indexed by symbol; `code_value` is ignored — codes
-/// are reconstructed canonically (the proven default-variant path, which
-/// the explicit DLL-internal `code_value` column does not match because
-/// the loader uses a different reader convention; spec/16 §1).
-fn build_canonical_mv_table(raw: &[(u32, u32)]) -> Vec<VlcEntry<u16>> {
-    let mut symbols: Vec<(u32, u16)> = raw
-        .iter()
+/// VLC-table builder shared by both v3 MV VLC variants. The `raw` slice
+/// carries `(bit_length, code)` pairs indexed by symbol, where `code` is
+/// the **actual DLL wire bit-pattern** (MSB-first) extracted in
+/// Extractor 07 (spec/16 §1). These codes form a complete prefix code
+/// (Kraft = 1.0) but are NOT a textbook-canonical assignment: spec/12 §2
+/// shows the per-slot walker builder is fed the literal `(code, bl)`
+/// records (`emit_walker_entry(this, record.code, record.bl, sym, …)`),
+/// and spec/12 §3 decodes them MSB-first. So the runtime matches against
+/// the extracted `code` directly — the same convention the v1/v2
+/// per-component MV table already uses ([`build_v1v2_table`]).
+fn build_mv_table(raw: &[(u32, u32)]) -> Vec<VlcEntry<u16>> {
+    raw.iter()
         .enumerate()
-        .filter_map(|(idx, &(bl, _code))| {
+        .filter_map(|(idx, &(bl, code))| {
             if bl == 0 {
                 None
             } else {
-                Some((bl, idx as u16))
+                Some(VlcEntry::new(bl as u8, code, idx as u16))
             }
         })
-        .collect();
-    symbols.sort_by_key(|&(bl, idx)| (bl, idx));
-
-    let mut entries: Vec<VlcEntry<u16>> = Vec::with_capacity(symbols.len());
-    let mut code: u32 = 0;
-    let mut prev_bl: u32 = 0;
-    for (i, &(bl, idx)) in symbols.iter().enumerate() {
-        if i == 0 {
-            code = 0;
-        } else {
-            code = (code + 1) << (bl - prev_bl);
-        }
-        entries.push(VlcEntry::new(bl as u8, code, idx));
-        prev_bl = bl;
-    }
-    entries
+        .collect()
 }
 
 fn build_table() -> Vec<VlcEntry<u16>> {
-    build_canonical_mv_table(MV_V3_RAW)
+    build_mv_table(MV_V3_RAW)
 }
 
 fn build_alt_table() -> Vec<VlcEntry<u16>> {
-    build_canonical_mv_table(MV_V3_ALT_RAW)
+    build_mv_table(MV_V3_ALT_RAW)
 }
 
 fn table() -> &'static [VlcEntry<u16>] {
@@ -418,8 +405,8 @@ mod tests {
 
     #[test]
     fn mv_vlc_is_prefix_free() {
-        // Canonical-Huffman: no code is a prefix of another. Cross-
-        // check by sampling: for every pair of entries with distinct
+        // The extracted wire codes form a prefix code: no code is a
+        // prefix of another. For every pair of entries with distinct
         // bit-lengths, the shorter is not a prefix of the longer.
         let t = table();
         for (i, a) in t.iter().enumerate() {
@@ -436,6 +423,64 @@ mod tests {
                     short.value, short.bits, long.value, long.bits,
                 );
             }
+        }
+    }
+
+    /// Replay a textbook-canonical code assignment over the bit-lengths
+    /// (sort by `(bit_length, symbol_index)`, seed code 0, then
+    /// `code = (code + 1) << Δbl`) and return it keyed by symbol.
+    fn canonical_codes(raw: &[(u32, u32)]) -> std::collections::HashMap<u16, u32> {
+        let mut syms: Vec<(u32, u16)> = raw
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &(bl, _))| if bl == 0 { None } else { Some((bl, i as u16)) })
+            .collect();
+        syms.sort_by_key(|&(bl, i)| (bl, i));
+        let mut out = std::collections::HashMap::new();
+        let mut code: u32 = 0;
+        let mut prev_bl: u32 = 0;
+        for (n, &(bl, i)) in syms.iter().enumerate() {
+            if n == 0 {
+                code = 0;
+            } else {
+                code = (code + 1) << (bl - prev_bl);
+            }
+            out.insert(i, code);
+            prev_bl = bl;
+        }
+        out
+    }
+
+    /// Regression pin for spec/16 §1 / spec/12 §2: the runtime tables
+    /// must carry the **actual extracted wire codes** from `MV_V3_RAW` /
+    /// `MV_V3_ALT_RAW`, NOT a textbook-canonical reconstruction. The two
+    /// disagree for nearly every symbol (the binary's per-slot walker
+    /// builder is fed literal `(code, bl)` records), so a regression to
+    /// canonical reconstruction would silently mis-decode almost every
+    /// motion vector. We assert (a) every table code equals its raw code
+    /// and (b) the two assignments genuinely differ for many symbols.
+    #[test]
+    fn mv_tables_use_extracted_codes_not_canonical() {
+        for (raw, tbl) in [(MV_V3_RAW, table()), (MV_V3_ALT_RAW, alt_table())] {
+            // (a) table codes are the extracted raw codes verbatim.
+            for e in tbl {
+                let (bl, code) = raw[e.value as usize];
+                assert_eq!(e.bits as u32, bl, "sym {} bit-length", e.value);
+                assert_eq!(e.code, code, "sym {} must use extracted wire code", e.value);
+            }
+            // (b) the extracted codes differ from canonical for most syms.
+            let canon = canonical_codes(raw);
+            let differ = tbl
+                .iter()
+                .filter(|e| canon.get(&e.value) != Some(&e.code))
+                .count();
+            assert!(
+                differ > tbl.len() / 2,
+                "extracted codes should differ from canonical for the \
+                 majority of symbols (got {differ}/{}); a small count \
+                 suggests a silent regression to canonical reconstruction",
+                tbl.len()
+            );
         }
     }
 
@@ -476,16 +521,16 @@ mod tests {
 
     #[test]
     fn decode_mv_round_trip_single_symbol() {
-        // Pick the first 1-bit symbol in the canonical table. In
-        // canonical Huffman the shortest code is `0` (the builder
-        // seeds `code = 0` for the first symbol). Encode `0` + tail
-        // padding, decode, check MV output.
+        // The default table has exactly one 1-bit symbol (the most-
+        // probable joint symbol). Its code is the actual DLL wire
+        // pattern `1` (spec/16 §1, region_05bfc0_mvvlc) — NOT `0` as a
+        // textbook-canonical assignment would produce. Encode that code
+        // MSB-first + tail padding, decode, check MV output.
         let t = table();
         let one_bit: Vec<_> = t.iter().filter(|e| e.bits == 1).collect();
-        // Per spec/99: exactly one 1-bit code exists (symbol 0).
         assert_eq!(one_bit.len(), 1);
         let e = one_bit[0];
-        assert_eq!(e.code, 0);
+        assert_eq!(e.code, 1, "default 1-bit code is the wire pattern `1`");
         let sym = e.value as usize;
         let expected_raw_x = MVDX_V3_BYTES[sym] as i32;
         let expected_raw_y = MVDY_V3_BYTES[sym] as i32;
@@ -493,8 +538,8 @@ mod tests {
         let exp_x = wrap_component(expected_raw_x - 32);
         let exp_y = wrap_component(expected_raw_y - 32);
 
-        // Byte stream: 1 bit = '0' followed by pad bits = 0x00.
-        let data = [0x00u8, 0x00, 0x00];
+        // Byte stream: 1 bit = '1' (MSB) followed by pad bits = 0x80.
+        let data = [0x80u8, 0x00, 0x00];
         let mut br = BitReader::new(&data);
         let out = decode_mv(&mut br, Mv::default()).unwrap();
         assert_eq!(out.x, exp_x, "x mismatch: raw_x={expected_raw_x}");
@@ -748,13 +793,14 @@ mod tests {
 
     // =================================================================
     // Round 326: alternate-variant VLC source wired end-to-end
-    // (spec/16 §1 / Extractor 07). The alternate MV VLC table now
-    // decodes through the same canonical-Huffman builder as the default.
+    // (spec/16 §1 / Extractor 07). The alternate MV VLC table decodes
+    // through the same builder as the default, using its extracted wire
+    // codes (spec/12 §2) rather than a canonical reconstruction.
     // =================================================================
 
-    /// The alternate MV VLC table builds to a complete 1100-entry
-    /// canonical-Huffman table with the ESC symbol (index 1099) present
-    /// — the same alphabet shape as the default variant.
+    /// The alternate MV VLC table builds to a complete 1100-entry prefix
+    /// code with the ESC symbol (index 1099) present — the same alphabet
+    /// shape as the default variant.
     #[test]
     fn alt_mv_vlc_table_has_1100_entries_with_esc() {
         let t = alt_table();
@@ -765,7 +811,7 @@ mod tests {
         );
     }
 
-    /// The alternate table is prefix-free (canonical-Huffman invariant).
+    /// The alternate table's extracted wire codes are prefix-free.
     #[test]
     fn alt_mv_vlc_is_prefix_free() {
         let t = alt_table();
@@ -787,9 +833,9 @@ mod tests {
     }
 
     /// `decode_mv_with_table(.., MvTable::Alternate)` no longer errors:
-    /// the alternate joint symbol 0 (canonical 2-bit code `00`, alt byte
-    /// LUT index 0 = `0x20` for both components) decodes to MV = (0, 0)
-    /// with a zero predictor.
+    /// the alternate joint symbol 0 (extracted 2-bit wire code `00`, alt
+    /// byte LUT index 0 = `0x20` for both components) decodes to
+    /// MV = (0, 0) with a zero predictor.
     #[test]
     fn decode_mv_alternate_symbol_zero_is_zero() {
         use crate::tables_data::{MVDX_V3_ALT_BYTES, MVDY_V3_ALT_BYTES};
@@ -797,8 +843,8 @@ mod tests {
         assert_eq!(MVDX_V3_ALT_BYTES[0], 32, "alt MVDx idx 0 must be bias 32");
         assert_eq!(MVDY_V3_ALT_BYTES[0], 32, "alt MVDy idx 0 must be bias 32");
 
-        // Alt bit-lengths start at 2 and symbol 0 sorts first, so its
-        // canonical code is `00` (2 bits). Stream: `00` then padding.
+        // Alt symbol 0's extracted wire code is `00` (2 bits, spec/16
+        // §1, region_0594b8_mvvlc). Stream: `00` then padding.
         let data = [0x00u8, 0x00, 0x00];
         let mut br = BitReader::new(&data);
         let out = decode_mv_with_table(&mut br, Mv::default(), MvTable::Alternate).unwrap();
@@ -811,22 +857,23 @@ mod tests {
         assert_eq!(br.bit_position(), 2, "alt sym 0 must consume only 2 bits");
     }
 
-    /// The alternate and default tables are genuinely distinct: decoding
-    /// the same 2-bit `00` prefix yields different consumed lengths /
-    /// symbols because the default's symbol 0 is a 1-bit code. This pins
+    /// The alternate and default tables are genuinely distinct. The
+    /// default's most-probable symbol is the 1-bit wire code `1`; the
+    /// alternate's is the 2-bit wire code `00` (spec/16 §1). Driving the
+    /// `1` prefix (0x80) through the default consumes 1 bit; the `00`
+    /// prefix (0x00) through the alternate consumes 2 bits. This pins
     /// that the dispatch actually selects the alternate table rather
     /// than silently falling back to the default.
     #[test]
     fn alt_and_default_tables_differ_at_dispatch() {
-        // Default symbol 0 is a 1-bit `0`; alternate symbol 0 is 2-bit
-        // `00`. Feeding `00` to each consumes 1 vs 2 bits respectively.
-        let data = [0x00u8, 0x00, 0x00];
-        let mut br_def = BitReader::new(&data);
-        let mut br_alt = BitReader::new(&data);
+        let def_data = [0x80u8, 0x00, 0x00];
+        let alt_data = [0x00u8, 0x00, 0x00];
+        let mut br_def = BitReader::new(&def_data);
+        let mut br_alt = BitReader::new(&alt_data);
         decode_mv_with_table(&mut br_def, Mv::default(), MvTable::Default).unwrap();
         decode_mv_with_table(&mut br_alt, Mv::default(), MvTable::Alternate).unwrap();
-        assert_eq!(br_def.bit_position(), 1, "default sym 0 is 1-bit");
-        assert_eq!(br_alt.bit_position(), 2, "alternate sym 0 is 2-bit");
+        assert_eq!(br_def.bit_position(), 1, "default 1-bit code `1`");
+        assert_eq!(br_alt.bit_position(), 2, "alternate 2-bit code `00`");
     }
 
     // =================================================================
@@ -928,7 +975,8 @@ mod tests {
     /// Sanity check that the new dispatch path doesn't drift.
     #[test]
     fn mv_table_default_matches_decode_mv() {
-        let data = [0x00u8, 0x00, 0x00];
+        // 0x80 = the default 1-bit wire code `1` (spec/16 §1).
+        let data = [0x80u8, 0x00, 0x00];
         let mut br1 = BitReader::new(&data);
         let mut br2 = BitReader::new(&data);
         let a = decode_mv(&mut br1, Mv::default()).unwrap();
