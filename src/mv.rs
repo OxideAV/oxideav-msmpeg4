@@ -46,8 +46,10 @@
 //! Extractor 07 (`docs/video/msmpeg4/spec/16-mv-vlc-dc-mcbpc-extraction.md`
 //! §1, `tables/region_0594b8_mvvlc.csv` — 1100 entries, ESC at index
 //! 1099, Kraft sum = 1.0, bit-lengths 2..15) — superseding the earlier
-//! 256-byte truncation. The bit-lengths drive the same canonical-Huffman
-//! builder as the default variant; the two `(MVDx, MVDy)` byte LUTs at
+//! 256-byte truncation. Both variants decode against their extracted
+//! `(bit_length, code)` wire patterns (spec/16 §1 / spec/12 §2), a
+//! complete prefix code that is NOT a textbook-canonical assignment; the
+//! two `(MVDx, MVDy)` byte LUTs at
 //! `0x1c25c320` / `0x1c25c770` (1104 bytes each, bias-32 residuals) are
 //! exposed as
 //! [`MVDX_V3_ALT_BYTES`](crate::tables_data::MVDX_V3_ALT_BYTES) /
@@ -797,6 +799,69 @@ mod tests {
     // through the same builder as the default, using its extracted wire
     // codes (spec/12 §2) rather than a canonical reconstruction.
     // =================================================================
+
+    /// Full-alphabet round trip: for BOTH variants, stream every non-ESC
+    /// symbol's actual extracted wire code (MSB-first) into the joint-MV
+    /// decoder with a zero predictor and assert it recovers exactly that
+    /// symbol's `(MVDx, MVDy)` byte-LUT residual (after the −32 bias and
+    /// toroidal wrap). This exercises all 1099 payload codes through the
+    /// real bit patterns end-to-end, locking the spec/16 §1 / spec/12 §2
+    /// extracted-code path against any silent regression.
+    #[test]
+    fn decode_mv_v3_round_trip_every_payload_symbol() {
+        use crate::tables_data::{
+            MVDX_V3_ALT_BYTES, MVDX_V3_BYTES, MVDY_V3_ALT_BYTES, MVDY_V3_BYTES,
+        };
+        // (which table, raw (bl,code) pairs, MVDx LUT, MVDy LUT).
+        type Variant = (
+            MvTable,
+            &'static [(u32, u32)],
+            &'static [u8; 1104],
+            &'static [u8; 1104],
+        );
+        let variants: [Variant; 2] = [
+            (MvTable::Default, MV_V3_RAW, MVDX_V3_BYTES, MVDY_V3_BYTES),
+            (
+                MvTable::Alternate,
+                MV_V3_ALT_RAW,
+                MVDX_V3_ALT_BYTES,
+                MVDY_V3_ALT_BYTES,
+            ),
+        ];
+        for (which, raw, lut_x, lut_y) in variants {
+            for idx in 0..MV_V3_ESC_INDEX {
+                let (bl, code) = raw[idx];
+                // Pack `code` in `bl` bits MSB-first, then pad to a byte
+                // boundary plus slack for the BitReader.
+                let mut acc: u64 = code as u64;
+                let mut nbits = bl;
+                let pad = (8 - (nbits % 8)) % 8;
+                acc <<= pad;
+                nbits += pad;
+                let mut bytes: Vec<u8> = Vec::new();
+                while nbits > 0 {
+                    nbits -= 8;
+                    bytes.push(((acc >> nbits) & 0xff) as u8);
+                }
+                bytes.extend_from_slice(&[0u8; 4]);
+
+                let mut br = BitReader::new(&bytes);
+                let out = decode_mv_with_table(&mut br, Mv::default(), which).unwrap();
+                let exp_x = wrap_component(lut_x[idx] as i32 - 32);
+                let exp_y = wrap_component(lut_y[idx] as i32 - 32);
+                assert_eq!(
+                    out,
+                    Mv { x: exp_x, y: exp_y },
+                    "{which:?} sym {idx} (bl={bl}, code={code}) round trip"
+                );
+                assert_eq!(
+                    br.bit_position() as u32,
+                    bl,
+                    "{which:?} sym {idx} must consume exactly {bl} bits"
+                );
+            }
+        }
+    }
 
     /// The alternate MV VLC table builds to a complete 1100-entry prefix
     /// code with the ESC symbol (index 1099) present — the same alphabet
