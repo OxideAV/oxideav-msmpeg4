@@ -46,7 +46,7 @@ pending Auditor item.
 | G0..G5 canonical-Huffman primary AC VLC        | complete   |
 | MS-MPEG4v3 intra 3-tier ESC body               | complete (LMAX/RMAX ground-truth-validated for all 6 G-families) |
 | Inter AC residual (G4 VLC → IDCT → add to MC)  | complete   |
-| P-frame MV VLC + half-pel MC (default + alt)   | complete   |
+| P-frame MV VLC + half-pel MC (default + alt)   | complete (decodes against extracted wire codes, spec/16 §1) |
 | P-frame 1-MV predictor (Figure 7-34)           | complete   |
 | 4-MV-per-MB predictor surface + neighbour resolver | wired (per-block bordering-cell pick) |
 | V3 intra-luma I-frame end-to-end via `decode_picture` | complete |
@@ -60,6 +60,19 @@ pending Auditor item.
 
 ## What's still open for real-content decode
 
+- **V3 joint-MCBPCY wire codes (docs gap)**: round 356 corrected the v3
+  joint-MV VLC to decode against its actual extracted wire codes (spec/16
+  §1 / spec/12 §2 — the per-slot walker builder is fed literal `(code, bl)`
+  records, and the codes are NOT a textbook-canonical assignment). The
+  128-entry joint-MCBPCY table (`region_05eac8`) is still built via
+  canonical reconstruction, and its CSV `code` column is the *old*
+  mis-decoded extraction (32 of 128 entries have `code ≥ 2^bit_length`,
+  i.e. impossible as wire codes). To apply the same correctness fix to
+  MCBPCY, the docs need an Extractor-07-style re-extraction of
+  `region_05eac8` carrying the real MSB-first wire codes (a
+  `region_05eac8_mcbpcy.csv` with the `symbol_index,code_dec,code_bin,
+  bit_length` layout, Kraft 1.0). Until then MCBPCY stays canonical and
+  whether that matches the binary is unverified.
 - **V3 4-MV-per-MB picture decode**: the predictor / neighbour-resolver
   surface is complete and is now exercised end-to-end on the v1 P-frame
   INTER4V path (`spec/16` §3.1). Wiring it into the **v3** picture
