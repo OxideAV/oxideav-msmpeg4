@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Tests
+
+- round 359: add the first picture-level end-to-end pin for the v3
+  P-frame **median-predictor propagation** across a multi-MB row
+  (`picture::tests::pframe_median_predictor_propagates_neighbour_mv`).
+  A 2-MB-wide P-frame decodes MB(0,0) at a non-zero integer-pixel joint-MV
+  symbol (picked at runtime from the extracted `MVDX/MVDY_V3_BYTES` LUTs,
+  spec/16 §1, so the test follows the tables if re-rolled) and MB(1,0) at
+  joint-MV symbol 0 (residual 0); the §7.6.5 single-valid-neighbour
+  rule-3 substitution must promote MB(0,0)'s MV into MB(1,0)'s predictor
+  so MB(1,0) reconstructs at the propagated MV. The assertion compares
+  MB(1,0)'s decoded luma against an independent `apply_mc_to_mb`
+  reconstruction at the propagated MV and guards the inequality against a
+  dropped predictor (which would copy the reference unshifted). All prior
+  v3 P-frame inter tests used MV (0,0) or single MBs, so the non-trivial
+  median predictor was previously unexercised at the picture level.
+
 ### Other
 
 - round 352: scrub external-implementation naming from `src/` doc

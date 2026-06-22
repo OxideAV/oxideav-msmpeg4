@@ -2643,4 +2643,194 @@ mod tests {
         );
         assert_eq!(got, want);
     }
+
+    /// End-to-end pin for the v3 P-frame **median-predictor propagation**
+    /// across a multi-MB row: a left-neighbour inter MB's decoded MV must
+    /// flow into the next MB's §7.6.5 predictor, so a downstream MB whose
+    /// MVD codes to zero residual still reconstructs at the propagated MV.
+    ///
+    /// Layout (32x16 = 2 MBs wide, 1 MB tall, no skip, both inter, CBP=0):
+    /// - **MB(0,0)** decodes joint-MV symbol 363, whose extracted
+    ///   `(MVDx, MVDy)` byte-LUT pair (read here from
+    ///   [`crate::tables_data::MVDX_V3_BYTES`] /
+    ///   [`crate::tables_data::MVDY_V3_BYTES`] at runtime — not hardcoded)
+    ///   is `(24, 24)`. With predictor `(0, 0)` and the `-32` bias
+    ///   (spec/06 §3.5) the final half-pel MV is `(-8, -8)` — an even
+    ///   pair, hence a pure integer shift of `(-4, -4)` luma samples with
+    ///   no half-pel interpolation.
+    /// - **MB(1,0)** decodes joint-MV symbol 0 (LUT byte `32` each
+    ///   component → residual `0`). Its §7.6.5 candidate set is
+    ///   `{left = MB(0,0).mv, above = Absent, above_right = Absent}`; the
+    ///   single-valid-neighbour rule-3 substitution
+    ///   ([`crate::mv_pred::apply_validity_rules`]) promotes `left` to all
+    ///   three slots, so the predictor is `(-8, -8)` and the final MV is
+    ///   `(-8, -8) + (0, 0) = (-8, -8)`.
+    ///
+    /// The assertion compares MB(1,0)'s decoded luma against an
+    /// independent `apply_mc_to_mb` reconstruction at the propagated MV
+    /// AND asserts it is *not* a zero-MV copy. A regression that dropped
+    /// the median predictor (decoding MB(1,0) at MV `(0, 0)`) would leave
+    /// MB(1,0) as an identity copy and fail the inequality check. This is
+    /// the first picture-level test exercising a non-trivial median
+    /// predictor end-to-end against the extracted joint-MV wire codes
+    /// (prior P-frame inter tests all used MV `(0, 0)` or single MBs).
+    #[test]
+    fn pframe_median_predictor_propagates_neighbour_mv() {
+        use oxideav_core::bits::BitReader;
+
+        fn pack(fields: &[(u32, u32)]) -> Vec<u8> {
+            let mut out: Vec<u8> = Vec::new();
+            let mut acc: u64 = 0;
+            let mut bits: u32 = 0;
+            for (v, w) in fields {
+                let mask = if *w == 32 { u32::MAX } else { (1u32 << w) - 1 };
+                acc = (acc << w) | ((*v & mask) as u64);
+                bits += w;
+                while bits >= 8 {
+                    let shift = bits - 8;
+                    out.push(((acc >> shift) & 0xff) as u8);
+                    acc &= (1u64 << shift) - 1;
+                    bits -= 8;
+                }
+            }
+            if bits > 0 {
+                out.push(((acc << (8 - bits)) & 0xff) as u8);
+            }
+            out
+        }
+
+        // Canonical MCBPCY code for symbol 0 (inter, CBP=0), mirroring the
+        // build in `mcbpcy.rs` (and the other P-frame inter tests above).
+        let (bl_mcbpcy0, code_mcbpcy0) = {
+            let mut syms: Vec<(u32, u8)> = crate::tables_data::MCBPCY_V3_RAW
+                .iter()
+                .enumerate()
+                .filter_map(|(i, &(bl, _))| if bl == 0 { None } else { Some((bl, i as u8)) })
+                .collect();
+            syms.sort_by_key(|&(bl, idx)| (bl, idx));
+            let mut code: u32 = 0;
+            let mut prev_bl: u32 = 0;
+            let mut found = None;
+            for (i, &(bl, idx)) in syms.iter().enumerate() {
+                if i == 0 {
+                    code = 0;
+                } else {
+                    code = (code + 1) << (bl - prev_bl);
+                }
+                if idx == 0 {
+                    found = Some((bl, code));
+                }
+                prev_bl = bl;
+            }
+            found.expect("symbol 0 in canonical MCBPCY")
+        };
+
+        // Joint-MV wire codes are the extracted `(bit_length, code)` pairs
+        // (spec/16 §1), read straight from MV_V3_RAW. Pick the first
+        // non-ESC symbol whose extracted `(MVDx, MVDy)` byte-LUT pair, after
+        // the `-32` bias (spec/06 §3.5), yields a non-zero **even**
+        // (integer-pixel) MV with a magnitude small enough to stay inside
+        // the 16-sample-high frame after MC — no hardcoded symbol index,
+        // so the test follows the extracted tables if they are re-rolled.
+        let sym_nonzero = (1..crate::tables_data::MV_V3_ESC_INDEX)
+            .find(|&i| {
+                let rx = crate::tables_data::MVDX_V3_BYTES[i] as i32 - 32;
+                let ry = crate::tables_data::MVDY_V3_BYTES[i] as i32 - 32;
+                rx != 0 && ry != 0 && rx % 2 == 0 && ry % 2 == 0 && rx.abs() <= 8 && ry.abs() <= 8
+            })
+            .expect("an integer-pixel joint-MV symbol must exist in the extracted LUT");
+        let (mv_nz_bl, mv_nz_code) = crate::tables_data::MV_V3_RAW[sym_nonzero];
+        let (mv0_bl, mv0_code) = crate::tables_data::MV_V3_RAW[0];
+
+        // Reconstruct the expected MB(0,0)/MB(1,0) MV from the LUT bytes
+        // (no hardcoded magic numbers): raw - 32 bias, predictor (0,0).
+        let raw_x = crate::tables_data::MVDX_V3_BYTES[sym_nonzero] as i32;
+        let raw_y = crate::tables_data::MVDY_V3_BYTES[sym_nonzero] as i32;
+        let exp_mv_half = (raw_x - 32, raw_y - 32);
+        // Sanity: must be a non-zero, even (integer-pixel) shift so the
+        // test's MC reconstruction is exact and the inequality is real.
+        assert!(
+            exp_mv_half.0 != 0 && exp_mv_half.1 != 0,
+            "test symbol must give a non-zero MV; got {exp_mv_half:?}"
+        );
+        assert!(
+            exp_mv_half.0 % 2 == 0 && exp_mv_half.1 % 2 == 0,
+            "test symbol must give an even (integer-pixel) shift; got {exp_mv_half:?}"
+        );
+
+        let dims = PictureDims::new(32, 16).unwrap();
+        let mut reference = Picture::alloc(dims, PictureType::I);
+        for (i, px) in reference.y.iter_mut().enumerate() {
+            *px = (i % 251) as u8;
+        }
+        for (i, px) in reference.cb.iter_mut().enumerate() {
+            *px = (i % 199) as u8;
+        }
+        for (i, px) in reference.cr.iter_mut().enumerate() {
+            *px = (i % 197) as u8;
+        }
+
+        let mut fields: Vec<(u32, u32)> = vec![
+            (1, 2), // P
+            (8, 5), // quant
+            (0, 1), // ac_chroma_sel
+            (0, 1), // dc_size_sel
+            (0, 1), // mv_table_sel = 0 (default)
+        ];
+        // MB(0,0): inter, CBP=0, integer-pixel MV symbol (predictor (0,0)).
+        fields.push((0, 1)); // skip = 0
+        fields.push((code_mcbpcy0, bl_mcbpcy0));
+        fields.push((0, 1)); // ac_pred (ignored for inter)
+        fields.push((mv_nz_code, mv_nz_bl));
+        // MB(1,0): inter, CBP=0, MV symbol 0 (residual 0 → final = predictor).
+        fields.push((0, 1)); // skip = 0
+        fields.push((code_mcbpcy0, bl_mcbpcy0));
+        fields.push((0, 1)); // ac_pred (ignored for inter)
+        fields.push((mv0_code, mv0_bl));
+        fields.push((0, 16)); // trailing padding
+
+        let bytes = pack(&fields);
+        let mut br = BitReader::new(&bytes);
+        let pic = decode_picture(&mut br, dims, Some(&reference))
+            .expect("2-MB P-frame with propagated median predictor must decode");
+
+        // Independent reference: a picture in which MB(1,0) is
+        // motion-compensated at the *propagated* MV. If the predictor
+        // works, the decoder's MB(1,0) luma equals this.
+        let mut expected = Picture::alloc(dims, PictureType::P);
+        apply_mc_to_mb(&mut expected, &reference, 1, 0, exp_mv_half);
+
+        // And a zero-MV copy of MB(1,0) — what a broken (dropped) predictor
+        // would produce. The two must differ, else the inequality below is
+        // vacuous (it isn't: the reference pattern varies across the shift).
+        let mut zero_mv = Picture::alloc(dims, PictureType::P);
+        apply_mc_to_mb(&mut zero_mv, &reference, 1, 0, (0, 0));
+
+        // Compare MB(1,0)'s 16x16 luma block: columns 16..32, rows 0..16.
+        let stride = pic.y_stride;
+        let mut matches_propagated = true;
+        let mut differs_from_zero = false;
+        for row in 0..16 {
+            for col in 16..32 {
+                let idx = row * stride + col;
+                if pic.y[idx] != expected.y[idx] {
+                    matches_propagated = false;
+                }
+                if expected.y[idx] != zero_mv.y[idx] {
+                    differs_from_zero = true;
+                }
+            }
+        }
+        assert!(
+            differs_from_zero,
+            "test setup invalid: propagated-MV and zero-MV reconstructions \
+             are identical, so the inequality would be vacuous",
+        );
+        assert!(
+            matches_propagated,
+            "MB(1,0) must reconstruct at the propagated median MV \
+             {exp_mv_half:?}; a dropped predictor would copy the reference \
+             unshifted instead",
+        );
+    }
 }
