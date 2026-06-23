@@ -40,7 +40,7 @@ pending Auditor item.
 | Quantiser dequantisation + DC scalers          | complete   |
 | CBPY + DC-size VLCs                             | complete   |
 | Intra MB header + DC differential decode       | complete   |
-| Joint MCBPCY VLC (v3, 128-entry canonical)     | complete   |
+| Joint MCBPCY VLC (v3, 128-entry canonical)     | complete (intra/inter partition corrected to patent polarity 0..63=intra, round 362) |
 | DC spatial predictor + AC scan dispatcher      | complete   |
 | Intra MB pipeline (DC pred + IDCT + store)     | complete   |
 | G0..G5 canonical-Huffman primary AC VLC        | complete   |

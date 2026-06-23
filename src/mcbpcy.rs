@@ -86,12 +86,23 @@ fn table() -> &'static [VlcEntry<u8>] {
 pub struct McbpcyDecode {
     /// Raw joint symbol index 0..127.
     pub idx: u8,
-    /// True if this MB is intra-coded (spec/05 §3.2 step 3: `test bl,
-    /// 0x40`). Empirically, the partition test is "is bit 6 of the
-    /// decoded idx set" — high-half of the 128-alphabet. spec/99 §3.1's
-    /// wording on which half is I vs P is ambiguous; the binary uses
-    /// `test bl,0x40` followed by "MB-type = 3 (intra-in-P)" on the
-    /// set-branch, so high half = intra.
+    /// True if this MB is intra-coded. The 128-entry joint-MCBPCY
+    /// alphabet is partitioned at 64: **indices 0..63 are I-type
+    /// (intra) MBs, 64..127 are P-type (inter) MBs** — established by
+    /// patent US 6,563,953 Table 1 (`audit/02` §1.4, read directly from
+    /// the patent: "indices 0..63 are MB type = I; 64..127 are MB type
+    /// = P") and corroborated by the table's own `(128, 64)`
+    /// partition-boundary header (`audit/02` §4) baked into
+    /// `MCBPCY_V3_PARTITION`. So `is_intra` is the **low** half
+    /// (`idx < 64`).
+    ///
+    /// This also matches the binary's `test bl,0x40; je 0x1c2178bd`
+    /// (spec/05 §3.2): `je` is taken when `test` yields zero, i.e. when
+    /// bit 6 is **clear** (`idx < 64`), and the jump target `1c2178bd`
+    /// is the branch that sets `MB-type = 3` (intra-in-P). The earlier
+    /// reading of this slot as "high half = intra" inverted the `je`
+    /// polarity (jump-on-zero) and pre-dated the `audit/02` patent
+    /// extraction that resolved the spec/99 §3.1 ambiguity.
     pub is_intra: bool,
     /// 4-bit mask: bit `i` = 1 if luma block `i` has coded AC. Bits are
     /// stored with block 0 at MSB (bit 3), block 3 at LSB (bit 0).
@@ -106,10 +117,12 @@ pub struct McbpcyDecode {
 /// 128-entry canonical-Huffman table, and split the resulting index
 /// into the (MB-type, 6-bit CBP) components.
 ///
-/// Per `docs/video/msmpeg4/spec/05-ab0-resolution.md` §3.2 step 3-4:
-/// `test bl, 0x40` separates the "all-zero-block / no-skip" prefix
-/// from the main payload; `je 0x1c2178bd` then sets `MB-type = 3`
-/// (intra-in-P) on the SET path.
+/// Per `docs/video/msmpeg4/spec/05-ab0-resolution.md` §3.2 and patent
+/// US 6,563,953 Table 1 (`audit/02` §1.4): the alphabet is partitioned
+/// at 64 — indices 0..63 are I-type (intra) MBs, 64..127 are P-type
+/// (inter). The binary's `test bl, 0x40; je 0x1c2178bd` jumps to the
+/// intra (`MB-type = 3`) branch when bit 6 is **clear** (`idx < 64`),
+/// so `is_intra = idx < MCBPCY_V3_PARTITION`.
 ///
 /// The 6-bit CBP encoding: bit 5 = Y0, bit 4 = Y1, bit 3 = Y2,
 /// bit 2 = Y3, bit 1 = Cb, bit 0 = Cr. (Bits assigned MSB-first in the
@@ -121,8 +134,9 @@ pub fn decode_mcbpcy(br: &mut BitReader<'_>) -> Result<McbpcyDecode> {
             "msmpeg4v3 mcbpcy: decoded index {idx} >= alphabet 128"
         )));
     }
-    // Partition test: bit 6 of idx == (idx >= MCBPCY_V3_PARTITION).
-    let is_intra = (idx as usize) >= MCBPCY_V3_PARTITION;
+    // Partition test: indices 0..63 (bit 6 clear) are I-type / intra;
+    // 64..127 are P-type / inter (patent Table 1, audit/02 §1.4).
+    let is_intra = (idx as usize) < MCBPCY_V3_PARTITION;
     let pattern = idx & 0x3f; // low 6 bits = CBP
     let cbpy = (pattern >> 2) & 0xf;
     let cbp_cb = (pattern & 0b10) != 0;
@@ -533,6 +547,56 @@ mod tests {
         assert_eq!(cbpy, 0b1011);
         assert_eq!(pattern & 0b10, 0); // Cb = 0
         assert_ne!(pattern & 0b01, 0); // Cr = 1
+    }
+
+    #[test]
+    fn v3_mcbpcy_partition_low_half_is_intra() {
+        // Patent US 6,563,953 Table 1 (audit/02 §1.4): joint-MCBPCY
+        // indices 0..63 are MB type = I (intra), 64..127 are MB type = P
+        // (inter). Decode every symbol via the canonical round-trip and
+        // assert `is_intra` is exactly the low-half membership. This pins
+        // the partition polarity so a future regression cannot silently
+        // re-invert it (the pre-correction code had `is_intra = idx >=
+        // 64`, the inverse, mis-classifying every coded v3 P-frame MB).
+        assert_eq!(MCBPCY_V3_PARTITION, 64);
+        let t = table();
+        // Track that both halves are actually exercised.
+        let mut saw_intra = false;
+        let mut saw_inter = false;
+        for e in t {
+            // Same byte-packing as `canonical_round_trip_per_symbol`.
+            let mut acc: u64 = 0;
+            let mut bits: u32 = 0;
+            acc = (acc << e.bits) | (e.code as u64);
+            bits += e.bits as u32;
+            let mut out = Vec::new();
+            while bits >= 8 {
+                let shift = bits - 8;
+                out.push(((acc >> shift) & 0xff) as u8);
+                acc &= (1u64 << shift) - 1;
+                bits -= 8;
+            }
+            if bits > 0 {
+                out.push(((acc << (8 - bits)) & 0xff) as u8);
+            }
+            out.extend_from_slice(&[0u8; 8]);
+            let mut br = BitReader::new(&out);
+            let dec = decode_mcbpcy(&mut br).expect("symbol decodes");
+            assert_eq!(
+                dec.is_intra,
+                (dec.idx as usize) < MCBPCY_V3_PARTITION,
+                "idx {} is_intra polarity must match the patent low-half \
+                 (0..63 = intra)",
+                dec.idx,
+            );
+            if dec.is_intra {
+                saw_intra = true;
+            } else {
+                saw_inter = true;
+            }
+        }
+        assert!(saw_intra, "no intra (low-half) symbol exercised");
+        assert!(saw_inter, "no inter (high-half) symbol exercised");
     }
 
     fn pack(fields: &[(u32, u32)]) -> Vec<u8> {

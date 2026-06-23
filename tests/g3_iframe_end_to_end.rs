@@ -136,10 +136,12 @@ fn build_g3_coded_iframe() -> Vec<u8> {
     ];
 
     // --- Macroblock header (spec/05 §3.2): joint-MCBPCY + ac_pred bit ---
-    // Choose an intra symbol (idx >= partition 64) whose low-6 CBP
-    // pattern codes luma block 0 only: cbpy bit 3 set ⇒ cbpy = 0b1000 = 8
-    // ⇒ pattern = 8 << 2 = 0b100000 = 32. So idx = 64 + 32 = 96.
-    let mcbpcy_idx = (MCBPCY_V3_PARTITION as u8) + 32;
+    // Choose an intra symbol (idx < partition 64 — patent Table 1 I-type
+    // half, audit/02 §1.4) whose low-6 CBP pattern codes luma block 0
+    // only: cbpy bit 3 set ⇒ cbpy = 0b1000 = 8 ⇒ pattern = 8 << 2 =
+    // 0b100000 = 32. So idx = 32 (already in the intra/low half).
+    let mcbpcy_idx = 32u8;
+    debug_assert!((mcbpcy_idx as usize) < MCBPCY_V3_PARTITION);
     let (mc_code, mc_bl) = mcbpcy_code_for(mcbpcy_idx);
     fields.push((mc_code, mc_bl));
     fields.push((0, 1)); // ac_pred = 0 → zigzag scan, no AC prediction

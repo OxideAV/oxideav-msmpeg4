@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- round 362: **correct the v3 joint-MCBPCY intra/inter partition
+  polarity.** The 128-entry joint-MCBPCY alphabet partitions at 64:
+  indices 0..63 are I-type (intra) MBs and 64..127 are P-type (inter) —
+  established by patent US 6,563,953 Table 1 (`audit/02` §1.4, "indices
+  0..63 are MB type = I; 64..127 are MB type = P") and corroborated by
+  the table's own `(128, 64)` partition-boundary header. The decoder had
+  `is_intra = (idx >= 64)`, the **inverse**, which mis-classified every
+  coded v3 P-frame macroblock (P-type/inter entries were routed to the
+  intra-in-P pipeline and I-type/intra entries to the inter MV/MC path).
+  The earlier reading mis-resolved the binary's `test bl,0x40; je
+  0x1c2178bd` (spec/05 §3.2): `je` is jump-on-zero, so the
+  `MB-type = 3` (intra-in-P) target is reached when bit 6 is **clear**
+  (`idx < 64`), not set — and it pre-dated the `audit/02` patent
+  extraction that resolved the spec/99 §3.1 ambiguity. The I-frame path
+  is unaffected (it treats every MB as intra and consumes only the
+  low-6-bit CBP). A new `mcbpcy::tests::v3_mcbpcy_partition_low_half_is_intra`
+  unit test decodes all 128 symbols and pins `is_intra == (idx < 64)`,
+  exercising both halves, so a future regression cannot silently
+  re-invert it. The hand-crafted v3 P-frame inter tests were updated to
+  craft inter MBs at idx 64..127 (e.g. idx 64 for CBP=0) instead of the
+  previously-used low-half indices.
+
 ### Tests
 
 - round 362: add a **discriminating** end-to-end pin for the alternate
