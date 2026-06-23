@@ -237,17 +237,15 @@ pub fn decode_picture_with_ac(
                      to feed packets in decode order starting with an I-frame.",
                 )
             })?;
-            // Round 32 piece 3: per-frame `mv_table_sel` bit is now
-            // threaded through `decode_pframe` → `decode_pframe_mb`
-            // → `decode_mv_with_table`. The alternate variant (sel=1)
-            // is still a placeholder (extraction blocker — see
-            // [`crate::mv::MvTable::Alternate`] doc), but the
-            // unsupported error now fires from the MV decode site
-            // with full diagnostic instead of the early picture-
-            // header reject. This makes the failure observable per
-            // P-frame instead of per-packet, and lets all the
-            // mv_table_sel=0 P-frames between two sel=1 ones still
-            // decode normally.
+            // The per-frame `mv_table_sel` bit is threaded through
+            // `decode_pframe` → `decode_pframe_mb` →
+            // `decode_mv_with_table`. Both variants now decode
+            // end-to-end: the alternate (sel=1) joint-MV VLC source +
+            // its byte LUTs were fully extracted in Extractor 07
+            // (spec/16 §1; see [`crate::mv::MvTable::Alternate`]), and
+            // the picture decoder selects the alternate table + byte LUT
+            // when the header bit is set (pinned by
+            // `pframe_alternate_mv_table_selects_alternate_byte_lut`).
             decode_pframe(br, dims, &hdr, reference, ac_selection)
         }
     }
@@ -373,18 +371,21 @@ fn decode_iframe(
 /// MVs, and copy a 16×16 luma + two 8×8 chroma blocks from the
 /// reference at the resulting half-pel position (bilinear-averaged).
 /// Intra-in-P MBs are decoded via the same I-frame pipeline (spatial
-/// DC prediction + AC walk / placeholder).
+/// DC prediction + the per-frame-selected intra G-family AC walk).
 ///
-/// Because the intra AC VLC is still a placeholder (spec/99 §9 OPEN),
-/// intra-in-P blocks are reconstructed DC-only when their CBP bit is
-/// set — same behaviour as in I-frames.
+/// The intra AC VLC is no longer a placeholder: as of round 234 all six
+/// G-families (G0..G5) carry their real packed-Huffman primary VLC
+/// (spec/11 §5), and the intra-in-P path routes its luma / chroma blocks
+/// through the same [`AcSelection::FromHeader`] dispatch as I-frames
+/// (`luma_ac` / `chroma_ac` below), so a CBP-coded intra-in-P block
+/// decodes its AC coefficients end-to-end rather than reconstructing
+/// DC-only.
 ///
-/// The *inter* AC residual now decodes through the G4 inter VLC
+/// The *inter* AC residual decodes through the G4 inter VLC
 /// ([`AcVlcTable::g4_inter`], whose packed-Huffman primary VLC is fully
 /// extracted): each inter MB lays down its MC prediction and then adds
 /// the per-block IDCT residual for every CBP-coded block (spec/04 §1 /
-/// §2.6). Intra-in-P AC remains placeholder/DC-only where the intra
-/// G-table VLC has not been extracted (spec/99 §9 OPEN).
+/// §2.6).
 fn decode_pframe(
     br: &mut BitReader<'_>,
     dims: PictureDims,
@@ -2093,6 +2094,194 @@ mod tests {
         assert_eq!(pic.y, reference.y, "alt-MV (0,0) luma must copy reference");
         assert_eq!(pic.cb, reference.cb, "alt-MV (0,0) Cb must copy reference");
         assert_eq!(pic.cr, reference.cr, "alt-MV (0,0) Cr must copy reference");
+    }
+
+    /// Round 362: prove the **alternate** joint-MV VLC table is genuinely
+    /// consulted end-to-end (not silently falling through to the default
+    /// table). The previous `pframe_alternate_mv_table_inter_mb_decodes`
+    /// test used joint symbol 0 → MV (0, 0), which is identical in both
+    /// the default and alternate byte LUTs, so it could not distinguish a
+    /// correct alt-table dispatch from an accidental default-table decode.
+    ///
+    /// This test feeds the **9-bit wire pattern `010011111`** as the
+    /// joint-MV code:
+    ///   * Decoded against the **alternate** VLC (`region_0594b8_mvvlc`,
+    ///     spec/16 §1) it is symbol 36, whose alternate byte-LUT entry
+    ///     (`region_05b720`/`region_05bb70`, VMAs 0x1c25c320/0x1c25c770)
+    ///     is `(0x24, 0x20)` → after the −32 bias → MV `(+4, 0)` half-pel
+    ///     = an **integer +2-pixel** horizontal shift (frac = 0, pure
+    ///     copy, no half-pel interpolation).
+    ///   * Decoded against the **default** VLC the same 9 bits are also
+    ///     symbol 36, but the *default* byte-LUT maps it to `(-2, -2)`
+    ///     half-pel = a (−1, −1) integer-pixel shift — a visibly different
+    ///     translation.
+    ///
+    /// So asserting the decoded luma equals the reference translated by
+    /// exactly `(+2, 0)` integer pixels (edge-clamped) pins that the
+    /// alternate table + alternate byte-LUT pair drove the MC, and the
+    /// companion `mv_table_sel = 0` decode of the identical payload bits
+    /// must produce a *different* picture.
+    #[test]
+    fn pframe_alternate_mv_table_selects_alternate_byte_lut() {
+        use oxideav_core::bits::BitReader;
+
+        fn pack(fields: &[(u32, u32)]) -> Vec<u8> {
+            let mut out: Vec<u8> = Vec::new();
+            let mut acc: u64 = 0;
+            let mut bits: u32 = 0;
+            for (v, w) in fields {
+                let mask = if *w == 32 { u32::MAX } else { (1u32 << w) - 1 };
+                acc = (acc << w) | ((*v & mask) as u64);
+                bits += w;
+                while bits >= 8 {
+                    let shift = bits - 8;
+                    out.push(((acc >> shift) & 0xff) as u8);
+                    acc &= (1u64 << shift) - 1;
+                    bits -= 8;
+                }
+            }
+            if bits > 0 {
+                out.push(((acc << (8 - bits)) & 0xff) as u8);
+            }
+            out
+        }
+
+        // Canonical MCBPCY symbol-0 (inter, CBP = 0) build — same helper
+        // shape as the surrounding hand-crafted tests.
+        let t_mcbpcy = {
+            let mut syms: Vec<(u32, u8)> = crate::tables_data::MCBPCY_V3_RAW
+                .iter()
+                .enumerate()
+                .filter_map(|(i, &(bl, _))| if bl == 0 { None } else { Some((bl, i as u8)) })
+                .collect();
+            syms.sort_by_key(|&(bl, idx)| (bl, idx));
+            let mut entries: Vec<(u8, u32, u8)> = Vec::new();
+            let mut code: u32 = 0;
+            let mut prev_bl: u32 = 0;
+            for (i, &(bl, idx)) in syms.iter().enumerate() {
+                if i == 0 {
+                    code = 0;
+                } else {
+                    code = (code + 1) << (bl - prev_bl);
+                }
+                entries.push((bl as u8, code, idx));
+                prev_bl = bl;
+            }
+            entries
+        };
+        let (bl_sym0, code_sym0) = t_mcbpcy
+            .iter()
+            .find(|(_, _, sym)| *sym == 0)
+            .map(|(bl, code, _)| (*bl as u32, *code))
+            .expect("symbol 0 in canonical MCBPCY");
+
+        // The alternate VLC must really map this wire pattern to symbol 36
+        // and the alternate byte LUTs must give the (+4, 0) half-pel MV.
+        // Assert these provenance facts directly off the build-time
+        // tables so the test fails loudly if a future re-extraction
+        // shifts the alphabet rather than silently passing on a wrong
+        // assumption.
+        const ALT_MV_CODE: u32 = 0b010011111;
+        const ALT_MV_BL: u32 = 9;
+        const ALT_SYM: usize = 36;
+        assert_eq!(
+            crate::tables_data::MV_V3_ALT_RAW[ALT_SYM],
+            (ALT_MV_BL, ALT_MV_CODE),
+            "alt VLC symbol 36 wire code drifted from spec/16 §1 extraction",
+        );
+        assert_eq!(
+            (
+                crate::tables_data::MVDX_V3_ALT_BYTES[ALT_SYM] as i32 - 32,
+                crate::tables_data::MVDY_V3_ALT_BYTES[ALT_SYM] as i32 - 32,
+            ),
+            (4, 0),
+            "alt byte-LUT entry 36 must decode to (+4, 0) half-pel",
+        );
+        assert_ne!(
+            (
+                crate::tables_data::MVDX_V3_BYTES[ALT_SYM] as i32 - 32,
+                crate::tables_data::MVDY_V3_BYTES[ALT_SYM] as i32 - 32,
+            ),
+            (4, 0),
+            "default byte-LUT entry 36 must differ — otherwise this test \
+             cannot distinguish the tables",
+        );
+
+        let dims = PictureDims::new(16, 16).unwrap();
+        let mut reference = Picture::alloc(dims, PictureType::I);
+        for (i, px) in reference.y.iter_mut().enumerate() {
+            *px = (i % 251) as u8;
+        }
+        for (i, px) in reference.cb.iter_mut().enumerate() {
+            *px = (i % 199) as u8;
+        }
+        for (i, px) in reference.cr.iter_mut().enumerate() {
+            *px = (i % 197) as u8;
+        }
+
+        // Common payload after the picture header: skip=0, MCBPCY sym 0
+        // (inter, CBP=0), ac_pred bit, the 9-bit alt MV code, padding.
+        let payload: Vec<(u32, u32)> = vec![
+            (0, 1),               // skip = 0
+            (code_sym0, bl_sym0), // MCBPCY sym 0 (inter, CBP = 0)
+            (0, 1),               // ac_pred (ignored for inter)
+            (ALT_MV_CODE, ALT_MV_BL),
+            (0, 16), // trailing padding
+        ];
+
+        let header = |mv_table_sel: u32| -> Vec<(u32, u32)> {
+            vec![
+                (1, 2),            // P
+                (8, 5),            // quant
+                (0, 1),            // ac_chroma_sel
+                (0, 1),            // dc_size_sel
+                (mv_table_sel, 1), // mv_table_sel
+            ]
+        };
+
+        let mut alt_fields = header(1);
+        alt_fields.extend_from_slice(&payload);
+        let alt_bytes = pack(&alt_fields);
+        let mut br = BitReader::new(&alt_bytes);
+        let alt_pic =
+            decode_picture(&mut br, dims, Some(&reference)).expect("alt-table P-frame must decode");
+
+        // Expected luma: MB (0,0) translated by integer (+2, 0) pixels
+        // (mv_x_half = 4 → int_x = 2, frac = 0 → pure edge-clamped copy).
+        let w = dims.width as i32;
+        let h = dims.height as i32;
+        let stride = alt_pic.y_stride;
+        let sample = |x: i32, y: i32| -> u8 {
+            let x = x.clamp(0, w - 1) as usize;
+            let y = y.clamp(0, h - 1) as usize;
+            reference.y[y * stride + x]
+        };
+        for j in 0..16i32 {
+            for i in 0..16i32 {
+                let expected = sample(i + 2, j);
+                let got = alt_pic.y[(j as usize) * stride + i as usize];
+                assert_eq!(
+                    got, expected,
+                    "alt-MV (+4,0) luma at ({i},{j}) must be reference \
+                     sampled at (+2, 0) integer-pel",
+                );
+            }
+        }
+
+        // The identical payload decoded with mv_table_sel = 0 must produce
+        // a different picture — proving the selector actually routes to a
+        // distinct table rather than both paths collapsing to one.
+        let mut def_fields = header(0);
+        def_fields.extend_from_slice(&payload);
+        let def_bytes = pack(&def_fields);
+        let mut br_def = BitReader::new(&def_bytes);
+        let def_pic = decode_picture(&mut br_def, dims, Some(&reference))
+            .expect("default-table P-frame must decode");
+        assert_ne!(
+            alt_pic.y, def_pic.y,
+            "alternate vs default MV table must yield different luma for \
+             the same payload bits (alt MV (+4,0) vs default MV (-2,-2))",
+        );
     }
 
     /// Hand-crafted P-frame with a single non-skipped inter MB that

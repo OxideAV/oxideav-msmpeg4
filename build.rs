@@ -138,12 +138,12 @@ fn main() {
 
     // MVDx / MVDy byte LUTs alternate variant — 05b720 + 05bb70 (VMAs
     // 0x1c25c320 / 0x1c25c770 per spec/06 §2.2). These pair with the
-    // alternate joint MV VLC source at file 0x594b8 / VMA 0x1c25a0b8.
-    // The alternate VLC source extraction itself is still a 256-byte
-    // truncation of the spec/11 §5 documented 8804-byte region — this
-    // round emits only the two pre-extracted byte LUTs so the dispatch
-    // wiring is one step closer to full alt support when the VLC source
-    // is re-extracted (see [`crate::mv::MvTable::Alternate`] doc).
+    // alternate joint MV VLC source at file 0x594b8 / VMA 0x1c25a0b8,
+    // which was re-extracted to its full 8804-byte / 1100-entry form
+    // (Kraft = 1.0, ESC at 1099) in Extractor 07 (spec/16 §1) — see the
+    // `region_0594b8_mvvlc.csv` emit below. Together they make the
+    // alternate `mv_table_sel == 1` path decode end-to-end (see
+    // [`crate::mv::MvTable::Alternate`] doc).
     let mvdx_alt_hex = tables_dir.join("region_05b720.hex");
     let mvdy_alt_hex = tables_dir.join("region_05bb70.hex");
     println!("cargo:rerun-if-changed={}", mvdx_alt_hex.display());
@@ -1231,11 +1231,10 @@ fn emit_mv_byte_lut_v3_alt(mvdx_path: &Path, mvdy_path: &Path, out_path: &Path) 
          aedb4cf3d33c8554ab8acf04afe2d936eaa7c49107c5fefe163bca2e94b3c099\n\
          // Role: v3 MVDx / MVDy byte LUTs alternate variant (VMAs\n\
          // 0x1c25c320, 0x1c25c770 per spec/06 §2.2). Paired with the\n\
-         // alternate VLC source at VMA 0x1c25a0b8 (file 0x594b8) which\n\
-         // remains a 256-byte truncation of the 8804-byte spec/11 §5\n\
-         // region — these byte LUTs are landed in advance so the alt\n\
-         // path becomes a single-emitter swap once the VLC source is\n\
-         // re-extracted.\n\
+         // alternate joint-MV VLC source at VMA 0x1c25a0b8 (file\n\
+         // 0x594b8), re-extracted to its full 8804-byte / 1100-entry\n\
+         // form in Extractor 07 (spec/16 §1); together they drive the\n\
+         // alternate mv_table_sel == 1 MC path end-to-end.\n\
          \n\
          pub static MVDX_V3_ALT_BYTES: &[u8; 1104] = &["
     )
