@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.9](https://github.com/OxideAV/oxideav-msmpeg4/compare/v0.0.8...v0.0.9) - 2026-06-23
+
+### Other
+
+- correct v3 joint-MCBPCY intra/inter partition polarity (round 362)
+- CHANGELOG + README for round 362 alt-MV byte-LUT pin
+- pin alternate joint-MV VLC byte-LUT selection end-to-end (round 362)
+- pin v3 P-frame median-predictor propagation end-to-end (round 359)
+- README — record round 356 MV wire-code correction + MCBPCY docs gap
+- full-alphabet round-trip pin for v3 joint-MV extracted codes
+- decode v3 joint-MV VLC against extracted wire codes, not canonical
+- rename ffmpeg_roundtrip.rs -> reference_roundtrip.rs (neutral filename; black-box validator invocation unchanged)
+- README — record v1 MB-type table grounding + precise v3 4-MV docs gap
+- scrub external-decoder naming from src/ doc comments
+- ground v1 P-frame MB-type decode in extracted region_053140_mbtype (spec/16 §3)
+- cross-check v1/v2 DC-size tables against spec/16 §2 + unit-test the size+value decode
+- unblock v1/v2 intra pixel pipeline (I-frame + intra-in-P) via spec/16 §2 size+value DC rule
+- round 335: wire v1 P-frame inter sub-types — INTER+Q + INTER4V (4-MV)
+- wire v3 alternate joint-MV VLC (mv_table_sel==1) end-to-end
+- round 317: narrow v1/v2 I-frame docs gap to intra-DC-size selector [esi+0x8bc] default
+- refresh to current status, drop per-round changelog cruft
+
 ### Fixed
 
 - round 362: **correct the v3 joint-MCBPCY intra/inter partition
