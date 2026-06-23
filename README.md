@@ -46,7 +46,7 @@ pending Auditor item.
 | G0..G5 canonical-Huffman primary AC VLC        | complete   |
 | MS-MPEG4v3 intra 3-tier ESC body               | complete (LMAX/RMAX ground-truth-validated for all 6 G-families) |
 | Inter AC residual (G4 VLC → IDCT → add to MC)  | complete   |
-| P-frame MV VLC + half-pel MC (default + alt)   | complete (decodes against extracted wire codes, spec/16 §1) |
+| P-frame MV VLC + half-pel MC (default + alt)   | complete (decodes against extracted wire codes, spec/16 §1; alt-table byte-LUT selection picture-level-pinned, round 362) |
 | P-frame 1-MV predictor (Figure 7-34)           | complete (picture-level median-propagation pin, round 359) |
 | 4-MV-per-MB predictor surface + neighbour resolver | wired (per-block bordering-cell pick) |
 | V3 intra-luma I-frame end-to-end via `decode_picture` | complete |

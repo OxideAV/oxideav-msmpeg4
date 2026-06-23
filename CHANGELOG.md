@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Tests
 
+- round 362: add a **discriminating** end-to-end pin for the alternate
+  joint-MV VLC table
+  (`picture::tests::pframe_alternate_mv_table_selects_alternate_byte_lut`).
+  The pre-existing alternate-table P-frame test only used joint symbol 0
+  (MV (0,0)), which is identical in the default and alternate byte LUTs,
+  so it could not prove the `mv_table_sel=1` path actually consults the
+  alternate table. The new test feeds the 9-bit wire pattern `010011111`,
+  which decodes to alternate symbol 36 → alternate byte-LUT MV (+4, 0)
+  half-pel (an integer +2-pixel shift), whereas the default table maps the
+  same bits to (-2, -2). Asserting the decoded luma equals the reference
+  translated by exactly (+2, 0) — and that the identical payload under
+  `mv_table_sel=0` yields a different picture — pins that the selector
+  routes through the alternate VLC + its paired byte LUTs (spec/16 §1).
+  Provenance asserts on `MV_V3_ALT_RAW[36]` and the alt/default byte-LUT
+  entries fail loudly if a future re-extraction shifts the alphabet.
+
+### Other
+
+- round 362: scrub stale comments that described the alternate
+  `mv_table_sel=1` joint-MV path as "still a placeholder / unsupported /
+  256-byte truncation" (`src/picture.rs`, `build.rs`). The full 8804-byte
+  / 1100-entry alternate source landed in Extractor 07 (spec/16 §1) and
+  decodes end-to-end; the byte LUTs at VMAs 0x1c25c320 / 0x1c25c770 pair
+  with it. Also correct the `decode_pframe` doc that claimed intra-in-P AC
+  is "placeholder/DC-only" — all six G-families carry their real
+  packed-Huffman primary VLC (round 234) and intra-in-P routes through the
+  same `FromHeader` AC dispatch as I-frames.
+
 - round 359: add the first picture-level end-to-end pin for the v3
   P-frame **median-predictor propagation** across a multi-MB row
   (`picture::tests::pframe_median_predictor_propagates_neighbour_mv`).
