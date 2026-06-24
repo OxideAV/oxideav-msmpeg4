@@ -48,9 +48,9 @@ pending Auditor item.
 | Inter AC residual (G4 VLC → IDCT → add to MC)  | complete   |
 | P-frame MV VLC + half-pel MC (default + alt)   | complete (decodes against extracted wire codes, spec/16 §1; alt-table byte-LUT selection picture-level-pinned, round 362) |
 | P-frame 1-MV predictor (Figure 7-34)           | complete (picture-level median-propagation pin, round 359) |
-| 4-MV-per-MB predictor surface + neighbour resolver | wired (per-block bordering-cell pick) |
+| 4-MV-per-MB predictor surface + neighbour resolver | complete (per-block bordering-cell pick; INTER4V→1-MV-neighbour propagation picture-level-pinned, round 366) |
 | V3 intra-luma I-frame end-to-end via `decode_picture` | complete |
-| V1 / V2 P-frame pixel pipeline (incl. INTER+Q + INTER4V) | complete |
+| V1 / V2 P-frame pixel pipeline (incl. INTER+Q + INTER4V) | complete (INTER4V luma + §7.6.3.4 chroma + per-MB-neighbour propagation picture-level-pinned, round 366) |
 | V1 P-frame MB-type table (`MB_TYPE_V1_INFO`)   | complete (binary-extracted, spec/16 §3) |
 | V1 / V2 intra pipeline (I-frame + intra-in-P)  | complete (size+value DC, spec/16 §2) |
 | V1 / V2 intra DC-size category VLCs (luma/chroma) | complete (binary-extracted, spec/16 §2) |
@@ -73,18 +73,29 @@ pending Auditor item.
   `region_05eac8_mcbpcy.csv` with the `symbol_index,code_dec,code_bin,
   bit_length` layout, Kraft 1.0). Until then MCBPCY stays canonical and
   whether that matches the binary is unverified.
-- **V3 4-MV-per-MB picture decode**: the predictor / neighbour-resolver
-  surface is complete and is now exercised end-to-end on the v1 P-frame
-  INTER4V path (`spec/16` §3.1). Wiring it into the **v3** picture
-  decoder is a docs gap: the v3 joint 128-entry MCBPCY alphabet
-  (`region_05eac8`, `audit/02` §4) encodes only an intra/inter split
-  (64 I-type + 64 P-type CBPCY patterns = 2 MB-types × 64 CBPCY), so it
-  carries **no** INTER4V code, and the v3 per-MB driver's 1-MV vs 4-MV
-  decision (`spec/06` §1.3 "for each MV needed by the decoded MB-type")
-  is not traced to a concrete signal. The v3 MV decoder itself already
-  supports the 4-MV output layout (`spec/06` §3.6 "first of four (or
-  one)") — only the trigger is missing. Until the docs resolve where v3
-  signals INTER4V, the v3 picture decoder stays 1-MV-per-MB.
+- **V3 4-MV-per-MB picture decode (hard docs gap #1895)**: the
+  predictor / neighbour-resolver surface is complete and is exercised
+  end-to-end on the v1 P-frame INTER4V path (`spec/16` §3.1, the real
+  traced 4-MV path = MCBPC MB-type 2). Wiring 4-MV into the **v3**
+  picture decoder is blocked: the v3 joint 128-entry MCBPCY alphabet
+  (`region_05eac8`, `audit/02` §4, patent 6,563,953 Table 1) encodes
+  only an intra/inter split (64 I-type + 64 P-type CBPCY patterns = 2
+  MB-types × 64 CBPCY), so it carries **no** INTER4V code, and every
+  traced part of the v3 per-MB driver (`1c2131ff` → MCBPCY `1c21782f` →
+  MV decoder `1c217f5a`, spec/05 §3 / spec/06 §1) invokes the MV decoder
+  exactly **once** per inter MB — there is no second VLC, no per-MB 4-MV
+  flag, and no other signal between MCBPCY and the MV decode. The v3 MV
+  decoder body itself supports the 4-MV output layout (`spec/06` §3.6
+  "first of four (or one)") — only the **trigger** is missing. As of
+  round 366 this 1-MV-per-MB invariant is a first-class property
+  (`McbpcyDecode::num_motion_vectors()` returns 0/intra, 1/inter, never
+  4) consulted by the v3 driver with a hard-error guard, so the v3 path
+  stays 1-MV-per-MB until the docs resolve where (or whether) v3 signals
+  INTER4V. **Docs ask:** trace the v3 P-frame MB layer for any signal
+  selecting a 4-MV mode (a second MCBPC-extension VLC, an OBMC/advanced
+  flag, or a per-MB bit) — or confirm authoritatively that MS-MPEG-4 v3
+  has no INTER4V mode (in which case #1895 closes as "v3 is 1-MV by
+  design").
 - **V1 / V2 I-frames and intra-in-P MBs**: now decode to pixels (round
   339). spec/16 §2 (Extractor 07) established that the v1/v2 intra-block
   driver gates on version (`cmp [esi+8], 3`): for v < 3 it decodes the DC
