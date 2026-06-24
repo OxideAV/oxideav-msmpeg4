@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Tests
+
+- round 366: deepen the **v1/v2 INTER4V (4-MV) picture-level coverage**
+  — the real, traced 4-MV path per `spec/16` §3.1 (MB-type 2). Two new
+  integration tests in `tests/v1_v2_pframe.rs`:
+  `v1_pframe_inter4v_uniform_mv_shifts_luma_and_derives_chroma` drives a
+  uniform-residual INTER4V MB and pins (a) block 1's luma 8×8 shifting
+  one column under its (+2, 0) half-pel final MV and (b) the §7.6.3.4
+  chroma derivation actually firing — both chroma planes diverge from
+  the reference, distinguishing the real `mc::chroma_mv_from_four_luma`
+  (sum/2K + Table 7-12) from a silent (0, 0) fallback. The prior INTER4V
+  tests used four (0, 0) MVs (trivial chroma derivation) or a single
+  non-zero block, so the uniform-MV chroma derivation was previously
+  unexercised through the full decoder.
+  `v1_pframe_inter4v_applies_cbp_residual_on_block` pins that
+  `decode_inter_residual_blocks` runs *after* the 4-MV MC on the INTER4V
+  path (not only the 1-MV path): a CBP-coded luma block 0 carries the
+  shortest G4 sub-class-B terminator and perturbs that 8×8 away from the
+  flat-128 MC copy while the three uncoded blocks stay verbatim.
+  Integration tests `v1_v2_pframe.rs` 15 → 17.
+
+### Other
+
+- round 366: correct the stale `src/mc.rs` module doc that still claimed
+  the MC kernel is "v3 P-frames" only and that the decoder "reject[s] all
+  P-frame MB-types other than 0" / "does not yet carry the per-4x4
+  INTER4V signalling". INTER4V (4-MV) MC has shipped for v1/v2 since
+  round 335 (`mc_macroblock_4mv` lives in this module). The doc now
+  enumerates the 1-MV vs INTER4V luma paths, the two chroma-MV
+  derivations (`chroma_mv_from_luma` `>> 1` toward −∞ vs
+  `chroma_mv_from_four_luma` sum/2K + Table 7-12), and records the
+  `spec/16` §3.1 fact that 4-MV is the v1/v2 MCBPC MB-type 2 while the v3
+  128-entry joint MCBPCY alphabet (`region_05eac8`, patent 6,563,953
+  Table 1) carries only an I-type/P-type split and **no** INTER4V code,
+  so the v3 picture decoder stays 1-MV-per-MB (docs gap #1895). Comment
+  only; no behaviour change.
+
 ### Fixed
 
 - round 362: **correct the v3 joint-MCBPCY intra/inter partition

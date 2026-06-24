@@ -1,4 +1,4 @@
-//! Motion compensation (luma + chroma) for MS-MPEG4 v3 P-frames.
+//! Motion compensation (luma + chroma) for MS-MPEG4 v1/v2/v3 P-frames.
 //!
 //! The decoded joint MV byte pair `(MVx, MVy)` ∈ `[-63, +63]` is in
 //! half-pel units per spec/06 §3.5. The MC kernel splits each byte MV
@@ -6,18 +6,22 @@
 //! 1: `sar byte, 1` → integer position; the original LSB marks
 //! half-pel. This module implements:
 //!
-//! * Luma 16×16 MC for 1-MV per MB (MB-type 0/1).
-//! * Chroma 8×8 MC using the MPEG-4-style `(dx_luma + dy_luma)`
-//!   chroma-MV derivation (each chroma component's MV is the sum of
-//!   its luma counterpart's four block MVs averaged down; with only
-//!   one luma MV per MB the chroma MV is the luma MV halved toward
-//!   zero by the half-pel rule).
-//!
-//! For a P-frame build that does not yet carry the per-4x4 INTER4V
-//! signalling (we reject all P-frame MB-types other than 0 for now),
-//! the chroma MV reduces to `luma_mv / 2` per component (rounded
-//! toward zero, which is H.263 Annex I / MPEG-4 §7.6.3.4 default
-//! rounding).
+//! * Luma 16×16 MC for 1-MV-per-MB inter MBs ([`mc_macroblock`]) —
+//!   v3 P-type / v1/v2 MB-type 0 (INTER) and 1 (INTER+Q).
+//! * Luma 4×8×8 MC for the INTER4V (v1/v2 MB-type 2, four-MV) case
+//!   ([`mc_macroblock_4mv`]): each Figure 6-8 8×8 luma block uses its
+//!   own half-pel MV, and the two chroma blocks share the §7.6.3.4
+//!   sum/2K-derived MV. Per spec/16 §3.1 the 4-MV mode is the v1/v2
+//!   MCBPC MB-type 2; the v3 128-entry joint MCBPCY alphabet
+//!   (`region_05eac8`, patent 6,563,953 Table 1) carries only an
+//!   I-type/P-type split and **no** INTER4V code, and no traced v3
+//!   bitstream signal selects 4-MV (docs gap #1895), so the v3 picture
+//!   decoder is 1-MV-per-MB.
+//! * Chroma 8×8 MC. For a 1-MV MB the chroma component is the luma MV
+//!   halved toward −∞ ([`chroma_mv_from_luma`], `>> 1`). For an INTER4V
+//!   MB the chroma MV is the four luma MVs summed, divided by `2*K = 8`,
+//!   and modified to the nearest half-sample position via Table 7-12
+//!   ([`chroma_mv_from_four_luma`] / [`eighth_to_half_component`]).
 //!
 //! # Out-of-bounds handling
 //!
