@@ -561,8 +561,32 @@ fn decode_pframe_mb(
     // alternate VLC variant (now fully wired — Extractor 07 / spec/16
     // §1; see `crate::mv::MvTable::Alternate`).
     //
-    // The 1-MV-per-MB case (which is the only mode currently shipping
-    // for v3) is the Figure 7-34 top-left sub-diagram per
+    // The number of MVs is taken from `McbpcyDecode::num_motion_vectors`,
+    // which is **1** for every v3 inter (P-type) MB: the v3 128-entry
+    // joint MCBPCY alphabet (`region_05eac8`, patent 6,563,953 Table 1)
+    // carries only an I-type/P-type split and no INTER4V code, and no
+    // traced v3 bitstream signal selects a 4-MV mode (docs gap #1895).
+    // Routing the count through the accessor (rather than hard-coding a
+    // single decode here) keeps the v3 driver structurally parallel to
+    // the v1/v2 `decode_pframe_mb_v1v2` dispatch and gives a future round
+    // a single switch to flip when the trigger is resolved. A count other
+    // than 1 on the v3 path would be a contract violation of the
+    // accessor, so we assert it loudly rather than silently mis-decode.
+    let num_mv = decode.num_motion_vectors();
+    debug_assert_eq!(
+        num_mv, 1,
+        "v3 inter MB num_motion_vectors must be 1 (docs gap #1895)"
+    );
+    if num_mv != 1 {
+        return Err(Error::invalid(format!(
+            "msmpeg4v3: inter MB at ({mb_x}, {mb_y}) implies {num_mv} \
+             motion vectors, but the v3 joint MCBPCY alphabet has no \
+             traced 4-MV trigger (docs gap #1895); the v3 path is \
+             1-MV-per-MB."
+        )));
+    }
+
+    // The 1-MV-per-MB case is the Figure 7-34 top-left sub-diagram per
     // `docs/video/mpeg4-visual/figure-7-34-mv-predictor-layout.md` §
     // "When only one motion vector is present for the whole macroblock,
     // the top-left case in Figure 7-34 is applied." The §7.6.5

@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- round 366: make the **v3 1-MV-per-MB invariant a first-class,
+  gap-#1895-grounded property**. New `McbpcyDecode::num_motion_vectors()`
+  const accessor returns **0 for intra (I-type) MBs and 1 for inter
+  (P-type) MBs** — mirroring the v1/v2 `V1V2McbpcyDecode` field but with
+  the v3-specific fact baked in: the 128-entry joint MCBPCY alphabet
+  (`region_05eac8`, patent US 6,563,953 Table 1, `audit/02` §4)
+  partitions only into 64 I-type + 64 P-type entries, carries no INTER4V
+  code, and no traced v3 bitstream signal selects 4-MV (the per-MB driver
+  `1c2131ff` → MCBPCY `1c21782f` → MV decoder `1c217f5a` invokes the MV
+  decoder exactly once per inter MB; spec/05 §3 / spec/06 §1). The v3
+  P-frame driver `picture::decode_pframe_mb` now takes its MV count from
+  this accessor (with a `debug_assert` + hard-error guard against any
+  count ≠ 1), keeping it structurally parallel to the v1/v2
+  `decode_pframe_mb_v1v2` INTER4V dispatch and giving a future round a
+  single switch to flip if the docs ever resolve the v3 4-MV trigger.
+  A new lib test
+  (`mcbpcy::tests::v3_mcbpcy_num_motion_vectors_is_one_for_every_inter_symbol`)
+  decodes all 128 symbols and pins the accessor (0 for the low half, 1
+  for the high half, never 4). Lib tests 423 → 424; no v3 runtime
+  behaviour change (the count was already implicitly 1).
+
 ### Tests
 
 - round 366: deepen the **v1/v2 INTER4V (4-MV) picture-level coverage**

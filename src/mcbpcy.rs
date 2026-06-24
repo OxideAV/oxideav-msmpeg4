@@ -113,6 +113,39 @@ pub struct McbpcyDecode {
     pub cbp_cr: bool,
 }
 
+impl McbpcyDecode {
+    /// Number of motion vectors a v3 P-frame MB of this type implies:
+    /// **0 for intra (I-type) MBs, 1 for inter (P-type) MBs**.
+    ///
+    /// Unlike the v1/v2 MCBPC alphabet — whose 21-symbol set carries a
+    /// distinct INTER4V MB-type 2 with a 4-MV count (spec/16 §3.1,
+    /// `V1V2McbpcyDecode::num_motion_vectors`) — the v3 128-entry joint
+    /// MCBPCY alphabet (`region_05eac8`, patent US 6,563,953 Table 1,
+    /// `audit/02` §4) partitions only into 64 I-type + 64 P-type entries
+    /// (2 MB-types × 64 CBPCY patterns). It carries **no** INTER4V code,
+    /// and no traced v3 bitstream signal (the per-MB driver `1c2131ff`
+    /// → MCBPCY `1c21782f` → MV decoder `1c217f5a`, spec/05 §3 / spec/06
+    /// §1) selects a 4-MV mode — the v3 MV decoder is invoked exactly
+    /// once per inter MB. The v3 *MV decoder body itself* supports the
+    /// 4-MV output layout (spec/06 §3.6 "first of four (or one)"), so
+    /// only the **trigger** is missing.
+    ///
+    /// This is a documented hard docs gap (#1895): until the docs resolve
+    /// where (or whether) v3 signals INTER4V, the v3 picture decoder is
+    /// 1-MV-per-MB by construction, and this accessor is the single
+    /// authoritative source of that count. A future round that resolves
+    /// the trigger changes this method (and only this method) to return
+    /// 4 for the 4-MV-coded MBs.
+    #[must_use]
+    pub const fn num_motion_vectors(&self) -> u8 {
+        if self.is_intra {
+            0
+        } else {
+            1
+        }
+    }
+}
+
 /// Decode one MCBPCY joint symbol from the bit stream using the v3
 /// 128-entry canonical-Huffman table, and split the resulting index
 /// into the (MB-type, 6-bit CBP) components.
@@ -597,6 +630,58 @@ mod tests {
         }
         assert!(saw_intra, "no intra (low-half) symbol exercised");
         assert!(saw_inter, "no inter (high-half) symbol exercised");
+    }
+
+    #[test]
+    fn v3_mcbpcy_num_motion_vectors_is_one_for_every_inter_symbol() {
+        // The v3 128-entry joint MCBPCY alphabet carries only an
+        // I-type/P-type split (patent 6,563,953 Table 1, audit/02 §4) and
+        // no INTER4V code; no traced v3 signal selects 4-MV (docs gap
+        // #1895). So `McbpcyDecode::num_motion_vectors()` must be 0 for
+        // every low-half (intra) symbol and exactly 1 for every high-half
+        // (inter) symbol — never 4. This pins the v3 1-MV-per-MB invariant
+        // so a future round cannot add a 4-MV path to v3 without first
+        // resolving the trigger (which would change this accessor).
+        let t = table();
+        let mut saw_one = false;
+        let mut saw_zero = false;
+        for e in t {
+            let mut acc: u64 = (e.code as u64) & ((1u64 << e.bits) - 1);
+            let mut bits = e.bits as u32;
+            let mut out = Vec::new();
+            while bits >= 8 {
+                let shift = bits - 8;
+                out.push(((acc >> shift) & 0xff) as u8);
+                acc &= (1u64 << shift) - 1;
+                bits -= 8;
+            }
+            if bits > 0 {
+                out.push(((acc << (8 - bits)) & 0xff) as u8);
+            }
+            out.extend_from_slice(&[0u8; 8]);
+            let mut br = BitReader::new(&out);
+            let dec = decode_mcbpcy(&mut br).expect("symbol decodes");
+            let expected = if dec.is_intra { 0 } else { 1 };
+            assert_eq!(
+                dec.num_motion_vectors(),
+                expected,
+                "idx {} num_motion_vectors must be {expected} (v3 is \
+                 1-MV-per-MB; docs gap #1895)",
+                dec.idx,
+            );
+            assert_ne!(
+                dec.num_motion_vectors(),
+                4,
+                "v3 must never imply 4 MVs (no INTER4V trigger; gap #1895)"
+            );
+            if dec.is_intra {
+                saw_zero = true;
+            } else {
+                saw_one = true;
+            }
+        }
+        assert!(saw_zero, "no intra (0-MV) symbol exercised");
+        assert!(saw_one, "no inter (1-MV) symbol exercised");
     }
 
     fn pack(fields: &[(u32, u32)]) -> Vec<u8> {
