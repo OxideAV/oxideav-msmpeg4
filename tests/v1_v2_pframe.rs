@@ -692,6 +692,167 @@ fn v1_pframe_inter4v_applies_cbp_residual_on_block() {
 }
 
 #[test]
+fn v1_pframe_inter4v_neighbour_propagates_block2_mv_to_next_mb() {
+    // A 2-MB-wide v1 P-frame: MB(0,0) is INTER4V (MB-type 2) and MB(1,0)
+    // is a plain 1-MV inter MB with MVD (0,0). MB(1,0)'s §7.6.5 left
+    // neighbour is the 4-MV-coded MB(0,0); per Figure 7-34 the 1-MV
+    // predictor must source MB(0,0)'s **block 2** (top-right 8x8) cell
+    // (`mv_pred::bordering_block_of_neighbour`, round 208/306). With
+    // MB(1,0)'s own MVD = 0 its final MV equals that propagated
+    // predictor, so MB(1,0) must reconstruct as the reference shifted by
+    // exactly MB(0,0).block2's MV. This is the first *picture-level*
+    // exercise of an INTER4V MB feeding a 1-MV neighbour through the full
+    // v1/v2 decoder (the prior `one_mv_predictor` FourMv coverage was a
+    // synthetic-grid unit test only).
+    use oxideav_msmpeg4::mc::{mc_macroblock, RefPlane};
+    use oxideav_msmpeg4::mv::{decode_mv_v1v2, Mv};
+    use oxideav_msmpeg4::mv_pred::{Block, Macroblock4MvDecoderNeighbours, NeighbourSet};
+
+    let dims = PictureDims::new(32, 16).unwrap();
+    let mut reference = Picture::alloc(dims, PictureType::I);
+    for (i, p) in reference.y.iter_mut().enumerate() {
+        *p = (i % 251) as u8;
+    }
+    for (i, p) in reference.cb.iter_mut().enumerate() {
+        *p = (i % 199) as u8;
+    }
+    for (i, p) in reference.cr.iter_mut().enumerate() {
+        *p = (i % 197) as u8;
+    }
+
+    // INTER4V block MVDs: block 1 = (+2, 0) half-pel, blocks 2..4 = 0.
+    let (mcbpc4v_code, mcbpc4v_bl) = code_for(MCBPC_V1_RAW, 8); // mb_type 2
+    let (mcbpc1_code, mcbpc1_bl) = code_for(MCBPC_V1_RAW, 0); // mb_type 0
+    let (cbpy_code, cbpy_bl) = code_for(CBPY_V1_V2_RAW, 15); // post-wrap 0
+    let (mvx2_code, mvx2_bl) = code_for(MV_V1_V2_RAW, 34); // +2 half-pel
+    let (mv0_code, mv0_bl) = code_for(MV_V1_V2_RAW, 32); // 0
+
+    let mut fields = v1_pframe_header(8);
+    // MB(0,0): INTER4V, block 1 MVDx=+2 then three (0,0) blocks.
+    fields.push((0, 1)); // skip = 0
+    fields.push((mcbpc4v_code, mcbpc4v_bl));
+    fields.push((cbpy_code, cbpy_bl));
+    fields.push((mvx2_code, mvx2_bl)); // block 1 MVDx = +2
+    fields.push((mv0_code, mv0_bl)); // block 1 MVDy = 0
+    for _ in 0..3 {
+        fields.push((mv0_code, mv0_bl));
+        fields.push((mv0_code, mv0_bl));
+    }
+    // MB(1,0): plain 1-MV inter, MVD (0,0).
+    fields.push((0, 1)); // skip = 0
+    fields.push((mcbpc1_code, mcbpc1_bl));
+    fields.push((cbpy_code, cbpy_bl));
+    fields.push((mv0_code, mv0_bl)); // MVDx = 0
+    fields.push((mv0_code, mv0_bl)); // MVDy = 0
+    let bytes = pack(&fields);
+    let mut br = BitReader::new(&bytes);
+    let pic = decode_picture_v1v2(&mut br, dims, MsV1V2Version::V1, Some(&reference))
+        .expect("v1 INTER4V + 1-MV-neighbour P-frame decode");
+
+    // Independently replay MB(0,0)'s within-MB Figure-7-34 driver with
+    // the same per-block MVDs (no neighbours → NeighbourSet::ABSENT) to
+    // recover its four committed MVs, then take block 2's MV — the cell
+    // MB(1,0)'s left-neighbour predictor borders.
+    let mut dec = Macroblock4MvDecoderNeighbours::new(NeighbourSet::ABSENT);
+    let block_mvds = [(2i8, 0i8), (0, 0), (0, 0), (0, 0)];
+    let mut committed = [Mv::default(); 4];
+    for (i, &block) in Block::ALL.iter().enumerate() {
+        let pred = dec.predictor_for(block);
+        let mvd = block_mvds[i];
+        // decode_mv_v1v2 reads from a bitstream; we instead apply the
+        // same predictor-add the decoder applies for a zero/known MVD.
+        // For MVD 0 the final MV is exactly the predictor; for block 1's
+        // (+2,0) MVD the final is predictor + (2,0) (no wrap in range).
+        let final_mv = Mv {
+            x: (pred.x as i32 + mvd.0 as i32) as i8,
+            y: (pred.y as i32 + mvd.1 as i32) as i8,
+        };
+        dec.commit_block(block, final_mv);
+        committed[i] = final_mv;
+    }
+    // Cross-check the replay against the production decoder by decoding
+    // the same MVD wire bits through `decode_mv_v1v2` for block 1 with a
+    // zero predictor (the first block's predictor is always (0,0)).
+    {
+        let bits = pack(&[(mvx2_code, mvx2_bl), (mv0_code, mv0_bl)]);
+        let mut b = BitReader::new(&bits);
+        let mv = decode_mv_v1v2(&mut b, Mv::default()).expect("block-1 MV decode");
+        assert_eq!(
+            (mv.x, mv.y),
+            (committed[0].x, committed[0].y),
+            "replayed block-1 MV must match the production MV decoder"
+        );
+    }
+    let propagated = committed[1]; // block 2 (top-right) cell
+
+    // Reconstruct MB(1,0) at the propagated MV via the public MC helper.
+    let mut expected = Picture::alloc(dims, PictureType::P);
+    let ref_y = RefPlane {
+        data: &reference.y,
+        stride: reference.y_stride,
+        width: reference.width as usize,
+        height: reference.height as usize,
+    };
+    let ref_cb = RefPlane {
+        data: &reference.cb,
+        stride: reference.c_stride,
+        width: (reference.width as usize).div_ceil(2),
+        height: (reference.height as usize).div_ceil(2),
+    };
+    let ref_cr = RefPlane {
+        data: &reference.cr,
+        stride: reference.c_stride,
+        width: (reference.width as usize).div_ceil(2),
+        height: (reference.height as usize).div_ceil(2),
+    };
+    mc_macroblock(
+        &ref_y,
+        &ref_cb,
+        &ref_cr,
+        &mut expected.y,
+        &mut expected.cb,
+        &mut expected.cr,
+        expected.y_stride,
+        expected.c_stride,
+        1, // mb_x = 1
+        0, // mb_y = 0
+        (propagated.x as i32, propagated.y as i32),
+    );
+
+    // Compare MB(1,0)'s 16x16 luma against the independent reconstruction.
+    for row in 0..16usize {
+        for col in 16..32usize {
+            assert_eq!(
+                pic.y[row * pic.y_stride + col],
+                expected.y[row * expected.y_stride + col],
+                "MB(1,0) luma ({row}, {col}) must reconstruct at the \
+                 propagated block-2 MV {propagated:?}",
+            );
+        }
+    }
+    // Guard against a dropped predictor: block-2's MV must be non-zero,
+    // so MB(1,0) must NOT be a verbatim reference copy.
+    assert_ne!(
+        (propagated.x, propagated.y),
+        (0, 0),
+        "test setup must yield a non-zero propagated block-2 MV"
+    );
+    let mut differs = false;
+    for row in 0..16usize {
+        for col in 16..32usize {
+            if pic.y[row * pic.y_stride + col] != reference.y[row * reference.y_stride + col] {
+                differs = true;
+            }
+        }
+    }
+    assert!(
+        differs,
+        "a dropped INTER4V-neighbour predictor would copy the reference \
+         unshifted; the propagated MV must perturb MB(1,0)"
+    );
+}
+
+#[test]
 fn v1_pframe_without_reference_requires_reference() {
     let (dims, _) = gradient_reference();
     let bytes = pack(&v1_pframe_header(8));

@@ -50,6 +50,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shortest G4 sub-class-B terminator and perturbs that 8×8 away from the
   flat-128 MC copy while the three uncoded blocks stay verbatim.
   Integration tests `v1_v2_pframe.rs` 15 → 17.
+- round 366: add the first **picture-level INTER4V → 1-MV-neighbour MV
+  propagation** pin (`v1_v2_pframe.rs::`
+  `v1_pframe_inter4v_neighbour_propagates_block2_mv_to_next_mb`). A
+  2-MB-wide v1 P-frame decodes MB(0,0) as INTER4V (block 1 at a +2
+  half-pel MV) and MB(1,0) as a 1-MV inter MB with MVD (0,0); per Figure
+  7-34 (`mv_pred::bordering_block_of_neighbour`, round 208/306) MB(1,0)'s
+  1-MV predictor must source MB(0,0)'s **block 2** (top-right 8×8) cell,
+  so MB(1,0) reconstructs as the reference shifted by exactly that MV.
+  The test independently replays MB(0,0)'s within-MB Figure-7-34 driver
+  (cross-checking block 1's MV against the production `decode_mv_v1v2`)
+  and reconstructs MB(1,0) via the public `mc::mc_macroblock`, guarding
+  the inequality against a dropped predictor (which would copy the
+  reference unshifted). All prior INTER4V coverage was single-MB or
+  synthetic-grid only, so the cross-MB bordering-cell propagation through
+  the full decoder was previously unexercised. Integration tests 17 → 18.
 
 ### Other
 
