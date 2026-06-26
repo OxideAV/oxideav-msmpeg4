@@ -3063,4 +3063,168 @@ mod tests {
              unshifted instead",
         );
     }
+
+    /// A v3 P-frame **intra-in-P** MB must contribute an `Absent` cell to
+    /// the §7.6.5 neighbour grid — it does NOT propagate a motion vector.
+    /// This pins the cross-MB interaction: a 2-MB-wide P-frame whose
+    /// MB(0,0) is intra-in-P (idx < 64, the intra/low half per patent
+    /// Table 1 / `audit/02` §1.4) followed by an inter MB(1,0) carrying a
+    /// non-zero MVD. Because MB(0,0) leaves its grid cell `Absent` (see
+    /// `decode_pframe_mb`'s `decode.is_intra` arm), MB(1,0)'s candidate
+    /// set is all-`Absent` → the §7.6.5 rule-4 all-zero predictor → the
+    /// final MV equals MB(1,0)'s raw MVD residual. The decoded MB(1,0)
+    /// must therefore reconstruct at exactly that residual MV — NOT at
+    /// some non-zero value a leaked/stale predictor would inject.
+    #[test]
+    fn pframe_intra_in_p_neighbour_contributes_absent_not_a_mv() {
+        use oxideav_core::bits::BitReader;
+
+        fn pack(fields: &[(u32, u32)]) -> Vec<u8> {
+            let mut out: Vec<u8> = Vec::new();
+            let mut acc: u64 = 0;
+            let mut bits: u32 = 0;
+            for (v, w) in fields {
+                let mask = if *w == 32 { u32::MAX } else { (1u32 << w) - 1 };
+                acc = (acc << w) | ((*v & mask) as u64);
+                bits += w;
+                while bits >= 8 {
+                    let shift = bits - 8;
+                    out.push(((acc >> shift) & 0xff) as u8);
+                    acc &= (1u64 << shift) - 1;
+                    bits -= 8;
+                }
+            }
+            if bits > 0 {
+                out.push(((acc << (8 - bits)) & 0xff) as u8);
+            }
+            out
+        }
+
+        // Canonical MCBPCY codes for (a) the first intra symbol idx 0
+        // (low/intra half, CBP=0) and (b) the first inter symbol idx 64
+        // (P-type half, CBP=0). Mirrors the build in `mcbpcy.rs`.
+        let mcbpcy_code = |target: u8| -> (u32, u32) {
+            let mut syms: Vec<(u32, u8)> = crate::tables_data::MCBPCY_V3_RAW
+                .iter()
+                .enumerate()
+                .filter_map(|(i, &(bl, _))| if bl == 0 { None } else { Some((bl, i as u8)) })
+                .collect();
+            syms.sort_by_key(|&(bl, idx)| (bl, idx));
+            let mut code: u32 = 0;
+            let mut prev_bl: u32 = 0;
+            let mut found = None;
+            for (i, &(bl, idx)) in syms.iter().enumerate() {
+                if i == 0 {
+                    code = 0;
+                } else {
+                    code = (code + 1) << (bl - prev_bl);
+                }
+                if idx == target {
+                    found = Some((code, bl));
+                }
+                prev_bl = bl;
+            }
+            found.expect("symbol in canonical MCBPCY")
+        };
+        let (code_intra, bl_intra) = mcbpcy_code(0); // intra, CBP=0
+        let (code_inter, bl_inter) = mcbpcy_code(64); // inter, CBP=0
+
+        // Pick a non-zero even (integer-pixel) joint-MV symbol — same
+        // selection rule as `pframe_median_predictor_propagates_neighbour_mv`,
+        // so the test follows the extracted LUT if it is re-rolled.
+        let sym_nonzero = (1..crate::tables_data::MV_V3_ESC_INDEX)
+            .find(|&i| {
+                let rx = crate::tables_data::MVDX_V3_BYTES[i] as i32 - 32;
+                let ry = crate::tables_data::MVDY_V3_BYTES[i] as i32 - 32;
+                rx != 0 && ry != 0 && rx % 2 == 0 && ry % 2 == 0 && rx.abs() <= 8 && ry.abs() <= 8
+            })
+            .expect("an integer-pixel joint-MV symbol must exist in the extracted LUT");
+        let (mv_nz_bl, mv_nz_code) = crate::tables_data::MV_V3_RAW[sym_nonzero];
+        let raw_x = crate::tables_data::MVDX_V3_BYTES[sym_nonzero] as i32;
+        let raw_y = crate::tables_data::MVDY_V3_BYTES[sym_nonzero] as i32;
+        // With an all-Absent predictor (= (0,0)) the final MV = the raw
+        // residual after the -32 bias.
+        let exp_mv_half = (raw_x - 32, raw_y - 32);
+
+        let dims = PictureDims::new(32, 16).unwrap();
+        let mut reference = Picture::alloc(dims, PictureType::I);
+        for (i, px) in reference.y.iter_mut().enumerate() {
+            *px = (i % 251) as u8;
+        }
+        for (i, px) in reference.cb.iter_mut().enumerate() {
+            *px = (i % 199) as u8;
+        }
+        for (i, px) in reference.cr.iter_mut().enumerate() {
+            *px = (i % 197) as u8;
+        }
+
+        // DC-only intra block sequence for MB(0,0): six DC-size-0 codes.
+        let (dc_l_bl, dc_l_code) = crate::tables_data::INTRA_DC_LUMA_SEL0_RAW[0];
+        let (dc_c_bl, dc_c_code) = crate::tables_data::INTRA_DC_CHROMA_SEL0_RAW[0];
+
+        let mut fields: Vec<(u32, u32)> = vec![
+            (1, 2), // P
+            (8, 5), // quant
+            (0, 1), // ac_chroma_sel
+            (0, 1), // dc_size_sel
+            (0, 1), // mv_table_sel = 0 (default)
+        ];
+        // MB(0,0): intra-in-P (idx 0, CBP=0). skip=0, MCBPCY, ac_pred, then
+        // six DC-only blocks (4 luma + 2 chroma).
+        fields.push((0, 1)); // skip = 0
+        fields.push((code_intra, bl_intra));
+        fields.push((0, 1)); // ac_pred = 0
+        for _ in 0..4 {
+            fields.push((dc_l_code, dc_l_bl));
+        }
+        for _ in 0..2 {
+            fields.push((dc_c_code, dc_c_bl));
+        }
+        // MB(1,0): inter, CBP=0, non-zero MV symbol. Predictor is all-Absent
+        // (MB(0,0) is intra; row 0 → above/above_right off-picture).
+        fields.push((0, 1)); // skip = 0
+        fields.push((code_inter, bl_inter));
+        fields.push((0, 1)); // ac_pred (ignored for inter)
+        fields.push((mv_nz_code, mv_nz_bl));
+        fields.push((0, 16)); // trailing padding
+
+        let bytes = pack(&fields);
+        let mut br = BitReader::new(&bytes);
+        let pic = decode_picture(&mut br, dims, Some(&reference))
+            .expect("2-MB P-frame (intra-in-P then inter) must decode");
+
+        // MB(1,0) must reconstruct at exp_mv_half (its raw residual, since
+        // the predictor is all-zero). Build the independent expectation.
+        let mut expected = Picture::alloc(dims, PictureType::P);
+        apply_mc_to_mb(&mut expected, &reference, 1, 0, exp_mv_half);
+        let mut zero_mv = Picture::alloc(dims, PictureType::P);
+        apply_mc_to_mb(&mut zero_mv, &reference, 1, 0, (0, 0));
+
+        let stride = pic.y_stride;
+        let mut matches_residual = true;
+        let mut differs_from_zero = false;
+        for row in 0..16 {
+            for col in 16..32 {
+                let idx = row * stride + col;
+                if pic.y[idx] != expected.y[idx] {
+                    matches_residual = false;
+                }
+                if expected.y[idx] != zero_mv.y[idx] {
+                    differs_from_zero = true;
+                }
+            }
+        }
+        assert!(
+            differs_from_zero,
+            "test setup invalid: residual-MV and zero-MV reconstructions are \
+             identical, so the assertion would be vacuous",
+        );
+        assert!(
+            matches_residual,
+            "MB(1,0) after an intra-in-P MB(0,0) must reconstruct at its raw \
+             residual MV {exp_mv_half:?} (all-Absent predictor). If the \
+             intra-in-P MB had leaked a non-Absent cell into the grid, the \
+             predictor would shift and MB(1,0) would land elsewhere.",
+        );
+    }
 }
