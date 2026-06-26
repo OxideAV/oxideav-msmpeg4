@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   decoded an *inter* MB; the `decode.is_intra` branch of the v3 / v1 / v2
   P-frame drivers (the intra-in-P MB, reached after the skip bit when the
   joint-MCBPCY / MCBPC index lands in the intra partition) was shipping
-  but untested end-to-end. Six new tests close that:
+  but untested end-to-end. Seven new tests close that:
   - `tests/v3_pframe_intra_in_p.rs` (4 tests): a v3 P-frame with a single
     intra-in-P MB (joint-MCBPCY idx < 64, the I-type/low half per patent
     US 6,563,953 Table 1 / `audit/02` §1.4) reconstructs intra content
@@ -25,7 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     under zigzag (ac_pred=0) vs alternate-horizontal (ac_pred=1), so the
     two reconstructions DIFFER — proving the ac_pred bit genuinely routes
     into the scan dispatch.
-  - `tests/v1_v2_pframe.rs` (+4 tests): the v2 analogue of the
+  - `tests/v1_v2_pframe.rs` (+3 tests): the v2 analogue of the
     CBP-coded ac_pred scan-flip (spec/07 §2.4, G5 luma per spec/14 §3.2);
     plus the **v1** P-frame intra-in-P path, which reads **no** ac_pred
     bit (spec/07 §1.4) — a DC-only pin (reconstructs flat grey 128, not a
@@ -42,8 +42,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     the classifier dispatch, the `last_picture` reference threading across
     packets, and the `picture → Frame::Video` plane conversion that the
     `decode_picture` tests skip.
-  Lib tests 424 → 425; integration tests +10
-  (`v3_pframe_intra_in_p.rs` new with 5; `v1_v2_pframe.rs` 18 → 22).
+  Lib tests 424 → 425; integration tests +8
+  (`v3_pframe_intra_in_p.rs` new with 5; `v1_v2_pframe.rs` 18 → 21).
   Purely additive; no runtime path changed.
 
 ### Added
