@@ -446,6 +446,121 @@ fn v2_pframe_intra_in_p_decodes() {
     );
 }
 
+/// Look up the G5 primary-VLC `(code, bit_length)` for a regular
+/// `(last, run, |level|)` token (the v1/v2 intra-in-P luma DCT table per
+/// spec/14 §3.2). Returns `None` if no such token exists in the alphabet.
+fn g5_code_for(last: bool, run: u8, level: u16) -> Option<(u32, u32)> {
+    use oxideav_msmpeg4::ac::{AcVlcTable, Symbol};
+    let t = AcVlcTable::v3_intra_g5();
+    for e in t.entries.iter() {
+        if let Symbol::RunLevel {
+            last: el,
+            run: er,
+            level: ev,
+        } = e.value
+        {
+            if el == last && er == run && ev == level {
+                return Some((e.code, e.bits as u32));
+            }
+        }
+    }
+    None
+}
+
+/// Build a v2 P-frame whose only MB is intra-in-P with **luma block 0
+/// CBP-coded**, carrying a single real G5 AC token at `(run=1, level=1)`
+/// then a sub-B terminator. `ac_pred` selects the post-VLC AC-prediction
+/// bit so the caller can compare zigzag against the AC-prediction scan.
+///
+/// Intra-in-P is v2 MCBPC quotient 1 (symbol 4 → mb_type 3). The v2
+/// decoder reads the ac_pred bit then CBPY-with-wrap; to set luma block 0
+/// only (final cbpy = 0b1000 = 8) we feed CBPY raw = 15 − 8 = 7.
+fn build_v2_pframe_intra_in_p_coded(ac_pred: u32) -> Vec<u8> {
+    let (mcbpc_code, mcbpc_bl) = code_for(MCBPC_V2_RAW, 4); // quotient 1 → intra
+    let (cbpy_code, cbpy_bl) = code_for(CBPY_V1_V2_RAW, 7); // wrap → 8 (block 0)
+    let (luma0_code, luma0_bl) = code_for(DC_SIZE_LUMA_V1V2_RAW, 0); // DC diff 0
+    let (chroma0_code, chroma0_bl) = code_for(DC_SIZE_CHROMA_V1V2_RAW, 0);
+
+    let (ac0_code, ac0_bl) = g5_code_for(false, 1, 1).expect("G5 (last=false, run=1, level=1)");
+    let (ac1_code, ac1_bl) = g5_code_for(true, 0, 1).expect("G5 (last=true, run=0, level=1)");
+
+    let mut fields = v2_pframe_header(8);
+    fields.push((0, 1)); // skip = 0
+    fields.push((mcbpc_code, mcbpc_bl));
+    fields.push((ac_pred, 1)); // ac_pred bit (spec/07 §2.4)
+    fields.push((cbpy_code, cbpy_bl));
+
+    // Block 0 (luma, CBP set): DC size 0 (diff 0), then the AC token pair.
+    fields.push((luma0_code, luma0_bl));
+    fields.push((ac0_code, ac0_bl));
+    fields.push((0, 1)); // sign = positive
+    fields.push((ac1_code, ac1_bl));
+    fields.push((0, 1)); // sign = positive
+
+    // Blocks 1..3 (luma uncoded): DC size 0.
+    for _ in 0..3 {
+        fields.push((luma0_code, luma0_bl));
+    }
+    // Blocks 4,5 (chroma uncoded): DC size 0.
+    for _ in 0..2 {
+        fields.push((chroma0_code, chroma0_bl));
+    }
+    pack(&fields)
+}
+
+#[test]
+fn v2_pframe_intra_in_p_coded_block_consults_ac_pred_scan() {
+    use oxideav_msmpeg4::scan::{ALTERNATE_HORIZONTAL, ZIGZAG};
+
+    // For the picture's first block (0,0) every DC neighbour is absent →
+    // the §7.4.3 gradient test resolves FROM-TOP → the ac_pred-on scan is
+    // ALTERNATE_HORIZONTAL. The (run=1) AC token sits at scan position 2,
+    // where ZIGZAG[2]=8 but ALTERNATE_HORIZONTAL[2]=2 — so the single
+    // coefficient lands at a different natural position under the two
+    // scans and the reconstructions differ.
+    assert_ne!(
+        ZIGZAG[2], ALTERNATE_HORIZONTAL[2],
+        "test premise: scan position 2 must differ between zigzag and alternate-horizontal",
+    );
+
+    let (dims, reference) = gradient_reference();
+
+    let bytes0 = build_v2_pframe_intra_in_p_coded(0);
+    let mut br0 = BitReader::new(&bytes0);
+    let pic0 = decode_picture_v1v2(&mut br0, dims, MsV1V2Version::V2, Some(&reference))
+        .expect("v2 intra-in-P ac_pred=0 (zigzag) coded block decodes");
+
+    let bytes1 = build_v2_pframe_intra_in_p_coded(1);
+    let mut br1 = BitReader::new(&bytes1);
+    let pic1 = decode_picture_v1v2(&mut br1, dims, MsV1V2Version::V2, Some(&reference))
+        .expect("v2 intra-in-P ac_pred=1 (alternate scan) coded block decodes");
+
+    let block0_uniform = |p: &Picture| -> bool {
+        let first = p.y[0];
+        (0..8).all(|j| (0..8).all(|i| p.y[j * p.y_stride + i] == first))
+    };
+    assert!(
+        !block0_uniform(&pic0),
+        "v2 zigzag coded intra-in-P block 0 must be non-uniform (AC applied)",
+    );
+    assert!(
+        !block0_uniform(&pic1),
+        "v2 alternate-scan coded intra-in-P block 0 must be non-uniform (AC applied)",
+    );
+
+    // Load-bearing: the v2 ac_pred bit (spec/07 §2.4) genuinely routes
+    // into the scan selection on the v1/v2 intra-in-P pixel path — the two
+    // polarities reconstruct DIFFERENT luma block 0 content.
+    let differs = (0..8)
+        .any(|j| (0..8).any(|i| pic0.y[j * pic0.y_stride + i] != pic1.y[j * pic1.y_stride + i]));
+    assert!(
+        differs,
+        "v2 ac_pred 0 (zigzag) and 1 (alternate-horizontal) must reconstruct \
+         DIFFERENT luma block 0 — the spec/07 §2.4 ac_pred bit drives the \
+         v1/v2 intra-in-P scan dispatch",
+    );
+}
+
 #[test]
 fn v1_pframe_inter_plus_q_subtype_one_mv_zero_copies_reference() {
     // spec/16 §3.1: MB-type 1 (INTER+Q) is a 1-MV inter MB decoded
