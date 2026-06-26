@@ -980,6 +980,101 @@ fn v1_pframe_without_reference_requires_reference() {
     );
 }
 
+#[test]
+fn v1_pframe_intra_in_p_mb_reconstructs_independent_of_reference() {
+    // v1 has intra-in-P MBs too (MCBPC MB-type 3 = INTRA / 4 = INTRA+Q,
+    // spec/16 §3.1). Unlike v2, v1 reads NO post-VLC ac_pred bit (spec/07
+    // §1.4: "no `call 0x1c215c9b` after the CBPY decode") — every v1 intra
+    // block uses the zigzag scan. The existing v1 intra coverage is all
+    // I-frame; this drives the *P-frame* intra-in-P branch of
+    // decode_pframe_mb_v1v2 (the decode.is_intra arm) through the picture
+    // decoder.
+    let (dims, reference) = gradient_reference();
+    // MCBPC sym 12 → mb_type 3 (INTRA), CBPC 0. CBPY raw 15 → post-wrap 0
+    // (all six blocks DC-only). DC-size 0 each (differential 0).
+    let (mcbpc_code, mcbpc_bl) = code_for(MCBPC_V1_RAW, 12);
+    let (cbpy_code, cbpy_bl) = code_for(CBPY_V1_V2_RAW, 15);
+    let (luma0_code, luma0_bl) = code_for(DC_SIZE_LUMA_V1V2_RAW, 0);
+    let (chroma0_code, chroma0_bl) = code_for(DC_SIZE_CHROMA_V1V2_RAW, 0);
+    let mut fields = v1_pframe_header(8);
+    fields.push((0, 1)); // skip / COD = 0 → not skipped
+    fields.push((mcbpc_code, mcbpc_bl));
+    // NOTE: v1 reads NO ac_pred bit here (contrast the v2 path).
+    fields.push((cbpy_code, cbpy_bl));
+    for _ in 0..4 {
+        fields.push((luma0_code, luma0_bl));
+    }
+    for _ in 0..2 {
+        fields.push((chroma0_code, chroma0_bl));
+    }
+    let bytes = pack(&fields);
+    let mut br = BitReader::new(&bytes);
+    let pic = decode_picture_v1v2(&mut br, dims, MsV1V2Version::V1, Some(&reference))
+        .expect("v1 P-frame with a single intra-in-P MB must decode");
+    assert_eq!(pic.picture_type, PictureType::P);
+    // The intra-in-P MB rebuilds from the DC differentials (all 0 →
+    // predictor 1024 → flat grey 128), NOT a copy of the gradient
+    // reference. This is the load-bearing distinction: an inter/skip MB
+    // would have reproduced the gradient.
+    assert_ne!(
+        pic.y, reference.y,
+        "v1 intra-in-P luma must be reconstructed (not a copy of the gradient reference)",
+    );
+    assert!(
+        pic.y.iter().all(|&p| p == 128),
+        "v1 intra-in-P DC-only luma must reconstruct flat grey 128",
+    );
+}
+
+#[test]
+fn v1_pframe_intra_in_p_coded_block_is_zigzag_only() {
+    // v1 has no ac_pred, so a CBP-coded v1 intra-in-P block always uses
+    // the zigzag scan. Pin that a coded block reconstructs non-uniform
+    // content end-to-end through the v1 P-frame intra-in-P path (the AC
+    // walk fired) — and that the decode does not read a phantom ac_pred
+    // bit (a stray read would desynchronise the AC tokens and corrupt the
+    // block or error). MCBPC sym 12 (mb_type 3, INTRA); to set luma
+    // block 0 only the final CBPY must be 0b1000 = 8 → raw = 15 − 8 = 7.
+    let (dims, reference) = gradient_reference();
+    let (mcbpc_code, mcbpc_bl) = code_for(MCBPC_V1_RAW, 12);
+    let (cbpy_code, cbpy_bl) = code_for(CBPY_V1_V2_RAW, 7); // wrap → 8 (block 0)
+    let (luma0_code, luma0_bl) = code_for(DC_SIZE_LUMA_V1V2_RAW, 0);
+    let (chroma0_code, chroma0_bl) = code_for(DC_SIZE_CHROMA_V1V2_RAW, 0);
+    let (ac0_code, ac0_bl) = g5_code_for(false, 1, 1).expect("G5 (last=false, run=1, level=1)");
+    let (ac1_code, ac1_bl) = g5_code_for(true, 0, 1).expect("G5 (last=true, run=0, level=1)");
+
+    let mut fields = v1_pframe_header(8);
+    fields.push((0, 1)); // skip = 0
+    fields.push((mcbpc_code, mcbpc_bl));
+    fields.push((cbpy_code, cbpy_bl));
+    // Block 0 (luma, coded): DC size 0, then the AC token pair.
+    fields.push((luma0_code, luma0_bl));
+    fields.push((ac0_code, ac0_bl));
+    fields.push((0, 1)); // sign = positive
+    fields.push((ac1_code, ac1_bl));
+    fields.push((0, 1)); // sign = positive
+    for _ in 0..3 {
+        fields.push((luma0_code, luma0_bl));
+    }
+    for _ in 0..2 {
+        fields.push((chroma0_code, chroma0_bl));
+    }
+    let bytes = pack(&fields);
+    let mut br = BitReader::new(&bytes);
+    let pic = decode_picture_v1v2(&mut br, dims, MsV1V2Version::V1, Some(&reference))
+        .expect("v1 P-frame coded intra-in-P MB decodes");
+    assert_eq!(pic.picture_type, PictureType::P);
+
+    // Luma block 0 (top-left 8×8) is non-uniform — the G5 AC token was
+    // applied through the zigzag scan; the other blocks stay flat grey.
+    let first = pic.y[0];
+    let block0_nonuniform = (0..8).any(|j| (0..8).any(|i| pic.y[j * pic.y_stride + i] != first));
+    assert!(
+        block0_nonuniform,
+        "v1 coded intra-in-P luma block 0 must be non-uniform (AC token applied via zigzag)",
+    );
+}
+
 /// End-to-end through the registered decoder: a v2 I-frame packet with
 /// a single DC-only intra MB now decodes to a flat-grey frame (spec/16
 /// §2 unblocks the v1/v2 intra path).
