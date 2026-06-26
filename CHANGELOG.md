@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Tests
+
+- round 374: **picture-level coverage of the intra-in-P macroblock path
+  across all three versions.** Every prior P-frame picture-level test
+  decoded an *inter* MB; the `decode.is_intra` branch of the v3 / v1 / v2
+  P-frame drivers (the intra-in-P MB, reached after the skip bit when the
+  joint-MCBPCY / MCBPC index lands in the intra partition) was shipping
+  but untested end-to-end. Six new tests close that:
+  - `tests/v3_pframe_intra_in_p.rs` (4 tests): a v3 P-frame with a single
+    intra-in-P MB (joint-MCBPCY idx < 64, the I-type/low half per patent
+    US 6,563,953 Table 1 / `audit/02` §1.4) reconstructs intra content
+    *independent of the reference* (DC-only → spatially uniform, not a
+    copy of a striped reference); the post-VLC ac_pred bit (spec/05 §3.2)
+    is consumed under both polarities; and on a **CBP-coded** block a real
+    G3 `(run=1, level=1)` AC token lands at a different natural position
+    under zigzag (ac_pred=0) vs alternate-horizontal (ac_pred=1), so the
+    two reconstructions DIFFER — proving the ac_pred bit genuinely routes
+    into the scan dispatch.
+  - `tests/v1_v2_pframe.rs` (+4 tests): the v2 analogue of the
+    CBP-coded ac_pred scan-flip (spec/07 §2.4, G5 luma per spec/14 §3.2);
+    plus the **v1** P-frame intra-in-P path, which reads **no** ac_pred
+    bit (spec/07 §1.4) — a DC-only pin (reconstructs flat grey 128, not a
+    gradient-reference copy) and a CBP-coded zigzag-only pin (the G5 AC
+    walk fires without a phantom ac_pred read desynchronising the stream).
+  - `src/picture.rs` (+1 lib test): a 2-MB v3 P-frame with an intra-in-P
+    MB(0,0) followed by an inter MB(1,0) — the intra-in-P MB must leave
+    its `MvGrid` cell `Absent` (not leak a MV), so MB(1,0)'s §7.6.5
+    predictor is the rule-4 all-zero predictor and its final MV equals its
+    raw residual; reconstructed independently via `apply_mc_to_mb`.
+  Lib tests 424 → 425; integration tests +9
+  (`v3_pframe_intra_in_p.rs` new with 4; `v1_v2_pframe.rs` 18 → 22).
+  Purely additive; no runtime path changed.
+
 ### Added
 
 - round 366: make the **v3 1-MV-per-MB invariant a first-class,

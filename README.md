@@ -50,6 +50,7 @@ pending Auditor item.
 | P-frame 1-MV predictor (Figure 7-34)           | complete (picture-level median-propagation pin, round 359) |
 | 4-MV-per-MB predictor surface + neighbour resolver | complete (per-block bordering-cell pick; INTER4V→1-MV-neighbour propagation picture-level-pinned, round 366) |
 | V3 intra-luma I-frame end-to-end via `decode_picture` | complete |
+| Intra-in-P MB (v1/v2/v3) picture-level pixel path | complete (round 374: v3 + v1/v2 intra-in-P pinned end-to-end through `decode_picture`; ac_pred scan-flip on a CBP-coded block, v1 zigzag-only, intra-in-P → `Absent` predictor cell) |
 | V1 / V2 P-frame pixel pipeline (incl. INTER+Q + INTER4V) | complete (INTER4V luma + §7.6.3.4 chroma + per-MB-neighbour propagation picture-level-pinned, round 366) |
 | V1 P-frame MB-type table (`MB_TYPE_V1_INFO`)   | complete (binary-extracted, spec/16 §3) |
 | V1 / V2 intra pipeline (I-frame + intra-in-P)  | complete (size+value DC, spec/16 §2) |
