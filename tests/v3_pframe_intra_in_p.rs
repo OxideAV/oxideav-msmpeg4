@@ -412,3 +412,98 @@ fn v3_pframe_intra_in_p_coded_block_consults_ac_pred_scan() {
          → picture.rs scan dispatch)",
     );
 }
+
+/// Build a 16×16 single-MB v3 I-frame, DC-only (one intra MB, CBP=0,
+/// every DC differential 0). I-frames carry no skip bit and read the
+/// extra `ac_luma_sel` header field (spec/01 §1.4).
+fn build_v3_iframe_dc_only() -> Vec<u8> {
+    let mut fields: Vec<(u32, u32)> = vec![
+        (0, 2), // picture_type = I
+        (8, 5), // pquant = 8
+        (0, 1), // ac_chroma_sel = 0 (→ G2)
+        (0, 1), // ac_luma_sel = 0 (→ G3) — I-frame only
+        (0, 1), // dc_size_sel = 0
+    ];
+    // One intra MB: no skip bit (I-frame), MCBPCY idx 0 (CBP=0), ac_pred,
+    // six DC-only blocks.
+    let (mc_code, mc_bl) = mcbpcy_code_for(0);
+    fields.push((mc_code, mc_bl));
+    fields.push((0, 1)); // ac_pred = 0
+    for _ in 0..4 {
+        let (bl, code) = INTRA_DC_LUMA_SEL0_RAW[0];
+        fields.push((code, bl));
+    }
+    for _ in 0..2 {
+        let (bl, code) = INTRA_DC_CHROMA_SEL0_RAW[0];
+        fields.push((code, bl));
+    }
+    fields.push((0, 32));
+    pack(&fields)
+}
+
+#[test]
+fn registered_decoder_v3_iframe_then_intra_in_p_pframe_sequence() {
+    // Drive an I-frame followed by an intra-in-P P-frame through the
+    // **registered Decoder trait** (send_packet / receive_frame), not the
+    // lower-level decode_picture entry. This exercises the parts the
+    // decode_picture tests skip: the classifier dispatch, the `last_picture`
+    // reference threading across packets, and the picture→Frame::Video
+    // plane conversion. Deterministic (no ffmpeg dependency).
+    use oxideav_core::time::TimeBase;
+    use oxideav_core::{CodecId, CodecParameters, CodecRegistry, Frame, Packet};
+
+    let mut reg = CodecRegistry::new();
+    oxideav_msmpeg4::register_codecs(&mut reg);
+    let mut params = CodecParameters::video(CodecId::new("msmpeg4v3"));
+    params.width = Some(16);
+    params.height = Some(16);
+    let mut dec = reg.first_decoder(&params).expect("v3 decoder creation");
+
+    // I-frame packet → flat-grey DC-only frame; also becomes last_picture.
+    let i_bytes = build_v3_iframe_dc_only();
+    let i_pkt = Packet::new(0, TimeBase::new(1, 25), i_bytes)
+        .with_pts(0)
+        .with_keyframe(true);
+    dec.send_packet(&i_pkt).expect("v3 I-frame send_packet");
+    let i_frame = dec.receive_frame().expect("I-frame output");
+    let i_vf = match i_frame {
+        Frame::Video(vf) => vf,
+        other => panic!("expected Frame::Video for I-frame, got {other:?}"),
+    };
+    assert_eq!(i_vf.planes.len(), 3, "YUV420 → 3 planes");
+    // DC-only intra I-frame → flat grey 128.
+    for row in 0..16usize {
+        for col in 0..16usize {
+            assert_eq!(
+                i_vf.planes[0].data[row * i_vf.planes[0].stride + col],
+                128,
+                "v3 I-frame DC-only luma ({row}, {col}) must be flat grey 128",
+            );
+        }
+    }
+
+    // P-frame packet with a single intra-in-P MB. It is decoded against
+    // the retained I-frame reference but, being intra-in-P, reconstructs
+    // independently → flat grey 128 again (DC-only). The point is that the
+    // registered decoder threaded the reference and the intra-in-P branch
+    // ran through the full public path.
+    let p_bytes = build_v3_pframe_intra_in_p(0);
+    let p_pkt = Packet::new(0, TimeBase::new(1, 25), p_bytes).with_pts(1);
+    dec.send_packet(&p_pkt)
+        .expect("v3 intra-in-P P-frame send_packet (reference threaded from the I-frame)");
+    let p_frame = dec.receive_frame().expect("P-frame output");
+    let p_vf = match p_frame {
+        Frame::Video(vf) => vf,
+        other => panic!("expected Frame::Video for P-frame, got {other:?}"),
+    };
+    assert_eq!(p_vf.planes.len(), 3);
+    for row in 0..16usize {
+        for col in 0..16usize {
+            assert_eq!(
+                p_vf.planes[0].data[row * p_vf.planes[0].stride + col],
+                128,
+                "v3 intra-in-P P-frame DC-only luma ({row}, {col}) must be flat grey 128",
+            );
+        }
+    }
+}

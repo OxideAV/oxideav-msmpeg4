@@ -36,8 +36,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     its `MvGrid` cell `Absent` (not leak a MV), so MB(1,0)'s §7.6.5
     predictor is the rule-4 all-zero predictor and its final MV equals its
     raw residual; reconstructed independently via `apply_mc_to_mb`.
-  Lib tests 424 → 425; integration tests +9
-  (`v3_pframe_intra_in_p.rs` new with 4; `v1_v2_pframe.rs` 18 → 22).
+  - `tests/v3_pframe_intra_in_p.rs` (+1 test): a **deterministic** (no
+    ffmpeg) I-frame → intra-in-P P-frame sequence driven through the
+    registered `Decoder` trait (`send_packet` / `receive_frame`) — covers
+    the classifier dispatch, the `last_picture` reference threading across
+    packets, and the `picture → Frame::Video` plane conversion that the
+    `decode_picture` tests skip.
+  Lib tests 424 → 425; integration tests +10
+  (`v3_pframe_intra_in_p.rs` new with 5; `v1_v2_pframe.rs` 18 → 22).
   Purely additive; no runtime path changed.
 
 ### Added
