@@ -142,6 +142,7 @@ use oxideav_core::{CodecInfo, CodecRegistry, Decoder};
 
 pub mod ac;
 pub mod dc_pred;
+pub mod enc;
 pub mod g_descriptor;
 pub mod g_enum;
 pub mod g_family;
