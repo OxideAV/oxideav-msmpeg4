@@ -79,6 +79,63 @@ pub fn dequantise_h263(coeffs: &mut [i32; 64], quant: u32, level_start: usize) -
     Ok(())
 }
 
+/// Encoder-side H.263 quantisation — the inverse of
+/// [`dequantise_h263`].
+///
+/// Maps one float DCT-domain coefficient to the bitstream "level" the
+/// AC walk encodes. The reconstruction rule is spec/08 §5
+/// (`sign · (|level| · 2q + q − even_flag)`), i.e. the decoder's
+/// reconstruction points sit at `2q·L + bias` with
+/// `bias = q − even_flag`, so the encoder inverts that affine map:
+/// `|level| = round((|coeff| − bias) / (2q))` clamped at 0. For any
+/// non-zero chosen level the reconstruction lands within `q` of the
+/// target; coefficients that quantise to level 0 sit in the implicit
+/// dead zone below the first reconstruction point (`2q + bias`), where
+/// the error can reach `~2q` — the standard H.263-style dead-zone
+/// behaviour. Which level an encoder emits is NOT a conformance
+/// surface (any level decodes); this choice just minimises the
+/// per-coefficient reconstruction error outside the dead zone.
+///
+/// Returns a level clamped to `[-127, 127]` so the verbatim ESC tier
+/// (8-bit signed level field, spec/04 §1.3 step 10 / §2.3 tier 3) can
+/// always represent it.
+pub fn quantise_h263(coeff: f32, quant: u32) -> i32 {
+    let q = quant as f32;
+    let even_flag = 1.0 - (quant % 2) as f32;
+    let bias = q - even_flag;
+    let level = ((coeff.abs() - bias) / (2.0 * q)).round().max(0.0) as i32;
+    let level = level.min(127);
+    if coeff < 0.0 {
+        -level
+    } else {
+        level
+    }
+}
+
+/// Quantise a whole 8×8 float DCT block into bitstream levels,
+/// starting at `level_start` (0 for inter — DC is a coded coefficient
+/// — and 1 for intra where the DC goes through the DC-scaler path
+/// instead). Positions before `level_start` are left untouched.
+///
+/// Returns the number of non-zero levels produced at or after
+/// `level_start`.
+pub fn quantise_block_h263(
+    coeffs: &[f32; 64],
+    quant: u32,
+    level_start: usize,
+    out: &mut [i32; 64],
+) -> u32 {
+    let mut nz = 0u32;
+    for i in level_start..64 {
+        let lv = quantise_h263(coeffs[i], quant);
+        out[i] = lv;
+        if lv != 0 {
+            nz += 1;
+        }
+    }
+    nz
+}
+
 /// Luma DC scaler by quantiser — MPEG-4 Part 2 Table 7-2, which
 /// MS-MPEG4v3 reuses unchanged.
 pub const Y_DC_SCALE_TABLE: [u8; 32] = [
@@ -191,6 +248,61 @@ mod tests {
         let mut c = [0i32; 64];
         assert!(dequantise_h263(&mut c, 0, 0).is_err());
         assert!(dequantise_h263(&mut c, 32, 0).is_err());
+    }
+
+    #[test]
+    fn quantise_then_dequantise_stays_within_q() {
+        // For every quant and a sweep of DCT-domain magnitudes, the
+        // encoder-side level must reconstruct to within q of the target
+        // (the nearest-reconstruction property), except where the
+        // ±127-level clamp saturates.
+        for q in 1..=31u32 {
+            for mag in [0i32, 1, 5, 17, 60, 200, 900, 2000] {
+                for sign in [1i32, -1] {
+                    let coeff = (mag * sign) as f32;
+                    let lv = quantise_h263(coeff, q);
+                    if lv.unsigned_abs() == 127 {
+                        continue; // saturated — no distance guarantee
+                    }
+                    let mut c = [0i32; 64];
+                    c[1] = lv;
+                    dequantise_h263(&mut c, q, 1).unwrap();
+                    let recon = if lv == 0 { 0 } else { c[1] };
+                    // Non-zero levels reconstruct within q of the
+                    // target; level 0 sits in the dead zone below the
+                    // first reconstruction point (error < 2q).
+                    let bound = if lv == 0 { 2 * q } else { q + 1 };
+                    assert!(
+                        (recon - mag * sign).unsigned_abs() <= bound,
+                        "q={q} coeff={coeff}: level={lv} recon={recon}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn quantise_zero_is_zero_and_sign_is_preserved() {
+        assert_eq!(quantise_h263(0.0, 8), 0);
+        assert!(quantise_h263(100.0, 4) > 0);
+        assert!(quantise_h263(-100.0, 4) < 0);
+        // Clamps to the verbatim-ESC-representable ±127.
+        assert_eq!(quantise_h263(10_000.0, 1), 127);
+        assert_eq!(quantise_h263(-10_000.0, 1), -127);
+    }
+
+    #[test]
+    fn quantise_block_respects_level_start() {
+        let mut coeffs = [0.0f32; 64];
+        coeffs[0] = 500.0;
+        coeffs[1] = 100.0;
+        coeffs[10] = -60.0;
+        let mut out = [0i32; 64];
+        out[0] = 77; // must survive level_start = 1
+        let nz = quantise_block_h263(&coeffs, 4, 1, &mut out);
+        assert_eq!(out[0], 77);
+        assert_eq!(nz, 2);
+        assert!(out[1] > 0 && out[10] < 0);
     }
 
     #[test]
