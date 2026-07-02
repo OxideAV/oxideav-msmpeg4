@@ -29,7 +29,7 @@
 //! This parser implements the v3 path. v1/v2 have different header
 //! shapes (spec §2.4) and are rejected here.
 
-use oxideav_core::bits::BitReader;
+use oxideav_core::bits::{BitReader, BitWriter};
 use oxideav_core::{Error, Result};
 
 use crate::g_family::GFamily;
@@ -78,6 +78,28 @@ fn read_unary_cap2(br: &mut BitReader<'_>) -> Result<u8> {
     } else {
         Ok(2)
     }
+}
+
+/// Write a unary-capped-at-2 value — the exact inverse of
+/// [`read_unary_cap2`]: `0 → 0`, `1 → 10`, `2 → 11`.
+fn write_unary_cap2(bw: &mut BitWriter, v: u8) -> Result<()> {
+    match v {
+        0 => bw.write_bit(false),
+        1 => {
+            bw.write_bit(true);
+            bw.write_bit(false);
+        }
+        2 => {
+            bw.write_bit(true);
+            bw.write_bit(true);
+        }
+        other => {
+            return Err(Error::invalid(format!(
+                "msmpeg4v3: unary-cap2 selector {other} out of range 0..=2"
+            )));
+        }
+    }
+    Ok(())
 }
 
 impl MsV3PictureHeader {
@@ -134,6 +156,49 @@ impl MsV3PictureHeader {
             dc_size_sel,
             mv_table_sel,
         })
+    }
+
+    /// Serialise this picture header — the exact bit-level inverse of
+    /// [`MsV3PictureHeader::parse`] (per-frame parser
+    /// `0x1c211f0c..0x1c2120a4`, spec/99 §2.2 / §2.3): 2-bit
+    /// picture_type (0 = I, 1 = P), 5-bit PQUANT, then the per-frame
+    /// selector cluster in frame-type order — I-frames write
+    /// `ac_chroma_sel` (unary-cap2), `ac_luma_sel` (unary-cap2),
+    /// `dc_size_sel` (1 bit); P-frames write `ac_chroma_sel`
+    /// (unary-cap2), `dc_size_sel` (1 bit), `mv_table_sel` (1 bit).
+    /// Fields a frame type does not carry on the wire (`ac_luma_sel`
+    /// on P, `mv_table_sel` on I) must be left at the parser's zero
+    /// default and are not written.
+    pub fn write(&self, bw: &mut BitWriter) -> Result<()> {
+        if !(1..=31).contains(&self.quant) {
+            return Err(Error::invalid(format!(
+                "msmpeg4v3: pquant {} out of range 1..=31",
+                self.quant
+            )));
+        }
+        if self.dc_size_sel > 1 || self.mv_table_sel > 1 {
+            return Err(Error::invalid(
+                "msmpeg4v3: dc_size_sel / mv_table_sel must be 0 or 1",
+            ));
+        }
+        match self.picture_type {
+            PictureType::I => bw.write_u32(0, 2),
+            PictureType::P => bw.write_u32(1, 2),
+        }
+        bw.write_u32(self.quant as u32, 5);
+        match self.picture_type {
+            PictureType::I => {
+                write_unary_cap2(bw, self.ac_chroma_sel)?;
+                write_unary_cap2(bw, self.ac_luma_sel)?;
+                bw.write_u32(self.dc_size_sel as u32, 1);
+            }
+            PictureType::P => {
+                write_unary_cap2(bw, self.ac_chroma_sel)?;
+                bw.write_u32(self.dc_size_sel as u32, 1);
+                bw.write_u32(self.mv_table_sel as u32, 1);
+            }
+        }
+        Ok(())
     }
 
     /// Typed dispatch of the parsed `ac_chroma_sel` raw `u8` to the

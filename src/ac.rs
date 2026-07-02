@@ -47,7 +47,7 @@
 //! dequantise → IDCT) parameterised by a [`AcVlcTable`] so the table
 //! can be plugged in without API churn.
 
-use oxideav_core::bits::BitReader;
+use oxideav_core::bits::{BitReader, BitWriter};
 use oxideav_core::{Error, Result};
 
 use crate::iq::dequantise_h263;
@@ -1108,6 +1108,237 @@ fn decode_escape_body(br: &mut BitReader<'_>, table: &AcVlcTable) -> Result<Toke
     // it as "no coefficient added" (caller loop bails on last=1).
     let level = level_raw.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
     Ok(Token { last, run, level })
+}
+
+// ====================================================================
+// Encoder side — bit-level inverses of decode_token / the AC walkers.
+// ====================================================================
+
+/// Find the primary-VLC entry for a concrete `(last, run, |level|)`
+/// triple, if the alphabet carries one.
+fn find_run_level_entry(
+    table: &AcVlcTable,
+    last: bool,
+    run: u8,
+    level_mag: u16,
+) -> Option<&'static VlcEntry<Symbol>> {
+    table.entries.iter().find(|e| {
+        matches!(e.value, Symbol::RunLevel { last: l, run: r, level: v }
+            if l == last && r == run && v == level_mag)
+    })
+}
+
+/// Find the ESC entry of a primary VLC table.
+fn escape_entry(table: &AcVlcTable) -> Option<&'static VlcEntry<Symbol>> {
+    table
+        .entries
+        .iter()
+        .find(|e| matches!(e.value, Symbol::Escape))
+}
+
+/// Encode one `(last, run, level)` token — the bit-level inverse of
+/// [`decode_token`]. Tier preference mirrors the escape chain the
+/// decoder walks (spec/04 §2.3):
+///
+/// 1. **Primary**: the triple has its own codeword → codeword + AC
+///    sign bit (standard MPEG-4 convention, bit `1` ⇒ negative).
+/// 2. **Tier-1 level extension** (tables with LMAX/RMAX, i.e. the
+///    intra 3-tier kernel): `ESC` + the codeword of
+///    `(last, run, |level| − LMAX[last][run])` + sign.
+/// 3. **Tier-2 run extension**: `ESC ESC` + the codeword of
+///    `(last, run − RMAX[last][|level|] − 1, |level|)` + sign.
+/// 4. **Verbatim FLC tier**: for 3-tier tables `ESC ESC ESC`, for
+///    1-tier tables (`lmax`/`rmax` absent — the inter kernel,
+///    spec/04 §1.3 step 10) a single `ESC`; then the fixed-length
+///    `last(1) + run(6) + level(8, two's-complement)` triple.
+///
+/// `level` must be non-zero, `run <= 63`, and `|level| <= 127` (every
+/// quantiser output from [`crate::iq::quantise_h263`] satisfies the
+/// clamp; the verbatim tier's 8-bit signed field is the binding
+/// constraint).
+pub fn encode_token(bw: &mut BitWriter, table: &AcVlcTable, tok: Token) -> Result<()> {
+    if tok.level == 0 {
+        return Err(Error::invalid("msmpeg4 ac encode: level 0 token"));
+    }
+    if tok.run > 63 {
+        return Err(Error::invalid(format!(
+            "msmpeg4 ac encode: run {} exceeds 63",
+            tok.run
+        )));
+    }
+    let level_mag = tok.level.unsigned_abs();
+    let negative = tok.level < 0;
+
+    // Tier 0 — primary codeword.
+    if level_mag <= u8::MAX as u16 {
+        if let Some(e) = find_run_level_entry(table, tok.last, tok.run, level_mag) {
+            bw.write_u32(e.code, e.bits as u32);
+            bw.write_bit(negative);
+            return Ok(());
+        }
+    }
+
+    let esc = escape_entry(table).ok_or_else(|| {
+        Error::invalid("msmpeg4 ac encode: table has no ESC codeword for an out-of-alphabet token")
+    })?;
+    let three_tier = table.lmax.is_some() && table.rmax.is_some();
+
+    if let (Some(lmax), Some(rmax)) = (table.lmax, table.rmax) {
+        // Tier 1 — level extension: |level| = base + LMAX[last][run].
+        let last_idx = tok.last as usize;
+        let lmax_v = lmax[last_idx][tok.run as usize] as u16;
+        if lmax_v > 0 && level_mag > lmax_v {
+            let base = level_mag - lmax_v;
+            if let Some(e) = find_run_level_entry(table, tok.last, tok.run, base) {
+                bw.write_u32(esc.code, esc.bits as u32);
+                bw.write_u32(e.code, e.bits as u32);
+                bw.write_bit(negative);
+                return Ok(());
+            }
+        }
+        // Tier 2 — run extension: run = base + RMAX[last][|level|] + 1.
+        if (level_mag as usize) < 32 {
+            let rmax_v = rmax[last_idx][level_mag as usize];
+            if tok.run > rmax_v {
+                let run_base = tok.run - rmax_v - 1;
+                if let Some(e) = find_run_level_entry(table, tok.last, run_base, level_mag) {
+                    bw.write_u32(esc.code, esc.bits as u32);
+                    bw.write_u32(esc.code, esc.bits as u32);
+                    bw.write_u32(e.code, e.bits as u32);
+                    bw.write_bit(negative);
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    // Verbatim FLC tier.
+    if !(-128..=127).contains(&tok.level) {
+        return Err(Error::invalid(format!(
+            "msmpeg4 ac encode: level {} exceeds the verbatim 8-bit tier",
+            tok.level
+        )));
+    }
+    let esc_fires = if three_tier { 3 } else { 1 };
+    for _ in 0..esc_fires {
+        bw.write_u32(esc.code, esc.bits as u32);
+    }
+    bw.write_u32(tok.last as u32, table.esc_last_bits as u32);
+    bw.write_u32(tok.run as u32, table.esc_run_bits as u32);
+    bw.write_u32(tok.level as u32 & 0xff, table.esc_level_bits as u32);
+    Ok(())
+}
+
+/// Serialise the non-zero levels of one intra block's AC plane — the
+/// bit-level inverse of [`decode_intra_ac`]. `levels` is the block in
+/// **natural (raster) order** carrying the bitstream levels (i.e. the
+/// quantised values *before* dequantisation, exactly what
+/// `decode_intra_ac` writes); position 0 (DC) is ignored. The walk
+/// visits `scan` order starting at `start_pos` (normally 1) and emits
+/// one token per non-zero level, with the sub-class `last` flag set on
+/// the final token per spec/13 §2.
+///
+/// Errors if the block has no non-zero AC level at or after
+/// `start_pos` — a caller that found CBP = 0 must not invoke the AC
+/// walk at all (there is no EOB-only token in the alphabet).
+pub fn encode_intra_ac(
+    bw: &mut BitWriter,
+    levels: &[i32; 64],
+    scan: Scan,
+    table: &AcVlcTable,
+    start_pos: usize,
+) -> Result<()> {
+    if !(1..=64).contains(&start_pos) {
+        return Err(Error::invalid(format!(
+            "msmpeg4 ac encode: start_pos {start_pos} out of range [1, 64]"
+        )));
+    }
+    let order = scan.table();
+    let coded: Vec<(usize, i32)> = (start_pos..64)
+        .filter_map(|pos| {
+            let lv = levels[order[pos]];
+            if lv == 0 {
+                None
+            } else {
+                Some((pos, lv))
+            }
+        })
+        .collect();
+    if coded.is_empty() {
+        return Err(Error::invalid(
+            "msmpeg4 ac encode: intra AC walk invoked on an all-zero block \
+             (CBP bit should have been 0)",
+        ));
+    }
+    let mut prev_pos = start_pos;
+    let mut first = true;
+    let n = coded.len();
+    for (i, &(pos, lv)) in coded.iter().enumerate() {
+        // decode_intra_ac: pos_0 = start_pos + run_0;
+        // pos_i = pos_{i-1} + 1 + run_i.
+        let run = if first {
+            pos - prev_pos
+        } else {
+            pos - prev_pos - 1
+        };
+        first = false;
+        prev_pos = pos;
+        encode_token(
+            bw,
+            table,
+            Token {
+                last: i + 1 == n,
+                run: run as u8,
+                level: lv.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+            },
+        )?;
+    }
+    Ok(())
+}
+
+/// Serialise one inter block's levels — the bit-level inverse of
+/// [`decode_inter_ac`]. `levels` is the block in natural order with
+/// the DC at position 0 a coded coefficient like every other (the
+/// inter kernel starts its scan at 0, spec/04 §1.3 / §2.6); the scan
+/// is fixed zigzag. Errors on an all-zero block (the CBP bit should
+/// have been 0).
+pub fn encode_inter_ac(bw: &mut BitWriter, levels: &[i32; 64], table: &AcVlcTable) -> Result<()> {
+    let order = &ZIGZAG;
+    let coded: Vec<(usize, i32)> = (0..64)
+        .filter_map(|pos| {
+            let lv = levels[order[pos]];
+            if lv == 0 {
+                None
+            } else {
+                Some((pos, lv))
+            }
+        })
+        .collect();
+    if coded.is_empty() {
+        return Err(Error::invalid(
+            "msmpeg4 ac encode: inter AC walk invoked on an all-zero block \
+             (CBP bit should have been 0)",
+        ));
+    }
+    let mut prev_pos = 0usize;
+    let mut first = true;
+    let n = coded.len();
+    for (i, &(pos, lv)) in coded.iter().enumerate() {
+        // decode_inter_ac: pos_0 = run_0; pos_i = pos_{i-1} + 1 + run_i.
+        let run = if first { pos } else { pos - prev_pos - 1 };
+        first = false;
+        prev_pos = pos;
+        encode_token(
+            bw,
+            table,
+            Token {
+                last: i + 1 == n,
+                run: run as u8,
+                level: lv.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+            },
+        )?;
+    }
+    Ok(())
 }
 
 /// Decode one full 8×8 AC block and place the coefficients into

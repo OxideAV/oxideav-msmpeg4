@@ -24,7 +24,7 @@
 //! spec and we don't need it to recover the joint index — canonical
 //! Huffman codes are fully determined by the length array alone.
 
-use oxideav_core::bits::BitReader;
+use oxideav_core::bits::{BitReader, BitWriter};
 use oxideav_core::{Error, Result};
 
 use crate::tables::CBPY_INTRA_TABLE;
@@ -181,6 +181,40 @@ pub fn decode_mcbpcy(br: &mut BitReader<'_>) -> Result<McbpcyDecode> {
         cbp_cb,
         cbp_cr,
     })
+}
+
+/// Encode one v3 joint-MCBPCY symbol — the bit-level inverse of
+/// [`decode_mcbpcy`]. `idx` is the raw joint index 0..=127: the low 6
+/// bits are the CBP pattern (bit 5 = Y0 … bit 1 = Cb, bit 0 = Cr) and
+/// bit 6 selects the P-type (inter) half of the alphabet per patent
+/// US 6,563,953 Table 1 / `audit/02` §1.4 — an I-frame or intra-in-P
+/// MB uses `idx = cbp` (0..=63), an inter MB uses `idx = 64 + cbp`.
+///
+/// The codeword written is the same canonical-Huffman assignment the
+/// decoder's table builder reconstructs from the `region_05eac8`
+/// bit-length array (spec/99 §3.1), so encode → decode round-trips by
+/// construction. (Whether that canonical assignment matches the
+/// original binary's wire codes is the open MCBPCY re-extraction item
+/// documented in the README; the encoder targets this crate's decoder.)
+pub fn encode_mcbpcy(bw: &mut BitWriter, idx: u8) -> Result<()> {
+    if idx as usize >= MCBPCY_V3_RAW.len() {
+        return Err(Error::invalid(format!(
+            "msmpeg4v3 mcbpcy: joint index {idx} out of alphabet 0..=127"
+        )));
+    }
+    let entry = table()
+        .iter()
+        .find(|e| e.value == idx)
+        .ok_or_else(|| Error::invalid(format!("msmpeg4v3 mcbpcy: index {idx} has no codeword")))?;
+    bw.write_u32(entry.code, entry.bits as u32);
+    Ok(())
+}
+
+/// Compose the 6-bit CBP pattern from its per-block components — the
+/// inverse of the [`decode_mcbpcy`] split (`cbpy` in bits 5..2, Cb in
+/// bit 1, Cr in bit 0).
+pub const fn compose_cbp(cbpy: u8, cbp_cb: bool, cbp_cr: bool) -> u8 {
+    ((cbpy & 0xf) << 2) | ((cbp_cb as u8) << 1) | (cbp_cr as u8)
 }
 
 /// P-frame MCBPCY parse: first read a 1-bit `skip` flag; if skipped,

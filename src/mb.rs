@@ -18,7 +18,7 @@
 
 use std::sync::OnceLock;
 
-use oxideav_core::bits::BitReader;
+use oxideav_core::bits::{BitReader, BitWriter};
 use oxideav_core::{Error, Result};
 
 use crate::ac::{decode_intra_ac, AcVlcTable, Scan};
@@ -337,6 +337,62 @@ pub fn decode_intra_dc_diff_v3(
     // Same MS-MPEG4 sign convention as ESC tier per spec/07 §5.2:
     // sign bit unset ⇒ negate the magnitude.
     Ok(if sign { mag } else { -mag })
+}
+
+/// Encode one v3 intra-DC differential — the bit-level inverse of
+/// [`decode_intra_dc_diff_v3`] (kernel `0x1c216cf8`, spec/07 §5.4).
+///
+/// * `diff == 0` → the idx-0 codeword alone (no sign bit, per the
+///   `test al, al; je` short-circuit at `1c216d2a`).
+/// * `1 <= |diff| <= 118` with a present codeword (some magnitudes are
+///   bit-length-0 holes in the extracted tables) → the magnitude's
+///   codeword followed by the MS-MPEG4 DC sign bit. Per spec/07 §5.2
+///   the DC sign convention is **inverted** relative to the AC walk:
+///   sign bit `1` ⇒ positive, `0` ⇒ negative (`if sign==0 neg eax`).
+/// * otherwise → the ESC codeword (idx 119), an 8-bit raw magnitude,
+///   then the same inverted sign bit. Magnitudes above 255 are not
+///   representable and error out (the intra DC differential of any
+///   realisable 8-bit pel block stays well inside ±255 at the minimum
+///   DC scaler of 8).
+pub fn encode_intra_dc_diff_v3(
+    bw: &mut BitWriter,
+    block_idx: usize,
+    dc_size_sel: u8,
+    diff: i32,
+) -> Result<()> {
+    let table = dc_table(block_idx, dc_size_sel);
+    let esc = dc_esc_index(block_idx, dc_size_sel);
+    let write_idx = |bw: &mut BitWriter, idx: usize| -> Result<()> {
+        let entry = table
+            .iter()
+            .find(|e| e.value as usize == idx)
+            .ok_or_else(|| {
+                Error::invalid(format!(
+                    "msmpeg4v3 intra DC: magnitude {idx} has no codeword (bit-length hole)"
+                ))
+            })?;
+        bw.write_u32(entry.code, entry.bits as u32);
+        Ok(())
+    };
+    if diff == 0 {
+        return write_idx(bw, 0);
+    }
+    let mag = diff.unsigned_abs() as usize;
+    let positive = diff > 0;
+    if mag < esc && write_idx(bw, mag).is_ok() {
+        // Direct-magnitude codeword + inverted sign bit.
+        bw.write_bit(positive);
+        return Ok(());
+    }
+    if mag > 255 {
+        return Err(Error::invalid(format!(
+            "msmpeg4v3 intra DC: |diff| {mag} exceeds the 8-bit ESC tier"
+        )));
+    }
+    write_idx(bw, esc)?;
+    bw.write_u32(mag as u32, 8);
+    bw.write_bit(positive);
+    Ok(())
 }
 
 /// Reconstruct the DC coefficient value for one intra block, combining

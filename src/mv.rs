@@ -58,7 +58,7 @@
 //! table include div3.avi frames 37/38/40 and div4.avi frames 1/16 per
 //! `memory/project_msmpeg4_runtime_binding_clues.md` §2.1.
 
-use oxideav_core::bits::BitReader;
+use oxideav_core::bits::{BitReader, BitWriter};
 use oxideav_core::{Error, Result};
 
 use crate::tables_data::{
@@ -298,6 +298,139 @@ fn decode_mv_variant(
     let mv_x = wrap_component(raw_x as i32 + predictor.x as i32 - 32);
     let mv_y = wrap_component(raw_y as i32 + predictor.y as i32 - 32);
     Ok(Mv { x: mv_x, y: mv_y })
+}
+
+/// Encoder-side inverse map for one v3 joint-MV VLC variant: for each
+/// `(raw_x, raw_y)` byte pair in `0..64 × 0..64`, the joint symbol
+/// index with the **shortest codeword** that decodes to that pair
+/// through the paired byte LUTs, or `u16::MAX` when no non-ESC symbol
+/// covers the pair (→ the encoder falls back to the ESC + 6+6-bit FLC
+/// tail, which can express every pair).
+struct MvEncodeLut {
+    best_idx: Box<[u16; 4096]>,
+}
+
+impl MvEncodeLut {
+    fn build(vlc_table: &[VlcEntry<u16>], mvdx_lut: &[u8; 1104], mvdy_lut: &[u8; 1104]) -> Self {
+        let mut best_idx = vec![u16::MAX; 4096].into_boxed_slice();
+        let mut best_bits = vec![u8::MAX; 4096].into_boxed_slice();
+        for e in vlc_table {
+            let idx = e.value as usize;
+            if idx >= MV_V3_ESC_INDEX {
+                continue; // ESC handled by the caller's fallback
+            }
+            let rx = mvdx_lut[idx] as usize;
+            let ry = mvdy_lut[idx] as usize;
+            if rx >= 64 || ry >= 64 {
+                continue; // outside the 6-bit residual domain
+            }
+            let key = rx * 64 + ry;
+            if e.bits < best_bits[key] {
+                best_bits[key] = e.bits;
+                best_idx[key] = e.value;
+            }
+        }
+        let best_idx: Box<[u16; 4096]> = best_idx.try_into().expect("length 4096");
+        Self { best_idx }
+    }
+
+    fn lookup(&self, raw_x: u8, raw_y: u8) -> Option<u16> {
+        let v = self.best_idx[raw_x as usize * 64 + raw_y as usize];
+        if v == u16::MAX {
+            None
+        } else {
+            Some(v)
+        }
+    }
+}
+
+static MV_V3_ENCODE_LUT: std::sync::OnceLock<MvEncodeLut> = std::sync::OnceLock::new();
+static MV_V3_ALT_ENCODE_LUT: std::sync::OnceLock<MvEncodeLut> = std::sync::OnceLock::new();
+
+fn encode_lut(mv_table: MvTable) -> &'static MvEncodeLut {
+    match mv_table {
+        MvTable::Default => MV_V3_ENCODE_LUT
+            .get_or_init(|| MvEncodeLut::build(table(), MVDX_V3_BYTES, MVDY_V3_BYTES)),
+        MvTable::Alternate => MV_V3_ALT_ENCODE_LUT
+            .get_or_init(|| MvEncodeLut::build(alt_table(), MVDX_V3_ALT_BYTES, MVDY_V3_ALT_BYTES)),
+    }
+}
+
+/// Map one final MV component + predictor component to the biased
+/// on-wire residual byte in `0..64` — the inverse of the
+/// [`decode_mv_variant`] arithmetic (`mv = wrap(raw + pred − 32)`,
+/// spec/06 §3.5). The residual is unique mod 64; whether the decoder's
+/// single-pass wrap then reproduces `mv` (rather than `mv ± 64`) is
+/// checked by [`mv_component_reachable`] — the toroidal coding makes a
+/// component reachable from a predictor only within a contiguous
+/// 64-wide window around it.
+fn raw_component(mv: i8, pred: i8) -> u8 {
+    (mv as i32 - pred as i32 + 32).rem_euclid(64) as u8
+}
+
+/// True when the decoder's `wrap(raw + pred − 32)` arithmetic
+/// (spec/06 §3.5) can reconstruct the component `mv` from the
+/// predictor component `pred` for **some** 6-bit residual — i.e. `mv`
+/// lies in the 64-value toroidal window the residual can address from
+/// `pred`. An encoder's motion search must only emit MVs whose both
+/// components are reachable from the §7.6.5 predictor it shares with
+/// the decoder.
+pub fn mv_component_reachable(mv: i8, pred: i8) -> bool {
+    let raw = raw_component(mv, pred);
+    wrap_component(raw as i32 + pred as i32 - 32) == mv
+}
+
+/// Encode one v3 joint motion vector — the bit-level inverse of
+/// [`decode_mv_with_table`]. `predictor` must be the same §7.6.5
+/// median predictor the decoder will derive at this MB position, and
+/// `mv` the final half-pel MV the decoder should reconstruct (both
+/// components in `[-63, +63]`).
+///
+/// The encoder prefers the shortest non-ESC joint symbol whose
+/// `(MVDx, MVDy)` byte-LUT pair matches the biased residual, falling
+/// back to the ESC symbol (index 1099) + two 6-bit FLC components —
+/// which can express any residual pair — when the joint alphabet has
+/// no covering codeword (spec/06 §3.3).
+pub fn encode_mv_with_table(
+    bw: &mut BitWriter,
+    predictor: Mv,
+    mv_table: MvTable,
+    mv: Mv,
+) -> Result<()> {
+    if !(-63..=63).contains(&mv.x) || !(-63..=63).contains(&mv.y) {
+        return Err(Error::invalid(format!(
+            "msmpeg4v3 mv: component ({}, {}) outside [-63, +63]",
+            mv.x, mv.y
+        )));
+    }
+    if !mv_component_reachable(mv.x, predictor.x) || !mv_component_reachable(mv.y, predictor.y) {
+        return Err(Error::invalid(format!(
+            "msmpeg4v3 mv: MV ({}, {}) not reachable from predictor ({}, {}) \
+             through the 6-bit toroidal residual (spec/06 §3.5)",
+            mv.x, mv.y, predictor.x, predictor.y
+        )));
+    }
+    let raw_x = raw_component(mv.x, predictor.x);
+    let raw_y = raw_component(mv.y, predictor.y);
+    let vlc_table = match mv_table {
+        MvTable::Default => table(),
+        MvTable::Alternate => alt_table(),
+    };
+    let write_idx = |bw: &mut BitWriter, idx: u16| -> Result<()> {
+        let entry = vlc_table.iter().find(|e| e.value == idx).ok_or_else(|| {
+            Error::invalid(format!("msmpeg4v3 mv: joint symbol {idx} has no codeword"))
+        })?;
+        bw.write_u32(entry.code, entry.bits as u32);
+        Ok(())
+    };
+    if let Some(idx) = encode_lut(mv_table).lookup(raw_x, raw_y) {
+        return write_idx(bw, idx);
+    }
+    // ESC: joint symbol 1099 + 6-bit raw_x + 6-bit raw_y (spec/06 §3.3).
+    write_idx(bw, MV_V3_ESC_INDEX as u16)?;
+    bw.write_u32(raw_x as u32, 6);
+    bw.write_u32(raw_y as u32, 6);
+    Ok(())
 }
 
 /// Toroidal wrap per spec/06 §3.5: if `mv > 63`, subtract 64; if
