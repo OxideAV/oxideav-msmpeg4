@@ -24,11 +24,15 @@
 //!   alternate-scan variant is kept only when strictly cheaper. v1 has
 //!   no `ac_pred` bit (spec/07 §1.4) and always walks zigzag.
 //!
-//! Table choices are fixed per frame: intra luma = G5
-//! (`ac_luma_sel = 2`), chroma = G4 (`ac_chroma_sel = 2`), default
-//! intra-DC pair (`dc_size_sel = 0`), default joint-MV VLC
-//! (`mv_table_sel = 0`). Inter residuals always use G4 (the alphabet
-//! is not frame-selectable on the inter path, spec/04 §1.3).
+//! v3 I-frame table selectors (`ac_luma_sel` ∈ {G3, G1, G5},
+//! `ac_chroma_sel` ∈ {G2, G0, G4}, `dc_size_sel` ∈ {0, 1}) are
+//! RD-decided per frame by serialising the analysed frame under all
+//! 18 combinations and keeping the smallest (see
+//! [`encode_iframe_v3`]). P-frames transmit the fixed chroma = G4 /
+//! default DC pair / default joint-MV VLC (`mv_table_sel = 0`); inter
+//! residuals always use G4 (the alphabet is not frame-selectable on
+//! the inter path, spec/04 §1.3), and intra-in-P luma binds G3 (the
+//! parser's zero for the untransmitted P-wire `ac_luma_sel`).
 
 use oxideav_core::bits::BitWriter;
 use oxideav_core::{Error, Result};
@@ -72,10 +76,9 @@ impl Default for EncoderConfig {
     }
 }
 
-/// The fixed per-frame table selectors this encoder emits (see the
-/// module doc): G5 intra luma, G4 chroma, default DC pair, default MV
-/// VLC.
-const AC_LUMA_SEL: u8 = 2; // G5
+/// The fixed **P-frame** table selectors this encoder emits (I-frames
+/// RD-select theirs per frame, see [`encode_iframe_v3`]): chroma G4 on
+/// the P wire, default DC pair, default MV VLC.
 const AC_CHROMA_SEL: u8 = 2; // G4
 const DC_SIZE_SEL: u8 = 0;
 
@@ -96,6 +99,15 @@ struct IntraBlockPlan {
 /// MB-aligned planes for `dims` (the layout [`Picture::alloc`]
 /// produces). Returns the frame's bitstream, decodable by
 /// [`crate::picture::decode_picture`] with the same `dims`.
+///
+/// The per-frame table selectors are RD-decided: the frame is
+/// analysed once (transform + quantise + DC-predictor threading —
+/// none of which depend on the entropy tables), then serialised under
+/// all 18 transmittable `(ac_luma_sel, ac_chroma_sel, dc_size_sel)`
+/// combinations (3 × 3 × 2, spec/14 §3.1 + spec/99 §4.5) with the
+/// per-MB ac_pred RD re-run against each table pair, and the smallest
+/// bitstream wins — exact-rate by construction, since the probe *is*
+/// the real serialiser.
 pub fn encode_iframe_v3(
     input: &Picture,
     dims: PictureDims,
@@ -105,36 +117,27 @@ pub fn encode_iframe_v3(
     let (mb_w, mb_h) = dims.mb_dims();
     let quant = config.quant as u32;
 
-    let mut bw = BitWriter::new();
-    let hdr = MsV3PictureHeader {
-        picture_type: PictureType::I,
-        quant: config.quant,
-        ac_chroma_sel: AC_CHROMA_SEL,
-        ac_luma_sel: AC_LUMA_SEL,
-        dc_size_sel: DC_SIZE_SEL,
-        mv_table_sel: 0,
-    };
-    hdr.write(&mut bw)?;
-
-    let luma_ac = AcVlcTable::v3_intra_g5();
-    let chroma_ac = AcVlcTable::g4_inter();
     let mut dc_cache = DcCache::new(mb_w, mb_h);
-
+    let mut mbs = Vec::with_capacity(mb_w * mb_h);
     for my in 0..mb_h {
         for mx in 0..mb_w {
-            encode_intra_mb(
-                &mut bw,
-                input,
-                &mut dc_cache,
-                mx,
-                my,
-                quant,
-                &luma_ac,
-                &chroma_ac,
-            )?;
+            mbs.push(analyse_intra_mb(input, &mut dc_cache, mx, my, quant));
         }
     }
-    Ok(bw.finish())
+
+    let mut best: Option<Vec<u8>> = None;
+    for luma_sel in 0..3u8 {
+        for chroma_sel in 0..3u8 {
+            for dc_size_sel in 0..2u8 {
+                let bytes =
+                    assemble_iframe_v3(&mbs, config.quant, luma_sel, chroma_sel, dc_size_sel)?;
+                if best.as_ref().map_or(true, |b| bytes.len() < b.len()) {
+                    best = Some(bytes);
+                }
+            }
+        }
+    }
+    Ok(best.expect("at least one selector combination was assembled"))
 }
 
 /// Transform + quantise all 6 blocks of one intra MB, threading the DC
@@ -209,7 +212,7 @@ fn write_intra_blocks(
 ) -> Result<()> {
     for (block_idx, plan) in plans.iter().enumerate() {
         match dc_scheme {
-            DcScheme::V3 => encode_intra_dc_diff_v3(bw, block_idx, DC_SIZE_SEL, plan.dc_diff)?,
+            DcScheme::V3(sel) => encode_intra_dc_diff_v3(bw, block_idx, sel, plan.dc_diff)?,
             DcScheme::V1V2 => encode_intra_dc_diff_v1v2(bw, block_idx, plan.dc_diff)?,
         }
         if plan.coded {
@@ -257,37 +260,69 @@ fn choose_ac_pred(
 }
 
 /// Which intra-DC differential codeword scheme a frame uses: the v3
-/// 120-entry direct-value VLC (spec/07 §5.4) or the v1/v2 H.263
-/// size+value scheme (spec/16 §2).
+/// 120-entry direct-value VLC (spec/07 §5.4) with its per-frame
+/// `dc_size_sel` table-pair selector, or the v1/v2 H.263 size+value
+/// scheme (spec/16 §2).
 #[derive(Clone, Copy)]
 enum DcScheme {
-    V3,
+    V3(u8),
     V1V2,
 }
 
-/// Analyse + serialise one v3 I-frame intra MB. (The intra-in-P path
-/// in [`encode_pframe_mb_v3`] emits the same joint-MCBPCY I-type
-/// half, ac_pred bit and block syntax, but behind the P-frame skip
-/// bit and with the P-frame's G3-luma table binding.)
-#[allow(clippy::too_many_arguments)]
-fn encode_intra_mb(
-    bw: &mut BitWriter,
-    input: &Picture,
-    dc_cache: &mut DcCache,
-    mb_x: usize,
-    mb_y: usize,
-    quant: u32,
-    luma_ac: &AcVlcTable,
-    chroma_ac: &AcVlcTable,
-) -> Result<()> {
-    let (plans, cbpy, cbp_cb, cbp_cr) = analyse_intra_mb(input, dc_cache, mb_x, mb_y, quant);
-    // Joint MCBPCY (I-type half: idx = cbp), then the RD-decided
-    // ac_pred bit (alternate scans only when strictly cheaper).
-    let cbp = compose_cbp(cbpy, cbp_cb, cbp_cr);
-    encode_mcbpcy(bw, cbp)?;
-    let ac_pred = choose_ac_pred(&plans, DcScheme::V3, luma_ac, chroma_ac)?;
-    bw.write_bit(ac_pred);
-    write_intra_blocks(bw, &plans, DcScheme::V3, luma_ac, chroma_ac, ac_pred)
+/// The three v3 intra-luma AC alphabets the per-frame `ac_luma_sel`
+/// selector can transmit (spec/14 §3.1: 0 → G3, 1 → G1, 2 → G5).
+fn v3_luma_table_for_sel(sel: u8) -> AcVlcTable {
+    match sel {
+        0 => AcVlcTable::v3_intra_g3(),
+        1 => AcVlcTable::v3_intra_g1(),
+        _ => AcVlcTable::v3_intra_g5(),
+    }
+}
+
+/// The three v3 intra-chroma AC alphabets `ac_chroma_sel` can
+/// transmit (spec/14 §3.1: 0 → G2, 1 → G0, 2 → G4).
+fn v3_chroma_table_for_sel(sel: u8) -> AcVlcTable {
+    match sel {
+        0 => AcVlcTable::v3_intra_g2(),
+        1 => AcVlcTable::v3_intra_g0(),
+        _ => AcVlcTable::g4_inter(),
+    }
+}
+
+/// One analysed I-frame MB: the 6 block plans plus the CBP split.
+type AnalysedMb = ([IntraBlockPlan; 6], u8, bool, bool);
+
+/// Serialise a full v3 I-frame from pre-analysed MBs under one
+/// concrete `(ac_luma_sel, ac_chroma_sel, dc_size_sel)` choice, with
+/// the per-MB ac_pred RD run against those tables.
+fn assemble_iframe_v3(
+    mbs: &[AnalysedMb],
+    quant: u8,
+    luma_sel: u8,
+    chroma_sel: u8,
+    dc_size_sel: u8,
+) -> Result<Vec<u8>> {
+    let mut bw = BitWriter::new();
+    let hdr = MsV3PictureHeader {
+        picture_type: PictureType::I,
+        quant,
+        ac_chroma_sel: chroma_sel,
+        ac_luma_sel: luma_sel,
+        dc_size_sel,
+        mv_table_sel: 0,
+    };
+    hdr.write(&mut bw)?;
+    let luma_ac = v3_luma_table_for_sel(luma_sel);
+    let chroma_ac = v3_chroma_table_for_sel(chroma_sel);
+    let scheme = DcScheme::V3(dc_size_sel);
+    for (plans, cbpy, cbp_cb, cbp_cr) in mbs {
+        let cbp = compose_cbp(*cbpy, *cbp_cb, *cbp_cr);
+        encode_mcbpcy(&mut bw, cbp)?;
+        let ac_pred = choose_ac_pred(plans, scheme, &luma_ac, &chroma_ac)?;
+        bw.write_bit(ac_pred);
+        write_intra_blocks(&mut bw, plans, scheme, &luma_ac, &chroma_ac, ac_pred)?;
+    }
+    Ok(bw.finish())
 }
 
 // ====================================================================
@@ -702,12 +737,17 @@ fn encode_pframe_mb_v3(
         let cbp = compose_cbp(cbpy, cbp_cb, cbp_cr);
         bw.write_bit(false); // not skipped
         encode_mcbpcy(bw, cbp)?;
-        let ac_pred = choose_ac_pred(&plans, DcScheme::V3, intra_luma_ac, intra_chroma_ac)?;
+        let ac_pred = choose_ac_pred(
+            &plans,
+            DcScheme::V3(DC_SIZE_SEL),
+            intra_luma_ac,
+            intra_chroma_ac,
+        )?;
         bw.write_bit(ac_pred);
         write_intra_blocks(
             bw,
             &plans,
-            DcScheme::V3,
+            DcScheme::V3(DC_SIZE_SEL),
             intra_luma_ac,
             intra_chroma_ac,
             ac_pred,
@@ -1606,10 +1646,12 @@ mod tests {
         plans[0].coded = true;
         let luma = AcVlcTable::v3_intra_g5();
         let chroma = AcVlcTable::g4_inter();
-        let zig = intra_blocks_bits(&plans, DcScheme::V3, &luma, &chroma, false).unwrap();
-        let alt = intra_blocks_bits(&plans, DcScheme::V3, &luma, &chroma, true).unwrap();
+        let zig =
+            intra_blocks_bits(&plans, DcScheme::V3(DC_SIZE_SEL), &luma, &chroma, false).unwrap();
+        let alt =
+            intra_blocks_bits(&plans, DcScheme::V3(DC_SIZE_SEL), &luma, &chroma, true).unwrap();
         assert!(alt < zig, "alt scan should be cheaper: alt={alt} zig={zig}");
-        assert!(choose_ac_pred(&plans, DcScheme::V3, &luma, &chroma).unwrap());
+        assert!(choose_ac_pred(&plans, DcScheme::V3(DC_SIZE_SEL), &luma, &chroma).unwrap());
         // And an uncoded MB never pays for the probe.
         let empty: [IntraBlockPlan; 6] = std::array::from_fn(|_| IntraBlockPlan {
             dc_diff: 0,
@@ -1617,7 +1659,7 @@ mod tests {
             coded: false,
             alt_scan: Scan::AlternateVertical,
         });
-        assert!(!choose_ac_pred(&empty, DcScheme::V3, &luma, &chroma).unwrap());
+        assert!(!choose_ac_pred(&empty, DcScheme::V3(DC_SIZE_SEL), &luma, &chroma).unwrap());
     }
 
     /// Row-banded DC (forces the FromTop / alternate-horizontal
@@ -1655,7 +1697,7 @@ mod tests {
         for my in 0..mb_h {
             for mx in 0..mb_w {
                 let (plans, _, _, _) = analyse_intra_mb(&input, &mut dc_cache, mx, my, quant);
-                if choose_ac_pred(&plans, DcScheme::V3, &luma, &chroma).unwrap() {
+                if choose_ac_pred(&plans, DcScheme::V3(DC_SIZE_SEL), &luma, &chroma).unwrap() {
                     fired += 1;
                 }
             }
@@ -1694,6 +1736,62 @@ mod tests {
             .sum::<u64>() as f64
             / out.y.len() as f64;
         assert!(mae < 3.0, "v2 ac_pred I-frame MAE {mae} too large");
+    }
+
+    #[test]
+    fn iframe_table_selector_rd_never_worse_and_decodes() {
+        // Across several content families the 18-way selector RD must
+        // (a) never lose to the historical fixed G5/G4/dc0 choice and
+        // (b) still decode through the production path (the decoder
+        // reads the selectors from the header it is handed).
+        let dims = PictureDims::new(48, 48).unwrap();
+        let fills: [fn(&mut Picture); 3] =
+            [fill_gradient, fill_texture, fill_row_bands_with_x_texture];
+        for (quant, fill) in
+            [(2u8, 0usize), (4, 1), (8, 2), (4, 0), (8, 1)].map(|(q, f)| (q, fills[f]))
+        {
+            let mut input = Picture::alloc(dims, PictureType::I);
+            fill(&mut input);
+            let config = EncoderConfig {
+                quant,
+                ..Default::default()
+            };
+            let rd = encode_iframe_v3(&input, dims, &config).unwrap();
+
+            // Re-run the analysis and force the historical selectors.
+            let (mb_w, mb_h) = dims.mb_dims();
+            let mut dc_cache = DcCache::new(mb_w, mb_h);
+            let mut mbs = Vec::new();
+            for my in 0..mb_h {
+                for mx in 0..mb_w {
+                    mbs.push(analyse_intra_mb(
+                        &input,
+                        &mut dc_cache,
+                        mx,
+                        my,
+                        quant as u32,
+                    ));
+                }
+            }
+            let forced = assemble_iframe_v3(&mbs, quant, 2, 2, 0).unwrap();
+            assert!(
+                rd.len() <= forced.len(),
+                "selector RD lost to the fixed default: {} > {} (q={quant})",
+                rd.len(),
+                forced.len()
+            );
+
+            let mut br = BitReader::new(&rd);
+            let out = decode_picture(&mut br, dims, None).unwrap();
+            let mae = out
+                .y
+                .iter()
+                .zip(input.y.iter())
+                .map(|(a, b)| (*a as i64 - *b as i64).unsigned_abs())
+                .sum::<u64>() as f64
+                / out.y.len() as f64;
+            assert!(mae < 2.0 * quant as f64, "q={quant} MAE {mae} too large");
+        }
     }
 
     #[test]
