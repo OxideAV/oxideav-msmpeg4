@@ -87,7 +87,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
      `make_encoder_v2`) — all three family members are now
      encode+decode in the registry; the registered-loop test runs for
      every codec id.
-  Test suite 431 lib-only → 605 total (0 failed). The encoder targets
+  9. **v1 INTER4V (4-MV, MB-type 2) encoding** — the traced spec/16
+     §3.1 four-MV path now has an encode-side exerciser: a greedy
+     per-Figure-6-8-block motion search walks the same interleaved
+     Figure-7-34 predict → code → commit order the decoder replays
+     (`Macroblock4MvDecoderNeighbours`), the MC prediction mirrors
+     `mc_macroblock_4mv` (per-block luma + §7.6.3.4 sum/2K chroma
+     derivation), and the mode decision emits `mcbpc = 8 + cbpc` when
+     the 4-MV SAD beats 1-MV by more than the extra-codeword margin
+     (v2 never takes the branch — its 8-symbol alphabet has no INTER4V
+     code, spec/16 §3.3). Pinned by a comparative test: on
+     divergent-block-motion content at coarse quant the v1 encode is
+     near-exact (MAE < 1) while the 1-MV-only v2 encode of identical
+     input carries over 2× the error.
+  Test suite 431 lib-only → 606 total (0 failed). The encoder targets
   THIS crate's decoder: for the two tables whose wire codes are
   canonically reconstructed rather than binary-extracted (128-entry
   joint MCBPCY — see the README docs-gap on `region_05eac8` — and the

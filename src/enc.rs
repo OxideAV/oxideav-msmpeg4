@@ -36,13 +36,16 @@ use crate::header::{MsV3PictureHeader, PictureType};
 use crate::idct::fdct8x8_from_pels;
 use crate::iq::{dc_scaler, quantise_block_h263};
 use crate::mb::{encode_intra_dc_diff_v1v2, encode_intra_dc_diff_v3};
-use crate::mc::{chroma_mv_from_luma, mc_block, RefPlane};
+use crate::mc::{chroma_mv_from_four_luma, chroma_mv_from_luma, mc_block, RefPlane};
 use crate::mcbpcy::{compose_cbp, encode_mcbpcy, encode_mcbpcy_v1, encode_mcbpcy_v2, V2FrameType};
 use crate::mv::{
     encode_mv_v1v2, encode_mv_with_table, mv_component_reachable, mv_v1v2_component_reachable, Mv,
     MvTable,
 };
-use crate::mv_pred::{predict_block_mv, resolve_block_candidates, Block, MvGrid, MvGridCell};
+use crate::mv_pred::{
+    predict_block_mv, resolve_block_candidates, Block, Macroblock4MvDecoderNeighbours, MvGrid,
+    MvGridCell,
+};
 use crate::picture::{MsV1V2Version, Picture, PictureDims};
 
 /// Per-frame encoder settings.
@@ -535,6 +538,18 @@ fn analyse_inter_residual(
     quant: u32,
 ) -> ([[i32; 64]; 6], [bool; 6]) {
     let pred = predict_mb(reference, mb_x, mb_y, (mv.x as i32, mv.y as i32));
+    analyse_residual_with_pred(input, &pred, mb_x, mb_y, quant)
+}
+
+/// Core of [`analyse_inter_residual`], reusable with an arbitrary
+/// (e.g. INTER4V) MC prediction.
+fn analyse_residual_with_pred(
+    input: &Picture,
+    pred: &MbPrediction,
+    mb_x: usize,
+    mb_y: usize,
+    quant: u32,
+) -> ([[i32; 64]; 6], [bool; 6]) {
     let mut levels = [[0i32; 64]; 6];
     let mut coded = [false; 6];
     for block_idx in 0..6usize {
@@ -559,6 +574,138 @@ fn analyse_inter_residual(
         coded[block_idx] = nz > 0;
     }
     (levels, coded)
+}
+
+/// Full luma + chroma MC prediction for one INTER4V MB: four per-block
+/// half-pel luma MVs in Figure 6-8 raster order plus the §7.6.3.4
+/// sum/2K + Table 7-12 chroma derivation — mirroring
+/// `mc::mc_macroblock_4mv`'s kernel calls.
+fn predict_mb_4mv(reference: &Picture, mb_x: usize, mb_y: usize, mvs: [Mv; 4]) -> MbPrediction {
+    let (ref_y, ref_cb, ref_cr) = ref_planes(reference);
+    let mut pred = MbPrediction {
+        luma: [0u8; 256],
+        cb: [0u8; 64],
+        cr: [0u8; 64],
+    };
+    let mvs_half = [
+        (mvs[0].x as i32, mvs[0].y as i32),
+        (mvs[1].x as i32, mvs[1].y as i32),
+        (mvs[2].x as i32, mvs[2].y as i32),
+        (mvs[3].x as i32, mvs[3].y as i32),
+    ];
+    for (i, &(mvx, mvy)) in mvs_half.iter().enumerate() {
+        let bx = (i & 1) * 8;
+        let by = (i >> 1) * 8;
+        let mut block = [0u8; 64];
+        mc_block(
+            &ref_y,
+            &mut block,
+            8,
+            (mb_x * 16 + bx) as i32,
+            (mb_y * 16 + by) as i32,
+            mvx,
+            mvy,
+            8,
+        );
+        for j in 0..8 {
+            for i2 in 0..8 {
+                pred.luma[(by + j) * 16 + bx + i2] = block[j * 8 + i2];
+            }
+        }
+    }
+    let (cmx, cmy) = chroma_mv_from_four_luma(mvs_half);
+    let cx = (mb_x * 8) as i32;
+    let cy = (mb_y * 8) as i32;
+    mc_block(&ref_cb, &mut pred.cb, 8, cx, cy, cmx, cmy, 8);
+    mc_block(&ref_cr, &mut pred.cr, 8, cx, cy, cmx, cmy, 8);
+    pred
+}
+
+/// Luma SAD of one Figure 6-8 8×8 block against the reference MC'd at
+/// `mv`.
+fn block_sad_8(
+    input: &Picture,
+    reference: &Picture,
+    mb_x: usize,
+    mb_y: usize,
+    blk: usize,
+    mv: Mv,
+) -> u32 {
+    let (ref_y, _, _) = ref_planes(reference);
+    let bx = (blk & 1) * 8;
+    let by = (blk >> 1) * 8;
+    let mut pred = [0u8; 64];
+    mc_block(
+        &ref_y,
+        &mut pred,
+        8,
+        (mb_x * 16 + bx) as i32,
+        (mb_y * 16 + by) as i32,
+        mv.x as i32,
+        mv.y as i32,
+        8,
+    );
+    let mut sad = 0u32;
+    for j in 0..8 {
+        let row = (mb_y * 16 + by + j) * input.y_stride + mb_x * 16 + bx;
+        for i in 0..8 {
+            sad += (input.y[row + i] as i32 - pred[j * 8 + i] as i32).unsigned_abs();
+        }
+    }
+    sad
+}
+
+/// Greedy per-block INTER4V motion search for a v1 MB: for each Figure
+/// 6-8 block in raster order, take the Figure-7-34 within-MB predictor
+/// from the already-committed blocks (the exact interleaved
+/// predict → decode → commit order the decoder replays), search the
+/// half-pel window for the smallest 8×8 SAD among v1/v2-reachable
+/// candidates, and commit. Returns the four final MVs and the total
+/// luma SAD.
+fn search_inter4v(
+    input: &Picture,
+    reference: &Picture,
+    mv_grid: &MvGrid,
+    mb_x: usize,
+    mb_y: usize,
+    range: u8,
+) -> ([Mv; 4], u32) {
+    let nset = mv_grid.neighbour_set_for(mb_x, mb_y);
+    let mut dec = Macroblock4MvDecoderNeighbours::new(nset);
+    let mut mvs = [Mv::default(); 4];
+    let mut total_sad = 0u32;
+    let r = range as i32;
+    for (i, &block) in Block::ALL.iter().enumerate() {
+        let predictor = dec.predictor_for(block);
+        let mut best = predictor; // always reachable (residual 0)
+        let mut best_sad = block_sad_8(input, reference, mb_x, mb_y, i, best);
+        for dy in -r..=r {
+            for dx in -r..=r {
+                if !(-63..=63).contains(&dx) || !(-63..=63).contains(&dy) {
+                    continue;
+                }
+                let cand = Mv {
+                    x: dx as i8,
+                    y: dy as i8,
+                };
+                if cand == best
+                    || !mv_v1v2_component_reachable(cand.x, predictor.x)
+                    || !mv_v1v2_component_reachable(cand.y, predictor.y)
+                {
+                    continue;
+                }
+                let sad = block_sad_8(input, reference, mb_x, mb_y, i, cand);
+                if sad < best_sad {
+                    best_sad = sad;
+                    best = cand;
+                }
+            }
+        }
+        dec.commit_block(block, best);
+        mvs[i] = best;
+        total_sad += best_sad;
+    }
+    (mvs, total_sad)
 }
 
 // ====================================================================
@@ -676,6 +823,56 @@ pub fn encode_pframe_v1v2(
                 config.mv_search_range,
                 mv_v1v2_component_reachable,
             );
+
+            // v1-only INTER4V (MB-type 2, spec/16 §3.1) mode decision:
+            // when the per-block greedy search beats the 1-MV SAD by
+            // more than the ~3 extra MV codeword pairs cost, emit the
+            // 4-MV MB. The v2 8-symbol MCBPC alphabet has no INTER4V
+            // code (spec/16 §3.3), so v2 never takes this branch.
+            const INTER4V_SAD_MARGIN: u32 = 96;
+            let inter4v = if version == MsV1V2Version::V1 && config.mv_search_range > 0 {
+                let sad_1mv = mb_sad(input, reference, mx, my, (mv.x as i32, mv.y as i32));
+                let (mvs4, sad_4mv) =
+                    search_inter4v(input, reference, &mv_grid, mx, my, config.mv_search_range);
+                let uniform = mvs4.iter().all(|&m| m == mvs4[0]);
+                if !uniform && sad_4mv + INTER4V_SAD_MARGIN < sad_1mv {
+                    Some(mvs4)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            if let Some(mvs4) = inter4v {
+                let pred = predict_mb_4mv(reference, mx, my, mvs4);
+                let (levels, coded) = analyse_residual_with_pred(input, &pred, mx, my, quant);
+                let cbpy = (coded[0] as u8) << 3
+                    | (coded[1] as u8) << 2
+                    | (coded[2] as u8) << 1
+                    | (coded[3] as u8);
+                let cbpc = ((coded[4] as u8) << 1) | (coded[5] as u8);
+                // MB-type 2 (INTER4V): mcbpc = 2 << 2 | cbpc.
+                encode_mcbpcy_v1(&mut bw, false, 8 + cbpc, cbpy)?;
+                // Serialise the four MVs replaying the same interleaved
+                // Figure-7-34 predict → encode → commit order the
+                // decoder walks.
+                let nset = mv_grid.neighbour_set_for(mx, my);
+                let mut dec = Macroblock4MvDecoderNeighbours::new(nset);
+                for (i, &block) in Block::ALL.iter().enumerate() {
+                    let block_pred = dec.predictor_for(block);
+                    encode_mv_v1v2(&mut bw, block_pred, mvs4[i])?;
+                    dec.commit_block(block, mvs4[i]);
+                }
+                mv_grid.set_cell(mx, my, dec.finalise_to_grid_cell());
+                for block_idx in 0..6usize {
+                    if coded[block_idx] {
+                        encode_inter_ac(&mut bw, &levels[block_idx], &inter_ac)?;
+                    }
+                }
+                continue;
+            }
+
             let (levels, coded) = analyse_inter_residual(input, reference, mx, my, mv, quant);
             let any_coded = coded.iter().any(|&c| c);
 

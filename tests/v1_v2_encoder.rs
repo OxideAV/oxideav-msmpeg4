@@ -208,3 +208,68 @@ fn v1_v2_pframe_residual_only_change_zero_mv() {
         }
     }
 }
+
+#[test]
+fn v1_inter4v_beats_single_mv_on_divergent_block_motion() {
+    // Content engineered so every 8x8 luma block has uniform motion
+    // but adjacent blocks move in OPPOSITE directions (+3 / -3 pels
+    // per 8-pel column strip): a 1-MV MB can align at most half its
+    // blocks, and at coarse quant the residual cannot make up the
+    // difference — only the v1 INTER4V (MB-type 2) path can track it.
+    // v2 has no INTER4V code (spec/16 3.3), so comparing the two
+    // versions on identical input pins that the v1 encoder actually
+    // exercises the 4-MV mode end-to-end through the decoder.
+    let dims = PictureDims::new(64, 48).unwrap();
+    let reference = {
+        let mut pic = Picture::alloc(dims, PictureType::I);
+        let h = pic.y.len() / pic.y_stride;
+        for y in 0..h {
+            for x in 0..pic.y_stride {
+                pic.y[y * pic.y_stride + x] = ((x * 7 + y * 5) % 200 + 25) as u8;
+            }
+        }
+        pic
+    };
+    // Per-8-pel-strip opposite horizontal shifts (chroma untouched).
+    let mut input = reference.clone();
+    let h = input.y.len() / input.y_stride;
+    for y in 0..h {
+        for x in 0..input.y_stride {
+            let strip = (x / 8) % 2;
+            let sx = if strip == 0 {
+                x.saturating_sub(3)
+            } else {
+                (x + 3).min(input.y_stride - 1)
+            };
+            input.y[y * input.y_stride + x] = reference.y[y * reference.y_stride + sx];
+        }
+    }
+    let config = EncoderConfig {
+        quant: 8, // coarse: the residual cannot hide a 6-half-pel miss
+        mv_search_range: 8,
+    };
+
+    let v1_bytes =
+        encode_pframe_v1v2(&input, &reference, dims, &config, MsV1V2Version::V1).unwrap();
+    let mut br = BitReader::new(&v1_bytes);
+    let v1_out = decode_picture_v1v2(&mut br, dims, MsV1V2Version::V1, Some(&reference)).unwrap();
+    let v1_mae = mae(&v1_out.y, &input.y);
+
+    let v2_bytes =
+        encode_pframe_v1v2(&input, &reference, dims, &config, MsV1V2Version::V2).unwrap();
+    let mut br = BitReader::new(&v2_bytes);
+    let v2_out = decode_picture_v1v2(&mut br, dims, MsV1V2Version::V2, Some(&reference)).unwrap();
+    let v2_mae = mae(&v2_out.y, &input.y);
+
+    // 4-MV MC reproduces every interior block exactly (each block is a
+    // pure integer translate of the reference), so v1 must be
+    // near-exact while 1-MV v2 carries a visible coarse-quant error.
+    assert!(
+        v1_mae < 1.0,
+        "v1 INTER4V should track divergent block motion (MAE {v1_mae})"
+    );
+    assert!(
+        v1_mae * 2.0 < v2_mae,
+        "v1 (INTER4V, MAE {v1_mae}) should clearly beat v2 (1-MV, MAE {v2_mae})"
+    );
+}
