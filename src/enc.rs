@@ -35,12 +35,15 @@ use crate::dc_pred::DcCache;
 use crate::header::{MsV3PictureHeader, PictureType};
 use crate::idct::fdct8x8_from_pels;
 use crate::iq::{dc_scaler, quantise_block_h263};
-use crate::mb::encode_intra_dc_diff_v3;
+use crate::mb::{encode_intra_dc_diff_v1v2, encode_intra_dc_diff_v3};
 use crate::mc::{chroma_mv_from_luma, mc_block, RefPlane};
-use crate::mcbpcy::{compose_cbp, encode_mcbpcy};
-use crate::mv::{encode_mv_with_table, mv_component_reachable, Mv, MvTable};
+use crate::mcbpcy::{compose_cbp, encode_mcbpcy, encode_mcbpcy_v1, encode_mcbpcy_v2, V2FrameType};
+use crate::mv::{
+    encode_mv_v1v2, encode_mv_with_table, mv_component_reachable, mv_v1v2_component_reachable, Mv,
+    MvTable,
+};
 use crate::mv_pred::{predict_block_mv, resolve_block_candidates, Block, MvGrid, MvGridCell};
-use crate::picture::{Picture, PictureDims};
+use crate::picture::{MsV1V2Version, Picture, PictureDims};
 
 /// Per-frame encoder settings.
 #[derive(Clone, Copy, Debug)]
@@ -123,24 +126,25 @@ pub fn encode_iframe_v3(
     Ok(bw.finish())
 }
 
-/// Analyse + serialise one intra MB (shared by the I-frame path; the
-/// P-frame encoder currently never emits intra-in-P MBs).
-#[allow(clippy::too_many_arguments)]
-fn encode_intra_mb(
-    bw: &mut BitWriter,
+/// Transform + quantise all 6 blocks of one intra MB, threading the DC
+/// predictor exactly as the decoder will (§7.4.3 gradient over
+/// reconstructed integer DCs). Version-independent: v1/v2/v3 share the
+/// spatial DC predictor and the DC-scaler quantisation (spec/99 §4.4,
+/// spec/16 §2 — only the DC-differential *codeword* scheme differs).
+/// Returns the 6 block plans plus the (cbpy, cbp_cb, cbp_cr) split.
+fn analyse_intra_mb(
     input: &Picture,
     dc_cache: &mut DcCache,
     mb_x: usize,
     mb_y: usize,
     quant: u32,
-    luma_ac: &AcVlcTable,
-    chroma_ac: &AcVlcTable,
-) -> Result<()> {
-    // Pass 1: transform + quantise all 6 blocks, threading the DC
-    // predictor exactly as the decoder will (§7.4.3 gradient over
-    // reconstructed DCs).
-    let mut plans: Vec<IntraBlockPlan> = Vec::with_capacity(6);
-    for block_idx in 0..6usize {
+) -> ([IntraBlockPlan; 6], u8, bool, bool) {
+    let mut plans: [IntraBlockPlan; 6] = std::array::from_fn(|_| IntraBlockPlan {
+        dc_diff: 0,
+        levels: [0i32; 64],
+        coded: false,
+    });
+    for (block_idx, plan) in plans.iter_mut().enumerate() {
         let pels = extract_block(input, mb_x, mb_y, block_idx);
         let mut f = [0.0f32; 64];
         fdct8x8_from_pels(&pels, &mut f);
@@ -164,33 +168,72 @@ fn encode_intra_mb(
             _ => unreachable!(),
         }
 
-        let mut levels = [0i32; 64];
-        let nz = quantise_block_h263(&f, quant, 1, &mut levels);
-        plans.push(IntraBlockPlan {
-            dc_diff,
-            levels,
-            coded: nz > 0,
-        });
+        plan.dc_diff = dc_diff;
+        let nz = quantise_block_h263(&f, quant, 1, &mut plan.levels);
+        plan.coded = nz > 0;
     }
-
-    // Pass 2: serialise — joint MCBPCY (I-type half: idx = cbp),
-    // ac_pred bit (always 0: fixed zigzag), then per-block DC + AC.
     let cbpy = (plans[0].coded as u8) << 3
         | (plans[1].coded as u8) << 2
         | (plans[2].coded as u8) << 1
         | (plans[3].coded as u8);
-    let cbp = compose_cbp(cbpy, plans[4].coded, plans[5].coded);
-    encode_mcbpcy(bw, cbp)?;
-    bw.write_bit(false); // ac_pred = 0
+    let cbp_cb = plans[4].coded;
+    let cbp_cr = plans[5].coded;
+    (plans, cbpy, cbp_cb, cbp_cr)
+}
 
+/// Serialise the 6 planned blocks of an intra MB: per-block DC
+/// differential through the version's codeword scheme, then the fixed
+/// zigzag AC walk (ac_pred = 0 on every MB this encoder emits) for
+/// each coded block.
+fn write_intra_blocks(
+    bw: &mut BitWriter,
+    plans: &[IntraBlockPlan; 6],
+    dc_scheme: DcScheme,
+    luma_ac: &AcVlcTable,
+    chroma_ac: &AcVlcTable,
+) -> Result<()> {
     for (block_idx, plan) in plans.iter().enumerate() {
-        encode_intra_dc_diff_v3(bw, block_idx, DC_SIZE_SEL, plan.dc_diff)?;
+        match dc_scheme {
+            DcScheme::V3 => encode_intra_dc_diff_v3(bw, block_idx, DC_SIZE_SEL, plan.dc_diff)?,
+            DcScheme::V1V2 => encode_intra_dc_diff_v1v2(bw, block_idx, plan.dc_diff)?,
+        }
         if plan.coded {
             let table = if block_idx <= 3 { luma_ac } else { chroma_ac };
             encode_intra_ac(bw, &plan.levels, Scan::Zigzag, table, 1)?;
         }
     }
     Ok(())
+}
+
+/// Which intra-DC differential codeword scheme a frame uses: the v3
+/// 120-entry direct-value VLC (spec/07 §5.4) or the v1/v2 H.263
+/// size+value scheme (spec/16 §2).
+#[derive(Clone, Copy)]
+enum DcScheme {
+    V3,
+    V1V2,
+}
+
+/// Analyse + serialise one v3 intra MB (I-frame path; this encoder
+/// never emits intra-in-P MBs).
+#[allow(clippy::too_many_arguments)]
+fn encode_intra_mb(
+    bw: &mut BitWriter,
+    input: &Picture,
+    dc_cache: &mut DcCache,
+    mb_x: usize,
+    mb_y: usize,
+    quant: u32,
+    luma_ac: &AcVlcTable,
+    chroma_ac: &AcVlcTable,
+) -> Result<()> {
+    let (plans, cbpy, cbp_cb, cbp_cr) = analyse_intra_mb(input, dc_cache, mb_x, mb_y, quant);
+    // Joint MCBPCY (I-type half: idx = cbp), then the ac_pred bit
+    // (always 0: fixed zigzag).
+    let cbp = compose_cbp(cbpy, cbp_cb, cbp_cr);
+    encode_mcbpcy(bw, cbp)?;
+    bw.write_bit(false); // ac_pred = 0
+    write_intra_blocks(bw, &plans, DcScheme::V3, luma_ac, chroma_ac)
 }
 
 // ====================================================================
@@ -376,10 +419,10 @@ fn motion_search(
     mb_y: usize,
     predictor: Mv,
     range: u8,
+    component_reachable: fn(i8, i8) -> bool,
 ) -> Mv {
-    let reachable = |mv: Mv| {
-        mv_component_reachable(mv.x, predictor.x) && mv_component_reachable(mv.y, predictor.y)
-    };
+    let reachable =
+        |mv: Mv| component_reachable(mv.x, predictor.x) && component_reachable(mv.y, predictor.y);
     let mut best = Mv { x: 0, y: 0 };
     let mut have_best = false;
     let mut best_sad = u32::MAX;
@@ -445,34 +488,11 @@ fn encode_inter_mb(
         mb_y,
         predictor,
         config.mv_search_range,
+        mv_component_reachable,
     );
 
     // Residual analysis over all 6 blocks at the chosen MV.
-    let pred = predict_mb(reference, mb_x, mb_y, (mv.x as i32, mv.y as i32));
-    let mut levels = [[0i32; 64]; 6];
-    let mut coded = [false; 6];
-    for block_idx in 0..6usize {
-        let cur = extract_block(input, mb_x, mb_y, block_idx);
-        let mut residual = [0i32; 64];
-        for (i, r) in residual.iter_mut().enumerate() {
-            let p = match block_idx {
-                0..=3 => {
-                    let bx = (block_idx & 1) * 8 + (i & 7);
-                    let by = (block_idx >> 1) * 8 + (i >> 3);
-                    pred.luma[by * 16 + bx]
-                }
-                4 => pred.cb[i],
-                5 => pred.cr[i],
-                _ => unreachable!(),
-            };
-            *r = cur[i] - p as i32;
-        }
-        let mut f = [0.0f32; 64];
-        fdct8x8_from_pels(&residual, &mut f);
-        let nz = quantise_block_h263(&f, quant, 0, &mut levels[block_idx]);
-        coded[block_idx] = nz > 0;
-    }
-
+    let (levels, coded) = analyse_inter_residual(input, reference, mb_x, mb_y, mv, quant);
     let any_coded = coded.iter().any(|&c| c);
     if mv == (Mv { x: 0, y: 0 }) && !any_coded {
         // Skip MB: 1-bit flag, decoder copies the reference at (0, 0)
@@ -500,6 +520,203 @@ fn encode_inter_mb(
         }
     }
     Ok(())
+}
+
+/// Transform + quantise the 6-block MC residual of one inter MB at the
+/// chosen MV (`level_start = 0` — the inter DC is a coded coefficient,
+/// spec/04 §1.3 / §2.6). Shared by the v3 and v1/v2 P-frame encoders
+/// (the inter kernel shape is version-independent per spec/99 §6).
+fn analyse_inter_residual(
+    input: &Picture,
+    reference: &Picture,
+    mb_x: usize,
+    mb_y: usize,
+    mv: Mv,
+    quant: u32,
+) -> ([[i32; 64]; 6], [bool; 6]) {
+    let pred = predict_mb(reference, mb_x, mb_y, (mv.x as i32, mv.y as i32));
+    let mut levels = [[0i32; 64]; 6];
+    let mut coded = [false; 6];
+    for block_idx in 0..6usize {
+        let cur = extract_block(input, mb_x, mb_y, block_idx);
+        let mut residual = [0i32; 64];
+        for (i, r) in residual.iter_mut().enumerate() {
+            let p = match block_idx {
+                0..=3 => {
+                    let bx = (block_idx & 1) * 8 + (i & 7);
+                    let by = (block_idx >> 1) * 8 + (i >> 3);
+                    pred.luma[by * 16 + bx]
+                }
+                4 => pred.cb[i],
+                5 => pred.cr[i],
+                _ => unreachable!(),
+            };
+            *r = cur[i] - p as i32;
+        }
+        let mut f = [0.0f32; 64];
+        fdct8x8_from_pels(&residual, &mut f);
+        let nz = quantise_block_h263(&f, quant, 0, &mut levels[block_idx]);
+        coded[block_idx] = nz > 0;
+    }
+    (levels, coded)
+}
+
+// ====================================================================
+// v1 / v2 picture encoding
+// ====================================================================
+
+/// Encode one picture as a MS-MPEG4 **v1 or v2 I-frame**, decodable by
+/// [`crate::picture::decode_picture_v1v2`]. Every MB is intra: the MB
+/// header is the version's separate MCBPC + CBPY pair (v1 MB-type 3
+/// INTRA at `mcbpc = 12 + cbpc` with the always-present leading COD
+/// bit, spec/07 §1.5; v2 intra quotient at `mcbpc = 4 + cbpc` with the
+/// post-MCBPC ac_pred bit, spec/07 §2.4), then the shared intra block
+/// pipeline with the v1/v2 size+value DC scheme (spec/16 §2) and the
+/// G5-luma / G4-chroma AC walks (the fixed v1/v2 fallthrough binding,
+/// spec/14 §3.2 — no per-frame selectors exist on the v1/v2 wire).
+pub fn encode_iframe_v1v2(
+    input: &Picture,
+    dims: PictureDims,
+    config: &EncoderConfig,
+    version: MsV1V2Version,
+) -> Result<Vec<u8>> {
+    validate_input(input, dims, config)?;
+    let (mb_w, mb_h) = dims.mb_dims();
+    let quant = config.quant as u32;
+
+    let mut bw = BitWriter::new();
+    let hdr = crate::header::MsV1V2PictureHeader {
+        picture_type: PictureType::I,
+        quant: config.quant,
+        v1_umv_flag: false,
+    };
+    match version {
+        MsV1V2Version::V1 => hdr.write_v1(&mut bw)?,
+        MsV1V2Version::V2 => hdr.write_v2(&mut bw)?,
+    }
+
+    let luma_ac = AcVlcTable::v3_intra_g5();
+    let chroma_ac = AcVlcTable::g4_inter();
+    let mut dc_cache = DcCache::new(mb_w, mb_h);
+
+    for my in 0..mb_h {
+        for mx in 0..mb_w {
+            let (plans, cbpy, cbp_cb, cbp_cr) =
+                analyse_intra_mb(input, &mut dc_cache, mx, my, quant);
+            let cbpc = ((cbp_cb as u8) << 1) | (cbp_cr as u8);
+            match version {
+                MsV1V2Version::V1 => {
+                    // MB-type 3 (INTRA): mcbpc = 3 << 2 | cbpc. v1 has
+                    // no ac_pred bit anywhere (spec/07 §1.4).
+                    encode_mcbpcy_v1(&mut bw, false, 12 + cbpc, cbpy)?;
+                }
+                MsV1V2Version::V2 => {
+                    // Intra quotient (mcbpc / 4 == 1): mcbpc = 4 + cbpc;
+                    // ac_pred = 0 → fixed zigzag.
+                    encode_mcbpcy_v2(&mut bw, V2FrameType::I, false, 4 + cbpc, false, cbpy)?;
+                }
+            }
+            write_intra_blocks(&mut bw, &plans, DcScheme::V1V2, &luma_ac, &chroma_ac)?;
+        }
+    }
+    Ok(bw.finish())
+}
+
+/// Encode one picture as a MS-MPEG4 **v1 or v2 P-frame** against the
+/// decoder-side reconstruction of the previous frame, decodable by
+/// [`crate::picture::decode_picture_v1v2`]. Same shape as the v3
+/// P-frame encoder — shared §7.6.5 predictor grid, half-pel motion
+/// search (clipped to the v1/v2 `[-32, +32]` per-component toroidal
+/// window, spec/07 §3.2), skip on (0, 0)-MV/zero-CBP MBs — but with
+/// the v1/v2 wire syntax: separate MCBPC (inter MB-type 0) + wrapped
+/// CBPY, and the two per-component MV codewords instead of the v3
+/// joint VLC. The residual is the shared G4 inter walk (spec/99 §6).
+pub fn encode_pframe_v1v2(
+    input: &Picture,
+    reference: &Picture,
+    dims: PictureDims,
+    config: &EncoderConfig,
+    version: MsV1V2Version,
+) -> Result<Vec<u8>> {
+    validate_input(input, dims, config)?;
+    if reference.width != dims.width || reference.height != dims.height {
+        return Err(Error::invalid(format!(
+            "msmpeg4 v1/v2 encode: reference dimensions {}x{} differ from current {}x{}",
+            reference.width, reference.height, dims.width, dims.height,
+        )));
+    }
+    let (mb_w, mb_h) = dims.mb_dims();
+    let quant = config.quant as u32;
+
+    let mut bw = BitWriter::new();
+    let hdr = crate::header::MsV1V2PictureHeader {
+        picture_type: PictureType::P,
+        quant: config.quant,
+        // The v1 UMV flag is consumed as framing but not branched on by
+        // the v<4 MV decoder body (spec/07 §3.4); write 0.
+        v1_umv_flag: false,
+    };
+    match version {
+        MsV1V2Version::V1 => hdr.write_v1(&mut bw)?,
+        MsV1V2Version::V2 => hdr.write_v2(&mut bw)?,
+    }
+
+    let inter_ac = AcVlcTable::g4_inter();
+    let mut mv_grid = MvGrid::new(mb_w, mb_h);
+
+    for my in 0..mb_h {
+        for mx in 0..mb_w {
+            let predictor = mv_predictor(&mv_grid, mx, my);
+            let mv = motion_search(
+                input,
+                reference,
+                mx,
+                my,
+                predictor,
+                config.mv_search_range,
+                mv_v1v2_component_reachable,
+            );
+            let (levels, coded) = analyse_inter_residual(input, reference, mx, my, mv, quant);
+            let any_coded = coded.iter().any(|&c| c);
+
+            if mv == (Mv { x: 0, y: 0 }) && !any_coded {
+                // Skip MB (1 bit): the decoder copies the reference at
+                // (0, 0) and stores a zero-MV grid cell.
+                match version {
+                    MsV1V2Version::V1 => encode_mcbpcy_v1(&mut bw, true, 0, 0)?,
+                    MsV1V2Version::V2 => {
+                        encode_mcbpcy_v2(&mut bw, V2FrameType::P, true, 0, false, 0)?
+                    }
+                }
+                mv_grid.set_cell(mx, my, MvGridCell::OneMv(Mv::default()));
+                continue;
+            }
+
+            let cbpy = (coded[0] as u8) << 3
+                | (coded[1] as u8) << 2
+                | (coded[2] as u8) << 1
+                | (coded[3] as u8);
+            let cbpc = ((coded[4] as u8) << 1) | (coded[5] as u8);
+            // Inter MB-type 0 for both versions: v1 mcbpc = 0 << 2 |
+            // cbpc, v2 quotient-0 mcbpc = cbpc (the v2 remainder == 3
+            // no-wrap sub-type is handled inside encode_mcbpcy_v2).
+            match version {
+                MsV1V2Version::V1 => encode_mcbpcy_v1(&mut bw, false, cbpc, cbpy)?,
+                MsV1V2Version::V2 => {
+                    encode_mcbpcy_v2(&mut bw, V2FrameType::P, false, cbpc, false, cbpy)?
+                }
+            }
+            encode_mv_v1v2(&mut bw, predictor, mv)?;
+            mv_grid.set_cell(mx, my, MvGridCell::OneMv(mv));
+
+            for block_idx in 0..6usize {
+                if coded[block_idx] {
+                    encode_inter_ac(&mut bw, &levels[block_idx], &inter_ac)?;
+                }
+            }
+        }
+    }
+    Ok(bw.finish())
 }
 
 /// Extract one 8×8 block (natural order) from the input picture.
