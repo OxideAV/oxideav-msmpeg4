@@ -528,6 +528,62 @@ pub fn decode_mv_v1v2(br: &mut BitReader<'_>, predictor: Mv) -> Result<Mv> {
     Ok(Mv { x: mv_x, y: mv_y })
 }
 
+/// Find the v1/v2 on-wire raw index (`0..=64`) whose decode reproduces
+/// the component `mv` from the predictor component `pred`, if one
+/// exists: the residual `mv − pred` must fit `[-32, +32]` directly or
+/// after a single ±64 toroidal correction, and the decoder's
+/// single-pass wrap must land back on `mv` (spec/07 §3.2 — same
+/// wrap-window constraint as the v3 joint decoder, but with the
+/// 65-value `[-32, +32]` residual alphabet).
+fn raw_v1v2_component(mv: i8, pred: i8) -> Option<u8> {
+    let base = mv as i32 - pred as i32;
+    for residual in [base, base - 64, base + 64] {
+        if !(-32..=32).contains(&residual) {
+            continue;
+        }
+        let raw = (residual + MV_V1_V2_BIAS) as u8;
+        if wrap_component(raw as i32 - MV_V1_V2_BIAS + pred as i32) == mv {
+            return Some(raw);
+        }
+    }
+    None
+}
+
+/// True when the v1/v2 per-component coding can reconstruct `mv` from
+/// the predictor component `pred` (see [`raw_v1v2_component`]).
+pub fn mv_v1v2_component_reachable(mv: i8, pred: i8) -> bool {
+    raw_v1v2_component(mv, pred).is_some()
+}
+
+/// Encode one v1/v2 motion vector — the bit-level inverse of
+/// [`decode_mv_v1v2`]: two independent component codewords against the
+/// shared 65-entry table (spec/07 §3.2), each carrying the biased
+/// residual `mv − pred + 32` (with the single ±64 toroidal correction
+/// where needed). Errors when a component is outside the reachable
+/// window of its predictor — the motion search must pre-filter with
+/// [`mv_v1v2_component_reachable`].
+pub fn encode_mv_v1v2(bw: &mut BitWriter, predictor: Mv, mv: Mv) -> Result<()> {
+    let raw_x = raw_v1v2_component(mv.x, predictor.x);
+    let raw_y = raw_v1v2_component(mv.y, predictor.y);
+    let (Some(raw_x), Some(raw_y)) = (raw_x, raw_y) else {
+        return Err(Error::invalid(format!(
+            "msmpeg4 v1/v2 mv: MV ({}, {}) not reachable from predictor ({}, {}) \
+             through the [-32, +32] toroidal residual (spec/07 §3.2)",
+            mv.x, mv.y, predictor.x, predictor.y
+        )));
+    };
+    for raw in [raw_x, raw_y] {
+        let entry = v1v2_table()
+            .iter()
+            .find(|e| e.value == raw)
+            .ok_or_else(|| {
+                Error::invalid(format!("msmpeg4 v1/v2 mv: raw index {raw} has no codeword"))
+            })?;
+        bw.write_u32(entry.code, entry.bits as u32);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

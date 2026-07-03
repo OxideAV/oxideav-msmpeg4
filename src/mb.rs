@@ -224,6 +224,45 @@ pub fn decode_intra_dc_diff_v1v2(br: &mut BitReader<'_>, block_idx: usize) -> Re
     Ok(fixed)
 }
 
+/// Encode one v1/v2 intra-DC differential — the bit-level inverse of
+/// [`decode_intra_dc_diff_v1v2`] (H.263 §5.4.1 size+value scheme,
+/// spec/16 §2): the size category is the bit-length of `|diff|`
+/// (0 for a zero differential — no value bits), then `size` raw bits
+/// carrying `diff` directly when positive or `diff + 2^size − 1` when
+/// negative (the H.263 lower-half-negative fixup). The binary's size
+/// tables cover categories 0..=8, bounding `|diff|` at 255 — the same
+/// ceiling as the v3 ESC tier, and never exceeded by a DC differential
+/// of any realisable 8-bit pel block at the minimum DC scaler of 8.
+pub fn encode_intra_dc_diff_v1v2(bw: &mut BitWriter, block_idx: usize, diff: i32) -> Result<()> {
+    if diff.unsigned_abs() > 255 {
+        return Err(Error::invalid(format!(
+            "msmpeg4 v1/v2 intra DC: |diff| {} exceeds size category 8 (spec/16 §2)",
+            diff.unsigned_abs()
+        )));
+    }
+    let table = dc_size_v1v2_table(block_idx);
+    let size = 32 - diff.unsigned_abs().leading_zeros(); // 0 for diff == 0
+    let entry = table
+        .iter()
+        .find(|e| e.value as u32 == size)
+        .ok_or_else(|| {
+            Error::invalid(format!(
+                "msmpeg4 v1/v2 intra DC: size category {size} has no codeword"
+            ))
+        })?;
+    bw.write_u32(entry.code, entry.bits as u32);
+    if size == 0 {
+        return Ok(());
+    }
+    let value = if diff > 0 {
+        diff
+    } else {
+        diff + (1 << size) - 1
+    };
+    bw.write_u32(value as u32, size);
+    Ok(())
+}
+
 // ====================================================================
 // MS-MPEG4 v3 custom intra-DC differential VLC (round 28 / task #113).
 // ====================================================================

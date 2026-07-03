@@ -8,11 +8,18 @@ use oxideav_msmpeg4::ac::{
     decode_inter_ac, decode_intra_ac, decode_token, encode_inter_ac, encode_intra_ac, encode_token,
     AcVlcTable, Scan, Symbol, Token,
 };
-use oxideav_msmpeg4::header::{MsV3PictureHeader, PictureType};
-use oxideav_msmpeg4::mb::{decode_intra_dc_diff_v3, encode_intra_dc_diff_v3};
-use oxideav_msmpeg4::mcbpcy::{compose_cbp, decode_mcbpcy, encode_mcbpcy};
+use oxideav_msmpeg4::header::{MsV1V2PictureHeader, MsV3PictureHeader, PictureType};
+use oxideav_msmpeg4::mb::{
+    decode_intra_dc_diff_v1v2, decode_intra_dc_diff_v3, encode_intra_dc_diff_v1v2,
+    encode_intra_dc_diff_v3,
+};
+use oxideav_msmpeg4::mcbpcy::{
+    compose_cbp, decode_mcbpcy, decode_mcbpcy_v1, decode_mcbpcy_v2, encode_mcbpcy,
+    encode_mcbpcy_v1, encode_mcbpcy_v2, V2FrameType,
+};
 use oxideav_msmpeg4::mv::{
-    decode_mv_with_table, encode_mv_with_table, mv_component_reachable, Mv, MvTable,
+    decode_mv_v1v2, decode_mv_with_table, encode_mv_v1v2, encode_mv_with_table,
+    mv_component_reachable, mv_v1v2_component_reachable, Mv, MvTable,
 };
 
 // ==================== picture header ====================
@@ -416,4 +423,151 @@ fn ac_block_walks_reject_all_zero_blocks() {
     let inter = AcVlcTable::g4_inter();
     let mut bw = BitWriter::new();
     assert!(encode_inter_ac(&mut bw, &levels, &inter).is_err());
+}
+
+// ==================== v1 / v2 primitives ====================
+
+#[test]
+fn v1_v2_picture_headers_round_trip() {
+    for &(ptype, quant, umv) in &[
+        (PictureType::I, 4u8, false),
+        (PictureType::P, 4, false),
+        (PictureType::P, 31, true),
+        (PictureType::I, 1, false),
+    ] {
+        let hdr = MsV1V2PictureHeader {
+            picture_type: ptype,
+            quant,
+            v1_umv_flag: umv,
+        };
+        // v1: 37-bit preamble + type/quant + P-only UMV.
+        let mut bw = BitWriter::new();
+        hdr.write_v1(&mut bw).unwrap();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let back = MsV1V2PictureHeader::parse_v1(&mut br).unwrap();
+        assert_eq!(back.picture_type, ptype);
+        assert_eq!(back.quant, quant);
+        assert_eq!(back.v1_umv_flag, ptype == PictureType::P && umv);
+        // v2: no preamble, no UMV.
+        let mut bw = BitWriter::new();
+        hdr.write_v2(&mut bw).unwrap();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let back = MsV1V2PictureHeader::parse_v2(&mut br).unwrap();
+        assert_eq!(back.picture_type, ptype);
+        assert_eq!(back.quant, quant);
+        assert!(!back.v1_umv_flag);
+    }
+}
+
+#[test]
+fn v1_mcbpcy_round_trips_every_payload_symbol() {
+    for mcbpc in 0..20u8 {
+        for &cbpy in &[0u8, 5, 9, 15] {
+            let mut bw = BitWriter::new();
+            encode_mcbpcy_v1(&mut bw, false, mcbpc, cbpy).unwrap();
+            let bytes = bw.finish();
+            let mut br = BitReader::new(&bytes);
+            let dec = decode_mcbpcy_v1(&mut br).unwrap();
+            assert!(!dec.skip);
+            assert_eq!(dec.mb_type, mcbpc >> 2, "mcbpc {mcbpc}");
+            assert_eq!(dec.cbp_cb, mcbpc & 0b10 != 0);
+            assert_eq!(dec.cbp_cr, mcbpc & 0b01 != 0);
+            assert_eq!(dec.cbpy, cbpy, "mcbpc {mcbpc} cbpy {cbpy}");
+        }
+    }
+    // Skip MB: single bit.
+    let mut bw = BitWriter::new();
+    encode_mcbpcy_v1(&mut bw, true, 0, 0).unwrap();
+    let bytes = bw.finish();
+    let mut br = BitReader::new(&bytes);
+    assert!(decode_mcbpcy_v1(&mut br).unwrap().skip);
+    // STUFFING/ESC symbol 20 rejected.
+    let mut bw = BitWriter::new();
+    assert!(encode_mcbpcy_v1(&mut bw, false, 20, 0).is_err());
+}
+
+#[test]
+fn v2_mcbpcy_round_trips_all_symbols_both_frame_types() {
+    for &frame_type in &[V2FrameType::I, V2FrameType::P] {
+        for mcbpc in 0..8u8 {
+            for &cbpy in &[0u8, 6, 15] {
+                for &ac_pred in &[false, true] {
+                    let intra = mcbpc >> 2 == 1;
+                    let mut bw = BitWriter::new();
+                    encode_mcbpcy_v2(&mut bw, frame_type, false, mcbpc, ac_pred, cbpy).unwrap();
+                    let bytes = bw.finish();
+                    let mut br = BitReader::new(&bytes);
+                    let dec = decode_mcbpcy_v2(&mut br, frame_type).unwrap();
+                    assert!(!dec.skip);
+                    assert_eq!(dec.is_intra, intra, "mcbpc {mcbpc}");
+                    assert_eq!(dec.cbpy, cbpy, "mcbpc {mcbpc} (wrap handling)");
+                    assert_eq!(dec.cbp_cb, mcbpc & 0b10 != 0);
+                    assert_eq!(dec.cbp_cr, mcbpc & 0b01 != 0);
+                    assert_eq!(dec.ac_pred, intra && ac_pred);
+                }
+            }
+        }
+    }
+    // P-frame skip round-trips; I-frame skip is rejected.
+    let mut bw = BitWriter::new();
+    encode_mcbpcy_v2(&mut bw, V2FrameType::P, true, 0, false, 0).unwrap();
+    let bytes = bw.finish();
+    let mut br = BitReader::new(&bytes);
+    assert!(decode_mcbpcy_v2(&mut br, V2FrameType::P).unwrap().skip);
+    let mut bw = BitWriter::new();
+    assert!(encode_mcbpcy_v2(&mut bw, V2FrameType::I, true, 0, false, 0).is_err());
+}
+
+#[test]
+fn v1_v2_intra_dc_diff_round_trips_full_range() {
+    for &block_idx in &[0usize, 4] {
+        for diff in -255i32..=255 {
+            let mut bw = BitWriter::new();
+            encode_intra_dc_diff_v1v2(&mut bw, block_idx, diff).unwrap();
+            let bytes = bw.finish();
+            let mut br = BitReader::new(&bytes);
+            let back = decode_intra_dc_diff_v1v2(&mut br, block_idx).unwrap();
+            assert_eq!(back, diff, "v1/v2 DC diff {diff} (blk {block_idx})");
+        }
+    }
+    let mut bw = BitWriter::new();
+    assert!(encode_intra_dc_diff_v1v2(&mut bw, 0, 256).is_err());
+    let mut bw = BitWriter::new();
+    assert!(encode_intra_dc_diff_v1v2(&mut bw, 0, -256).is_err());
+}
+
+#[test]
+fn v1_v2_mv_round_trips_dense_windows() {
+    for &pred in &[Mv { x: 0, y: 0 }, Mv { x: 9, y: -14 }, Mv { x: -30, y: 25 }] {
+        for dx in -32i32..=32 {
+            for dy in [-32i32, -7, 0, 3, 32] {
+                let mv = Mv {
+                    x: (pred.x as i32 + dx).clamp(-63, 63) as i8,
+                    y: (pred.y as i32 + dy).clamp(-63, 63) as i8,
+                };
+                if !mv_v1v2_component_reachable(mv.x, pred.x)
+                    || !mv_v1v2_component_reachable(mv.y, pred.y)
+                {
+                    continue;
+                }
+                let mut bw = BitWriter::new();
+                encode_mv_v1v2(&mut bw, pred, mv).unwrap();
+                let bytes = bw.finish();
+                let mut br = BitReader::new(&bytes);
+                let back = decode_mv_v1v2(&mut br, pred).unwrap();
+                assert_eq!(back, mv, "v1/v2 MV {mv:?} pred {pred:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn v1_v2_mv_unreachable_is_rejected() {
+    // Residual -95 is outside [-32, 32] even after one +64 correction
+    // lands it at -31 -> but the decoder wrap then reconstructs mv+64.
+    assert!(!mv_v1v2_component_reachable(-63, 32));
+    let mut bw = BitWriter::new();
+    assert!(encode_mv_v1v2(&mut bw, Mv { x: 32, y: 0 }, Mv { x: -63, y: 0 }).is_err());
 }

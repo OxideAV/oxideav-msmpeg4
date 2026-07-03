@@ -525,6 +525,99 @@ pub fn decode_mcbpcy_v2(
     })
 }
 
+// =====================================================================
+// v1 / v2 encode side — bit-level inverses of the decoders above.
+// =====================================================================
+
+/// Write one symbol from a `(sym, bl, code)`-triple-built VLC table.
+fn write_sym(bw: &mut BitWriter, table: &[VlcEntry<u8>], sym: u8, what: &str) -> Result<()> {
+    let entry = table
+        .iter()
+        .find(|e| e.value == sym)
+        .ok_or_else(|| Error::invalid(format!("msmpeg4 {what}: symbol {sym} has no codeword")))?;
+    bw.write_u32(entry.code, entry.bits as u32);
+    Ok(())
+}
+
+/// Encode a 4-bit CBPY through the shared v1/v2 CBPY VLC — the inverse
+/// of the decode-side wrap handling: the on-wire VLC symbol is the
+/// **inverted** pattern (`15 - cbpy`) when `apply_wrap` is set
+/// (spec/07 §1.2; v2 skips the wrap only for the `mcbpc % 4 == 3`
+/// inter sub-type per §2.5).
+pub fn encode_cbpy_v1v2(bw: &mut BitWriter, cbpy: u8, apply_wrap: bool) -> Result<()> {
+    if cbpy > 15 {
+        return Err(Error::invalid(format!(
+            "msmpeg4 v1/v2 cbpy: pattern {cbpy} > 15"
+        )));
+    }
+    let raw = if apply_wrap { 15 - cbpy } else { cbpy };
+    write_sym(bw, CBPY_INTRA_TABLE, raw, "v1/v2 cbpy")
+}
+
+/// Encode one v1 MB header — the bit-level inverse of
+/// [`decode_mcbpcy_v1`]: the always-present COD/skip bit, then (coded
+/// MBs) the 21-symbol MCBPC codeword and the wrapped CBPY. `mcbpc`
+/// composes as `mb_type << 2 | cbpc` (spec/07 §1.1); the STUFFING/ESC
+/// symbol 20 is rejected. v1 has no AC-prediction bit anywhere.
+pub fn encode_mcbpcy_v1(bw: &mut BitWriter, skip: bool, mcbpc: u8, cbpy: u8) -> Result<()> {
+    bw.write_bit(skip);
+    if skip {
+        return Ok(());
+    }
+    if mcbpc >= 20 {
+        return Err(Error::invalid(format!(
+            "msmpeg4 v1 mcbpc: symbol {mcbpc} out of the payload alphabet 0..=19 \
+             (20 is STUFFING/ESC, spec/16 §3.2)"
+        )));
+    }
+    write_sym(bw, mcbpc_v1_table(), mcbpc, "v1 mcbpc")?;
+    encode_cbpy_v1v2(bw, cbpy, true)
+}
+
+/// Encode one v2 MB header — the bit-level inverse of
+/// [`decode_mcbpcy_v2`]: P-frames carry the leading skip bit
+/// (I-frames none), then the 8-symbol MCBPC codeword; intra MBs
+/// (`mcbpc / 4 == 1`) write the AC-prediction bit before the CBPY, and
+/// the CBPY wrap is skipped only for the inter `mcbpc % 4 == 3`
+/// sub-type (spec/07 §2.5).
+pub fn encode_mcbpcy_v2(
+    bw: &mut BitWriter,
+    frame_type: V2FrameType,
+    skip: bool,
+    mcbpc: u8,
+    ac_pred: bool,
+    cbpy: u8,
+) -> Result<()> {
+    match frame_type {
+        V2FrameType::P => bw.write_bit(skip),
+        V2FrameType::I => {
+            if skip {
+                return Err(Error::invalid(
+                    "msmpeg4 v2 mcbpc: I-frames cannot carry skipped MBs",
+                ));
+            }
+        }
+    }
+    if skip {
+        return Ok(());
+    }
+    if mcbpc > 7 {
+        return Err(Error::invalid(format!(
+            "msmpeg4 v2 mcbpc: symbol {mcbpc} out of alphabet 0..=7"
+        )));
+    }
+    write_sym(bw, mcbpc_v2_table(), mcbpc, "v2 mcbpc")?;
+    let quotient = mcbpc >> 2;
+    let remainder = mcbpc & 0b11;
+    let apply_wrap = if quotient == 1 {
+        bw.write_bit(ac_pred);
+        true
+    } else {
+        remainder != 3
+    };
+    encode_cbpy_v1v2(bw, cbpy, apply_wrap)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -503,6 +503,42 @@ impl MsV1V2PictureHeader {
         Self::parse_inner(br, /*has_umv=*/ false)
     }
 
+    /// Serialise a v1 picture header — the inverse of
+    /// [`Self::parse_v1`]. The 37-bit preamble is opaque on the decode
+    /// side (read-and-discarded, never matched against a pattern per
+    /// spec/99 §2.1), so the encoder writes it as zeros; then the
+    /// shared 2-bit type + 5-bit PQUANT, and — P-frames only — the
+    /// UMV flag from `self.v1_umv_flag`.
+    pub fn write_v1(&self, bw: &mut BitWriter) -> Result<()> {
+        bw.write_u32(0, 32);
+        bw.write_u32(0, 5);
+        self.write_inner(bw, /*has_umv=*/ true)
+    }
+
+    /// Serialise a v2 picture header — the inverse of
+    /// [`Self::parse_v2`]: 2-bit type + 5-bit PQUANT, nothing else.
+    pub fn write_v2(&self, bw: &mut BitWriter) -> Result<()> {
+        self.write_inner(bw, /*has_umv=*/ false)
+    }
+
+    fn write_inner(&self, bw: &mut BitWriter, has_umv: bool) -> Result<()> {
+        if !(1..=31).contains(&self.quant) {
+            return Err(Error::invalid(format!(
+                "msmpeg4 v1/v2: pquant {} out of range 1..=31",
+                self.quant
+            )));
+        }
+        match self.picture_type {
+            PictureType::I => bw.write_u32(0, 2),
+            PictureType::P => bw.write_u32(1, 2),
+        }
+        bw.write_u32(self.quant as u32, 5);
+        if has_umv && self.picture_type == PictureType::P {
+            bw.write_bit(self.v1_umv_flag);
+        }
+        Ok(())
+    }
+
     fn parse_inner(br: &mut BitReader<'_>, has_umv: bool) -> Result<Self> {
         let ptype = br.read_u32(2)?;
         let picture_type = match ptype {
