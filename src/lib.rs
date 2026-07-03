@@ -339,7 +339,8 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
     for (idx, alias) in ALIASES_V1.iter().enumerate() {
         let mut info = CodecInfo::new(CodecId::new(*alias))
             .capabilities(make_caps("msmpeg4v1_sw"))
-            .decoder(|params| MsMpeg4Decoder::boxed(params, MsVersion::V1));
+            .decoder(|params| MsMpeg4Decoder::boxed(params, MsVersion::V1))
+            .encoder(crate::encoder::make_encoder_v1);
         if idx == 0 {
             info = info
                 .probe(probe_is_msmpeg4)
@@ -352,7 +353,8 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
     for (idx, alias) in ALIASES_V2.iter().enumerate() {
         let mut info = CodecInfo::new(CodecId::new(*alias))
             .capabilities(make_caps("msmpeg4v2_sw"))
-            .decoder(|params| MsMpeg4Decoder::boxed(params, MsVersion::V2));
+            .decoder(|params| MsMpeg4Decoder::boxed(params, MsVersion::V2))
+            .encoder(crate::encoder::make_encoder_v2);
         if idx == 0 {
             info = info.probe(probe_is_msmpeg4).tag(CodecTag::fourcc(b"MP42"));
         }

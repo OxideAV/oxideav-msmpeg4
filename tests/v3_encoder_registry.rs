@@ -47,22 +47,38 @@ fn moving_frame(w: usize, h: usize, n: usize) -> VideoFrame {
 }
 
 #[test]
-fn registry_exposes_v3_encoder_factory() {
+fn registry_exposes_encoder_factories_for_all_three_versions() {
     let mut ctx = oxideav_core::RuntimeContext::new();
     oxideav_msmpeg4::register(&mut ctx);
-    assert!(ctx.codecs.has_encoder(&CodecId::new("msmpeg4v3")));
-    assert!(ctx.codecs.has_encoder(&CodecId::new("div3")));
-    // v1/v2 remain decode-only.
-    assert!(!ctx.codecs.has_encoder(&CodecId::new("msmpeg4v1")));
-    assert!(!ctx.codecs.has_encoder(&CodecId::new("msmpeg4v2")));
+    for id in ["msmpeg4v3", "div3", "msmpeg4v1", "msmpeg4v2"] {
+        assert!(
+            ctx.codecs.has_encoder(&CodecId::new(id)),
+            "missing encoder factory for {id}"
+        );
+    }
 }
 
 #[test]
 fn registry_encoder_to_registered_decoder_loop() {
+    registry_loop_for("msmpeg4v3");
+}
+
+#[test]
+fn registry_encoder_to_registered_decoder_loop_v1() {
+    registry_loop_for("msmpeg4v1");
+}
+
+#[test]
+fn registry_encoder_to_registered_decoder_loop_v2() {
+    registry_loop_for("msmpeg4v2");
+}
+
+fn registry_loop_for(codec_id: &str) {
     let mut ctx = oxideav_core::RuntimeContext::new();
     oxideav_msmpeg4::register(&mut ctx);
 
     let mut params = video_params(64, 48);
+    params.codec_id = CodecId::new(codec_id);
     params.options.insert("quant", "2");
     params.options.insert("gop", "4");
     let mut enc = ctx.codecs.first_encoder(&params).expect("encoder factory");

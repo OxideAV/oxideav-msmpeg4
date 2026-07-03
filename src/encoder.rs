@@ -1,7 +1,8 @@
-//! Registry-facing MS-MPEG4 v3 encoder: wraps the picture-level
-//! [`crate::enc`] frame encoders in the [`oxideav_core::Encoder`]
-//! frame-to-packet contract, and exposes the crate's historical direct
-//! factory endpoint [`make_encoder`].
+//! Registry-facing MS-MPEG4 encoders (v1 / v2 / v3): wraps the
+//! picture-level [`crate::enc`] frame encoders in the
+//! [`oxideav_core::Encoder`] frame-to-packet contract, and exposes the
+//! crate's direct factory endpoints [`make_encoder`] (v3, the
+//! historical name) and [`make_encoder_v1`] / [`make_encoder_v2`].
 //!
 //! The encoder is a classic I/P GOP machine: the first frame (and
 //! every `gop`-th frame after it) is coded as a v3 I-frame, everything
@@ -26,16 +27,48 @@ use oxideav_core::{
     CodecId, CodecParameters, Encoder, Error, Frame, Packet, Result, TimeBase, VideoFrame,
 };
 
-use crate::enc::{encode_iframe_v3, encode_pframe_v3, EncoderConfig};
+use crate::enc::{
+    encode_iframe_v1v2, encode_iframe_v3, encode_pframe_v1v2, encode_pframe_v3, EncoderConfig,
+};
 use crate::header::PictureType;
-use crate::picture::{decode_picture, Picture, PictureDims};
+use crate::picture::{decode_picture, decode_picture_v1v2, MsV1V2Version, Picture, PictureDims};
+
+/// Which MS-MPEG4 bitstream version an encoder instance emits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EncVersion {
+    V1,
+    V2,
+    V3,
+}
+
+impl EncVersion {
+    fn codec_id(self) -> &'static str {
+        match self {
+            Self::V1 => crate::CODEC_ID_V1,
+            Self::V2 => crate::CODEC_ID_V2,
+            Self::V3 => crate::CODEC_ID_V3,
+        }
+    }
+}
 
 /// Direct factory endpoint (crate convention alongside the registry
-/// path): build a boxed MS-MPEG4 v3 encoder from codec parameters.
+/// path): build a boxed MS-MPEG4 **v3** encoder from codec parameters.
 /// `params.width` / `params.height` are required (MS-MPEG4 carries no
 /// dimensions in the bitstream — the container transports them).
 pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
-    MsMpeg4V3Encoder::boxed(params)
+    MsMpeg4Encoder::boxed(params, EncVersion::V3)
+}
+
+/// Direct factory endpoint for the MS-MPEG4 **v1** (`MP41` / `MPG4`)
+/// encoder. Same parameter contract as [`make_encoder`].
+pub fn make_encoder_v1(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
+    MsMpeg4Encoder::boxed(params, EncVersion::V1)
+}
+
+/// Direct factory endpoint for the MS-MPEG4 **v2** (`MP42`) encoder.
+/// Same parameter contract as [`make_encoder`].
+pub fn make_encoder_v2(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
+    MsMpeg4Encoder::boxed(params, EncVersion::V2)
 }
 
 /// Parse a small positive integer option with a default and an
@@ -59,8 +92,9 @@ fn int_option(params: &CodecParameters, key: &str, default: u32, lo: u32, hi: u3
     }
 }
 
-struct MsMpeg4V3Encoder {
+struct MsMpeg4Encoder {
     codec_id: CodecId,
+    version: EncVersion,
     output_params: CodecParameters,
     dims: PictureDims,
     config: EncoderConfig,
@@ -73,8 +107,8 @@ struct MsMpeg4V3Encoder {
     queue: VecDeque<Packet>,
 }
 
-impl MsMpeg4V3Encoder {
-    fn boxed(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
+impl MsMpeg4Encoder {
+    fn boxed(params: &CodecParameters, version: EncVersion) -> Result<Box<dyn Encoder>> {
         let (w, h) = match (params.width, params.height) {
             (Some(w), Some(h)) if w > 0 && h > 0 => (w, h),
             _ => {
@@ -91,9 +125,10 @@ impl MsMpeg4V3Encoder {
         let mv_search_range = int_option(params, "mv_search_range", 8, 0, 63)?;
 
         let mut output_params = params.clone();
-        output_params.codec_id = CodecId::new(crate::CODEC_ID_V3);
+        output_params.codec_id = CodecId::new(version.codec_id());
         Ok(Box::new(Self {
-            codec_id: CodecId::new(crate::CODEC_ID_V3),
+            codec_id: CodecId::new(version.codec_id()),
+            version,
             output_params,
             dims,
             config: EncoderConfig {
@@ -182,7 +217,7 @@ fn copy_plane(
     Ok(())
 }
 
-impl Encoder for MsMpeg4V3Encoder {
+impl Encoder for MsMpeg4Encoder {
     fn codec_id(&self) -> &CodecId {
         &self.codec_id
     }
@@ -201,20 +236,33 @@ impl Encoder for MsMpeg4V3Encoder {
         let input = self.frame_to_picture(vf)?;
 
         let force_key = self.last_recon.is_none() || self.frames_since_key >= self.gop;
+        let v1v2 = match self.version {
+            EncVersion::V1 => Some(MsV1V2Version::V1),
+            EncVersion::V2 => Some(MsV1V2Version::V2),
+            EncVersion::V3 => None,
+        };
         let (bytes, is_key) = if force_key {
-            (encode_iframe_v3(&input, self.dims, &self.config)?, true)
+            let bytes = match v1v2 {
+                None => encode_iframe_v3(&input, self.dims, &self.config)?,
+                Some(v) => encode_iframe_v1v2(&input, self.dims, &self.config, v)?,
+            };
+            (bytes, true)
         } else {
             let reference = self.last_recon.as_ref().expect("checked above");
-            (
-                encode_pframe_v3(&input, reference, self.dims, &self.config)?,
-                false,
-            )
+            let bytes = match v1v2 {
+                None => encode_pframe_v3(&input, reference, self.dims, &self.config)?,
+                Some(v) => encode_pframe_v1v2(&input, reference, self.dims, &self.config, v)?,
+            };
+            (bytes, false)
         };
 
         // Decode our own bytes so the next P-frame references exactly
         // what a decoder will hold (no encoder/decoder drift possible).
         let mut br = BitReader::new(&bytes);
-        let recon = decode_picture(&mut br, self.dims, self.last_recon.as_ref())?;
+        let recon = match v1v2 {
+            None => decode_picture(&mut br, self.dims, self.last_recon.as_ref())?,
+            Some(v) => decode_picture_v1v2(&mut br, self.dims, v, self.last_recon.as_ref())?,
+        };
         self.last_recon = Some(recon);
         self.frames_since_key = if is_key { 1 } else { self.frames_since_key + 1 };
 
