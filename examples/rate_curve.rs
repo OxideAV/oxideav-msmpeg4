@@ -184,6 +184,17 @@ fn main() {
         matrix.push(("v1", vec![("quant", q.to_string()), ("gop", "15".into())]));
         matrix.push(("v2", vec![("quant", q.to_string()), ("gop", "15".into())]));
     }
+    // Tight search window: the sequence pans at 3 half-pel/frame, so a
+    // ±2 window only tracks it through the predictor-centred window
+    // extension (the predictor chain).
+    matrix.push((
+        "v3",
+        vec![
+            ("quant", "8".into()),
+            ("gop", "15".into()),
+            ("mv_search_range", "2".into()),
+        ],
+    ));
     for (ver, opts) in &matrix {
         let r = run(ver, opts);
         let optstr = opts

@@ -409,12 +409,49 @@ fn mb_sad(input: &Picture, reference: &Picture, mb_x: usize, mb_y: usize, mv: (i
     sad
 }
 
-/// Half-pel motion search: evaluates `(0, 0)`, the predictor, and the
-/// full `[-range, +range]²` half-pel window, keeping the smallest luma
-/// SAD among candidates that are (a) inside the `[-63, 63]` component
-/// range and (b) toroidally reachable from `predictor` (spec/06 §3.5).
-/// `(0, 0)` is always reachable-checked first so an all-static MB can
-/// take the skip path.
+/// Which MV entropy coder a motion search optimises its rate term
+/// for: the v3 joint VLC (with the frame's table selector) or the
+/// v1/v2 per-component codeword pair.
+#[derive(Clone, Copy)]
+enum MvCoder {
+    V3(MvTable),
+    V1V2,
+}
+
+/// Exact bit cost of coding `mv` against `predictor` under `coder`,
+/// obtained by running the real encode-side serialiser into a scratch
+/// writer (so the rate term of the motion-search cost function can
+/// never drift from the wire format). `mv` must be reachable from
+/// `predictor` under the version's toroidal window; unreachable
+/// requests report an effectively-infinite cost.
+fn mv_rate_bits(coder: MvCoder, predictor: Mv, mv: Mv) -> u32 {
+    let mut bw = BitWriter::new();
+    let res = match coder {
+        MvCoder::V3(table) => encode_mv_with_table(&mut bw, predictor, table, mv),
+        MvCoder::V1V2 => encode_mv_v1v2(&mut bw, predictor, mv),
+    };
+    match res {
+        Ok(()) => bw.bit_position() as u32,
+        Err(_) => u32::MAX / 2,
+    }
+}
+
+/// Half-pel motion search with a rate-aware cost function:
+///
+/// > `cost(mv) = SAD(mv) + λ · bits(mv | predictor)`
+///
+/// where `bits` is the exact MV codeword length ([`mv_rate_bits`]) and
+/// `λ = quant` (the classic SAD-domain Lagrange weight — one quantiser
+/// step of distortion per residual bit). The candidate set is `(0, 0)`,
+/// the predictor, and the union of two `[-range, +range]²` half-pel
+/// windows centred on `(0, 0)` **and on the predictor** — the second
+/// window lets MVs track motion beyond the nominal search range once
+/// the §7.6.5 predictor chain has locked onto it (each MB extends the
+/// reach of the next). Candidates outside `[-63, 63]` per component or
+/// not toroidally reachable from `predictor` (spec/06 §3.5) are
+/// excluded. `(0, 0)` is always evaluated first so an all-static MB
+/// can take the skip path.
+#[allow(clippy::too_many_arguments)]
 fn motion_search(
     input: &Picture,
     reference: &Picture,
@@ -423,41 +460,51 @@ fn motion_search(
     predictor: Mv,
     range: u8,
     component_reachable: fn(i8, i8) -> bool,
+    quant: u32,
+    coder: MvCoder,
 ) -> Mv {
     let reachable =
         |mv: Mv| component_reachable(mv.x, predictor.x) && component_reachable(mv.y, predictor.y);
     let mut best = Mv { x: 0, y: 0 };
     let mut have_best = false;
-    let mut best_sad = u32::MAX;
+    let mut best_cost = u64::MAX;
+    // Visited-candidate mask over the [-63, 63]² component space so
+    // the overlap of the two windows is evaluated once.
+    let mut seen = vec![false; 127 * 127];
     let mut consider = |mv: Mv, input: &Picture| {
+        let slot = (mv.y as i32 + 63) as usize * 127 + (mv.x as i32 + 63) as usize;
+        if seen[slot] {
+            return;
+        }
+        seen[slot] = true;
+        if !reachable(mv) {
+            return;
+        }
         let sad = mb_sad(input, reference, mb_x, mb_y, (mv.x as i32, mv.y as i32));
-        if sad < best_sad {
-            best_sad = sad;
+        let cost = sad as u64 + quant as u64 * mv_rate_bits(coder, predictor, mv) as u64;
+        if cost < best_cost {
+            best_cost = cost;
             best = mv;
             have_best = true;
         }
     };
-    if reachable(Mv { x: 0, y: 0 }) {
-        consider(Mv { x: 0, y: 0 }, input);
-    }
-    if predictor != (Mv { x: 0, y: 0 }) && reachable(predictor) {
-        consider(predictor, input);
-    }
+    consider(Mv { x: 0, y: 0 }, input);
+    consider(predictor, input);
     let r = range as i32;
-    for dy in -r..=r {
-        for dx in -r..=r {
-            if dx == 0 && dy == 0 {
-                continue;
-            }
-            if !(-63..=63).contains(&dx) || !(-63..=63).contains(&dy) {
-                continue;
-            }
-            let cand = Mv {
-                x: dx as i8,
-                y: dy as i8,
-            };
-            if reachable(cand) {
-                consider(cand, input);
+    for &(cx, cy) in &[(0i32, 0i32), (predictor.x as i32, predictor.y as i32)] {
+        for dy in -r..=r {
+            for dx in -r..=r {
+                let (x, y) = (cx + dx, cy + dy);
+                if !(-63..=63).contains(&x) || !(-63..=63).contains(&y) {
+                    continue;
+                }
+                consider(
+                    Mv {
+                        x: x as i8,
+                        y: y as i8,
+                    },
+                    input,
+                );
             }
         }
     }
@@ -492,6 +539,8 @@ fn encode_inter_mb(
         predictor,
         config.mv_search_range,
         mv_component_reachable,
+        quant,
+        MvCoder::V3(MvTable::Default),
     );
 
     // Residual analysis over all 6 blocks at the chosen MV.
@@ -659,9 +708,10 @@ fn block_sad_8(
 /// 6-8 block in raster order, take the Figure-7-34 within-MB predictor
 /// from the already-committed blocks (the exact interleaved
 /// predict → decode → commit order the decoder replays), search the
-/// half-pel window for the smallest 8×8 SAD among v1/v2-reachable
-/// candidates, and commit. Returns the four final MVs and the total
-/// luma SAD.
+/// union of the zero- and predictor-centred half-pel windows for the
+/// smallest rate-aware cost (`SAD + quant · mv_bits`, mirroring
+/// [`motion_search`]) among v1/v2-reachable candidates, and commit.
+/// Returns the four final MVs and the total cost.
 fn search_inter4v(
     input: &Picture,
     reference: &Picture,
@@ -669,43 +719,49 @@ fn search_inter4v(
     mb_x: usize,
     mb_y: usize,
     range: u8,
-) -> ([Mv; 4], u32) {
+    quant: u32,
+) -> ([Mv; 4], u64) {
     let nset = mv_grid.neighbour_set_for(mb_x, mb_y);
     let mut dec = Macroblock4MvDecoderNeighbours::new(nset);
     let mut mvs = [Mv::default(); 4];
-    let mut total_sad = 0u32;
+    let mut total_cost = 0u64;
     let r = range as i32;
     for (i, &block) in Block::ALL.iter().enumerate() {
         let predictor = dec.predictor_for(block);
         let mut best = predictor; // always reachable (residual 0)
-        let mut best_sad = block_sad_8(input, reference, mb_x, mb_y, i, best);
-        for dy in -r..=r {
-            for dx in -r..=r {
-                if !(-63..=63).contains(&dx) || !(-63..=63).contains(&dy) {
-                    continue;
-                }
-                let cand = Mv {
-                    x: dx as i8,
-                    y: dy as i8,
-                };
-                if cand == best
-                    || !mv_v1v2_component_reachable(cand.x, predictor.x)
-                    || !mv_v1v2_component_reachable(cand.y, predictor.y)
-                {
-                    continue;
-                }
-                let sad = block_sad_8(input, reference, mb_x, mb_y, i, cand);
-                if sad < best_sad {
-                    best_sad = sad;
-                    best = cand;
+        let mut best_cost = block_sad_8(input, reference, mb_x, mb_y, i, best) as u64
+            + quant as u64 * mv_rate_bits(MvCoder::V1V2, predictor, best) as u64;
+        for &(cx, cy) in &[(0i32, 0i32), (predictor.x as i32, predictor.y as i32)] {
+            for dy in -r..=r {
+                for dx in -r..=r {
+                    let (x, y) = (cx + dx, cy + dy);
+                    if !(-63..=63).contains(&x) || !(-63..=63).contains(&y) {
+                        continue;
+                    }
+                    let cand = Mv {
+                        x: x as i8,
+                        y: y as i8,
+                    };
+                    if cand == best
+                        || !mv_v1v2_component_reachable(cand.x, predictor.x)
+                        || !mv_v1v2_component_reachable(cand.y, predictor.y)
+                    {
+                        continue;
+                    }
+                    let cost = block_sad_8(input, reference, mb_x, mb_y, i, cand) as u64
+                        + quant as u64 * mv_rate_bits(MvCoder::V1V2, predictor, cand) as u64;
+                    if cost < best_cost {
+                        best_cost = cost;
+                        best = cand;
+                    }
                 }
             }
         }
         dec.commit_block(block, best);
         mvs[i] = best;
-        total_sad += best_sad;
+        total_cost += best_cost;
     }
-    (mvs, total_sad)
+    (mvs, total_cost)
 }
 
 // ====================================================================
@@ -822,20 +878,30 @@ pub fn encode_pframe_v1v2(
                 predictor,
                 config.mv_search_range,
                 mv_v1v2_component_reachable,
+                quant,
+                MvCoder::V1V2,
             );
 
             // v1-only INTER4V (MB-type 2, spec/16 §3.1) mode decision:
-            // when the per-block greedy search beats the 1-MV SAD by
-            // more than the ~3 extra MV codeword pairs cost, emit the
-            // 4-MV MB. The v2 8-symbol MCBPC alphabet has no INTER4V
+            // rate-aware — the greedy per-block search's total cost
+            // (`SAD + quant · mv_bits` over the four blocks) must beat
+            // the 1-MV cost under the same λ before the 4-MV MB is
+            // emitted. The v2 8-symbol MCBPC alphabet has no INTER4V
             // code (spec/16 §3.3), so v2 never takes this branch.
-            const INTER4V_SAD_MARGIN: u32 = 96;
             let inter4v = if version == MsV1V2Version::V1 && config.mv_search_range > 0 {
-                let sad_1mv = mb_sad(input, reference, mx, my, (mv.x as i32, mv.y as i32));
-                let (mvs4, sad_4mv) =
-                    search_inter4v(input, reference, &mv_grid, mx, my, config.mv_search_range);
+                let cost_1mv = mb_sad(input, reference, mx, my, (mv.x as i32, mv.y as i32)) as u64
+                    + quant as u64 * mv_rate_bits(MvCoder::V1V2, predictor, mv) as u64;
+                let (mvs4, cost_4mv) = search_inter4v(
+                    input,
+                    reference,
+                    &mv_grid,
+                    mx,
+                    my,
+                    config.mv_search_range,
+                    quant,
+                );
                 let uniform = mvs4.iter().all(|&m| m == mvs4[0]);
-                if !uniform && sad_4mv + INTER4V_SAD_MARGIN < sad_1mv {
+                if !uniform && cost_4mv < cost_1mv {
                     Some(mvs4)
                 } else {
                     None
@@ -1059,6 +1125,73 @@ mod tests {
         }
         let mae = sum as f64 / out.y.len() as f64;
         assert!(mae < 1.5, "translated P-frame luma MAE {mae} too large");
+    }
+
+    /// Deterministic high-frequency texture (motion must be matched
+    /// exactly for the SAD to collapse — a plain gradient would let
+    /// any MV win via a cheap DC residual).
+    fn fill_texture(pic: &mut Picture) {
+        let h = pic.y.len() / pic.y_stride;
+        for y in 0..h {
+            for x in 0..pic.y_stride {
+                let a = (x * 7 + y * 13) % 251;
+                let b = (x * x / 3 + y * y / 5) % 89;
+                pic.y[y * pic.y_stride + x] = ((a + b) % 200 + 24) as u8;
+            }
+        }
+        let ch = pic.cb.len() / pic.c_stride;
+        for y in 0..ch {
+            for x in 0..pic.c_stride {
+                pic.cb[y * pic.c_stride + x] = ((x * 5 + y * 3) % 60 + 100) as u8;
+                pic.cr[y * pic.c_stride + x] = ((x * 3 + y * 7) % 60 + 110) as u8;
+            }
+        }
+    }
+
+    #[test]
+    fn pframe_predictor_chain_extends_search_beyond_window() {
+        // Global pan of 5 pels right / 2 pels down = MV (+10, +4) in
+        // half-pel units, searched with range 6: the zero-centred
+        // window alone cannot reach it, but once one MB locks on, the
+        // predictor-centred window lets every following MB track the
+        // true motion (§7.6.5 predictor chain).
+        let dims = PictureDims::new(64, 64).unwrap();
+        let mut reference = Picture::alloc(dims, PictureType::I);
+        fill_texture(&mut reference);
+        let mut input = Picture::alloc(dims, PictureType::I);
+        let h = input.y.len() / input.y_stride;
+        for y in 0..h {
+            for x in 0..input.y_stride {
+                let sx = x.saturating_sub(5).min(input.y_stride - 1);
+                let sy = y.saturating_sub(2).min(h - 1);
+                input.y[y * input.y_stride + x] = reference.y[sy * reference.y_stride + sx];
+            }
+        }
+        let ch = input.cb.len() / input.c_stride;
+        for y in 0..ch {
+            for x in 0..input.c_stride {
+                let sx = x.saturating_sub(2).min(input.c_stride - 1);
+                let sy = y.saturating_sub(1).min(ch - 1);
+                input.cb[y * input.c_stride + x] = reference.cb[sy * reference.c_stride + sx];
+                input.cr[y * input.c_stride + x] = reference.cr[sy * reference.c_stride + sx];
+            }
+        }
+        let config = EncoderConfig {
+            quant: 2,
+            mv_search_range: 6,
+        };
+        let bytes = encode_pframe_v3(&input, &reference, dims, &config).unwrap();
+        let mut br = BitReader::new(&bytes);
+        let out = decode_picture(&mut br, dims, Some(&reference)).unwrap();
+        let mut sum = 0u64;
+        for (a, b) in out.y.iter().zip(input.y.iter()) {
+            sum += (*a as i64 - *b as i64).unsigned_abs();
+        }
+        let mae = sum as f64 / out.y.len() as f64;
+        assert!(
+            mae < 2.5,
+            "predictor-chained search should recover the out-of-window pan, MAE {mae}"
+        );
     }
 
     #[test]
