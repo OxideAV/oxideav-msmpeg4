@@ -143,6 +143,7 @@ use oxideav_core::{CodecInfo, CodecRegistry, Decoder};
 pub mod ac;
 pub mod dc_pred;
 pub mod enc;
+pub mod encoder;
 pub mod g_descriptor;
 pub mod g_enum;
 pub mod g_family;
@@ -363,7 +364,8 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
     for (idx, alias) in ALIASES_V3.iter().enumerate() {
         let mut info = CodecInfo::new(CodecId::new(*alias))
             .capabilities(make_caps("msmpeg4v3_sw"))
-            .decoder(|params| MsMpeg4Decoder::boxed(params, MsVersion::V3));
+            .decoder(|params| MsMpeg4Decoder::boxed(params, MsVersion::V3))
+            .encoder(crate::encoder::make_encoder);
         if idx == 0 {
             info = info.probe(probe_is_msmpeg4).tags([
                 CodecTag::fourcc(b"DIV3"),
