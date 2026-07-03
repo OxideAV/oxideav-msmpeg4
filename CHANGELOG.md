@@ -9,6 +9,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- round 386: **encoder quality drive — rate-aware motion search,
+  ac_pred / table-selector RD, intra-in-P scene-change MBs, scene-cut
+  GOP policy, bit-budget rate control.** Six milestones on top of the
+  round-383 encoder family, each decoder-verified in-loop and measured
+  with the new `examples/rate_curve.rs` harness (176×144, 30 frames,
+  half-pel pan + hard mid-GOP scene cut; every packet decoded back
+  through the production `decode_picture` chain):
+  1. `examples/rate_curve.rs` — PSNR/rate measurement harness (also
+     the source of every number below).
+  2. Rate-aware predictor-centred motion search: cost =
+     `SAD + quant·mv_bits` with the rate term computed by the real MV
+     serialisers into a scratch writer, over the union of the zero-
+     and predictor-centred half-pel windows, so the §7.6.5 predictor
+     chain extends the effective search reach MB by MB. v1 INTER4V
+     greedy search + mode decision share the same λ. Headline: with a
+     deliberately tight ±2 window the chain still tracks the
+     3-half-pel/frame pan — 220125 → 72792 B (−67 %) at +1.12 dB.
+  3. RD-decided `ac_pred` (v3 + v2): each intra MB is serialised both
+     ways (fixed zigzag vs the per-block DC-gradient alternate scans,
+     spec/03 §1.1–§1.3) and the alternate variant kept only when
+     strictly cheaper; v1 carries no ac_pred bit (spec/07 §1.4).
+  4. Intra-in-P scene-change MBs (v1/v2/v3) + `PFrameStats` census:
+     TMN-lineage activity-vs-SAD decision per P-frame MB; v3 emits
+     the joint-MCBPCY I-type half behind the skip bit (intra-in-P
+     luma binds G3 — the parser zero of the untransmitted P-wire
+     `ac_luma_sel` — chroma the transmitted G4), v1 MB-type 3, v2 the
+     intra quotient with its post-MCBPC ac_pred bit; DC cache/MV-grid
+     state mirrors the decoder exactly (intra cells stay Absent).
+     Scene-cut frame: min Y-PSNR 35.95 → 46.08 dB (+10.1 dB) at q=2
+     while total bytes *drop* 270566 → 264324.
+  5. Scene-cut GOP policy (`scene_cut` option, % of intra MBs,
+     default 60, 0 = off): a P-frame whose census crosses the
+     threshold is discarded and re-encoded as a keyframe, restarting
+     the GOP at the cut (v3 q=8: 69262 → 67316 B, −2.8 %).
+  6. Bit-budget rate control (`bitrate` option, bits/s): per-frame
+     budget `bitrate/fps` with the classic I:P = 4:1 GOP split
+     normalised to the GOP average, a virtual buffer draining 1/8 per
+     frame into the adjusted target, ≤3 re-encode trials per frame
+     (step ⌈qp/4⌉, 0.6..1.3 dead-band) + ±1 drift. Requested 400 /
+     150 kbit/s → achieved 422 / 158 on the 30-frame sequence
+     (startup + scene cut included); 64×64 steady state lands within
+     25 % of budget.
+  7. v3 I-frame table-selector RD: the frame is analysed once and
+     serialised under all 18 transmittable (`ac_luma_sel`,
+     `ac_chroma_sel`, `dc_size_sel`) combinations (spec/14 §3.1 +
+     spec/99 §4.5), smallest bitstream wins (q=31 I-frames −1.4 %).
+  Whole-curve result (v3, gop=15, quant 2/4/8/16/31): 271800 → 264010,
+  152382 → 147648, 72078 → 67143, 32755 → 30913, 17122 → 16045 bytes
+  (−2.9 % … −6.9 %) at equal-or-better PSNR everywhere, with the
+  scene-cut frame +10 dB at fine quant.
+
 - round 383: **MS-MPEG-4 family encoder (v1 / v2 / v3) — I-frames +
   P-frames, decoder-verified end-to-end, registered.** The crate was
   decode-only; this round adds the complete encode direction over the

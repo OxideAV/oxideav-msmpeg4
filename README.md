@@ -38,10 +38,25 @@ element is written through the bit-level inverse of its decode surface
 over the same extracted tables, and every produced stream round-trips
 through this crate's own production decoders (`picture::decode_picture`
 / `decode_picture_v1v2`). The registered `oxideav_core::Encoder` (an
-I/P GOP machine with `quant` / `gop` / `mv_search_range` options)
-decodes its own bytes each frame so encoder/decoder prediction state
-cannot drift; direct factories live at `encoder::make_encoder`
-(+ `_v1` / `_v2`). Caveat: for the one table whose wire codes are
+I/P GOP machine with `quant` / `gop` / `mv_search_range` /
+`scene_cut` / `bitrate` options) decodes its own bytes each frame so
+encoder/decoder prediction state cannot drift; direct factories live
+at `encoder::make_encoder` (+ `_v1` / `_v2`).
+
+Round 386 drove encoder **quality**: rate-aware predictor-centred
+motion search (`SAD + q·mv_bits` over the union of the zero- and
+predictor-centred half-pel windows — a ±2 window still tracks a
+3-half-pel/frame pan at −67 % bytes / +1.1 dB), RD-decided `ac_pred`
+(v3 + v2) and the 18-way v3 I-frame table-selector RD (both exact-rate:
+the probe is the real serialiser), per-MB intra-in-P scene-change
+refuge on all three versions (+10 dB at a hard cut, q=2), a
+census-driven scene-cut P→I GOP policy, and frame-level bit-budget
+rate control (virtual buffer + bounded re-encode trials; requested
+400/150 kbit/s → achieved 422/158 on the 30-frame
+`examples/rate_curve.rs` sequence). Whole-curve: −2.9 %…−6.9 % bytes
+at equal-or-better PSNR (v3, q ∈ {2,4,8,16,31}).
+
+Caveat: for the one table whose wire codes are
 canonically *reconstructed* rather than binary-extracted (the v3
 128-entry joint MCBPCY, see the docs gap below) the encoder matches
 this crate's decoder by construction, and byte-exactness against the
