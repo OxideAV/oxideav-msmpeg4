@@ -101,14 +101,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
      near-exact (MAE < 1) while the 1-MV-only v2 encode of identical
      input carries over 2× the error.
   Test suite 431 lib-only → 606 total (0 failed). The encoder targets
-  THIS crate's decoder: for the two tables whose wire codes are
-  canonically reconstructed rather than binary-extracted (128-entry
-  joint MCBPCY — see the README docs-gap on `region_05eac8` — and the
-  shared v1/v2 CBPY table), byte-exactness against the original
-  binary remains unverified either way; all binary-extracted tables
-  (G0..G5 primaries, both v3 joint-MV VLCs + byte LUTs, v1/v2
-  MV/MCBPC/DC-size tables, the four v3 intra-DC VLCs) are used
-  verbatim in both directions.
+  THIS crate's decoder: for the one table whose wire codes are
+  canonically reconstructed rather than binary-extracted (the v3
+  128-entry joint MCBPCY — see the README docs-gap on
+  `region_05eac8`), byte-exactness against the original binary
+  remains unverified either way; every binary-extracted table
+  (G0..G5 primaries, both v3 joint-MV VLCs + byte LUTs, the v1/v2
+  MV/MCBPC/DC-size tables, the shared v1/v2 CBPY table from
+  `region_053640` — itself build-cross-checked against the H.263
+  Table 8 codes — and the four v3 intra-DC VLCs) is used verbatim in
+  both directions.
 
 ### Tests
 

@@ -41,12 +41,12 @@ through this crate's own production decoders (`picture::decode_picture`
 I/P GOP machine with `quant` / `gop` / `mv_search_range` options)
 decodes its own bytes each frame so encoder/decoder prediction state
 cannot drift; direct factories live at `encoder::make_encoder`
-(+ `_v1` / `_v2`). Caveat: for the two tables whose wire codes are
+(+ `_v1` / `_v2`). Caveat: for the one table whose wire codes are
 canonically *reconstructed* rather than binary-extracted (the v3
-128-entry joint MCBPCY, see the docs gap below, and the shared v1/v2
-CBPY table) the encoder matches this crate's decoder by construction,
-and byte-exactness against the original binary remains exactly as
-unverified as on the decode side.
+128-entry joint MCBPCY, see the docs gap below) the encoder matches
+this crate's decoder by construction, and byte-exactness against the
+original binary remains exactly as unverified as on the decode side;
+every other table both directions consume is binary-extracted.
 
 | Piece                                          | Status     |
 | ---------------------------------------------- | ---------- |
