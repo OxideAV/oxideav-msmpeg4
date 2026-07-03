@@ -7,6 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.9](https://github.com/OxideAV/oxideav-msmpeg4/compare/v0.0.8...v0.0.9) - 2026-07-03
+
+### Other
+
+- round 386 CHANGELOG + README - encoder quality drive documented
+- v3 I-frame table-selector RD - 18-way exact-rate header choice
+- bit-budget rate control - per-frame QP adaptation (all versions)
+- scene-cut GOP policy - census-driven P-to-I upgrade
+- fix doc_lazy_continuation lint on encode_intra_mb doc comment
+- intra-in-P scene-change macroblocks + PFrameStats census (v1/v2/v3)
+- RD-decided ac_pred - per-MB alternate-scan rate probe (v3 + v2)
+- rate-aware predictor-centred motion search (all versions)
+- rate_curve example - decoder-verified PSNR/rate measurement harness
+- correct the round-383 wire-code caveat - CBPY is binary-extracted
+- v1 INTER4V (4-MV) encoding - greedy per-block search through the Figure-7-34 driver
+- round 383 CHANGELOG + README - full-family encoder documented
+- register v1/v2 Encoder factories - full-family frame-to-packet encode
+- v1/v2 I-frame + P-frame picture encoders through decode_picture_v1v2
+- v1/v2 entropy-encode primitives (header / MCBPC+CBPY / size+value DC / per-component MV)
+- registered v3 Encoder (GOP I/P machine) + encoder::make_encoder factory
+- v3 P-frame encoder - skip / motion-searched inter MBs through decode_picture
+- v3 I-frame picture encoder end-to-end through decode_picture
+- v3 entropy-encode primitives - bit-level inverses of every v3 decode surface
+- encoder-side forward DCT + H.263 quantiser (inverse of idct/dequant)
+- correct round 374 CHANGELOG test counts (7 tests; v1_v2_pframe 18->21)
+- deterministic registered-decoder v3 I-frame to intra-in-P P-frame sequence
+- CHANGELOG + README for round 374 intra-in-P picture-level coverage
+- pin v3 intra-in-P MB contributes Absent (not a MV) to the predictor grid
+- pin the v1 P-frame intra-in-P MB path (no ac_pred)
+- pin v2 intra-in-P ac_pred scan-flip on a CBP-coded block
+- pin v3 intra-in-P ac_pred scan-flip on a CBP-coded block
+- picture-level pin for the v3 intra-in-P P-frame MB path
+- msmpeg4 README: round 366 rollup — INTER4V coverage + v3 gap #1895 firmed
+- picture-level INTER4V -> 1-MV-neighbour MV propagation pin
+- v3 McbpcyDecode::num_motion_vectors accessor pins 1-MV invariant
+- deepen v1/v2 INTER4V picture coverage + correct stale mc.rs doc
+- correct v3 joint-MCBPCY intra/inter partition polarity (round 362)
+- CHANGELOG + README for round 362 alt-MV byte-LUT pin
+- pin alternate joint-MV VLC byte-LUT selection end-to-end (round 362)
+- pin v3 P-frame median-predictor propagation end-to-end (round 359)
+- README — record round 356 MV wire-code correction + MCBPCY docs gap
+- full-alphabet round-trip pin for v3 joint-MV extracted codes
+- decode v3 joint-MV VLC against extracted wire codes, not canonical
+- rename ffmpeg_roundtrip.rs -> reference_roundtrip.rs (neutral filename; black-box validator invocation unchanged)
+- README — record v1 MB-type table grounding + precise v3 4-MV docs gap
+- scrub external-decoder naming from src/ doc comments
+- ground v1 P-frame MB-type decode in extracted region_053140_mbtype (spec/16 §3)
+- cross-check v1/v2 DC-size tables against spec/16 §2 + unit-test the size+value decode
+- unblock v1/v2 intra pixel pipeline (I-frame + intra-in-P) via spec/16 §2 size+value DC rule
+- round 335: wire v1 P-frame inter sub-types — INTER+Q + INTER4V (4-MV)
+- wire v3 alternate joint-MV VLC (mv_table_sel==1) end-to-end
+- round 317: narrow v1/v2 I-frame docs gap to intra-DC-size selector [esi+0x8bc] default
+- refresh to current status, drop per-round changelog cruft
+
 ### Added
 
 - round 386: **encoder quality drive — rate-aware motion search,
