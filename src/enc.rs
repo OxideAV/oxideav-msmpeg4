@@ -266,9 +266,9 @@ enum DcScheme {
 }
 
 /// Analyse + serialise one v3 I-frame intra MB. (The intra-in-P path
-/// in [`encode_pframe_mb_v3`] emits the same joint-MCBPCY I-type half
-/// + ac_pred + block syntax but behind the P-frame skip bit and with
-/// the P-frame's G3-luma table binding.)
+/// in [`encode_pframe_mb_v3`] emits the same joint-MCBPCY I-type
+/// half, ac_pred bit and block syntax, but behind the P-frame skip
+/// bit and with the P-frame's G3-luma table binding.)
 #[allow(clippy::too_many_arguments)]
 fn encode_intra_mb(
     bw: &mut BitWriter,
