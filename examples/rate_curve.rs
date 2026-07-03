@@ -195,6 +195,14 @@ fn main() {
             ("mv_search_range", "2".into()),
         ],
     ));
+    // Rate-controlled runs: the achieved kbps column should track the
+    // requested bitrate.
+    for br in [400_000u32, 150_000] {
+        matrix.push((
+            "v3",
+            vec![("bitrate", br.to_string()), ("gop", "15".into())],
+        ));
+    }
     for (ver, opts) in &matrix {
         let r = run(ver, opts);
         let optstr = opts

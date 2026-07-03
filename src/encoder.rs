@@ -15,10 +15,11 @@
 //!
 //! | key               | meaning                          | default |
 //! |-------------------|----------------------------------|---------|
-//! | `quant`           | frame quantiser, 1..=31          | 4       |
+//! | `quant`           | frame quantiser, 1..=31 (initial QP when `bitrate` is set) | 4 |
 //! | `gop`             | keyframe interval (1 = all-intra)| 12      |
 //! | `mv_search_range` | half-pel search radius, 0..=63   | 8       |
 //! | `scene_cut`       | % of intra MBs that upgrades a P-frame to a fresh I-frame (0 = off) | 60 |
+//! | `bitrate`         | target bits/second (0 = constant-quant mode) | 0 |
 //!
 //! **Scene-cut policy.** When a P-frame's macroblock census
 //! ([`crate::enc::PFrameStats`]) reports more than `scene_cut`% of the
@@ -26,6 +27,18 @@
 //! packet is discarded and the frame re-encoded as an I-frame: a frame
 //! that is mostly intra anyway is cheaper and cleaner as a keyframe,
 //! and the GOP clock restarts at the cut.
+//!
+//! **Rate control.** With `bitrate` set, the encoder targets
+//! `bitrate / fps` bits per frame (`fps` from
+//! `CodecParameters::frame_rate`, defaulting to 25) with the classic
+//! GOP split — I-frames get [`I_BUDGET_WEIGHT`]× a P-frame's budget,
+//! normalised so a whole GOP still averages the per-frame target. A
+//! virtual buffer integrates the running over/under-spend and drains
+//! into each frame's adjusted target; the per-frame QP is settled by
+//! bounded re-encode trials (at most [`RC_MAX_TRIALS`]) plus a gentle
+//! ±1 drift for the next frame. All of it sits above the picture
+//! encoders, so every emitted packet is still decoder-verified in-loop
+//! by the recon step in `send_frame`.
 
 use std::collections::VecDeque;
 
@@ -101,12 +114,58 @@ fn int_option(params: &CodecParameters, key: &str, default: u32, lo: u32, hi: u3
     }
 }
 
+/// I-frame budget weight for the rate controller: an I-frame is
+/// allowed this multiple of a P-frame's bit budget (H.263 TMN-lineage
+/// ratio), with the GOP-wide average normalised back to the per-frame
+/// target.
+pub const I_BUDGET_WEIGHT: f64 = 4.0;
+
+/// Maximum number of re-encode trials the rate controller spends
+/// settling one frame's QP.
+pub const RC_MAX_TRIALS: u32 = 3;
+
+/// Frame-level rate-controller state (present only when the `bitrate`
+/// option is set).
+struct RateControl {
+    /// Average bit budget per frame (`bitrate / fps`).
+    bits_per_frame: f64,
+    /// Virtual buffer: integral of (actual − target) bits so far.
+    /// Positive = over-spent; drained into later frames' targets.
+    buffer: f64,
+    /// Current quantiser, persisted across frames.
+    qp: u8,
+}
+
+impl RateControl {
+    /// Per-frame-type bit target: P-frames get `Tp = B·N / (N−1+w)`,
+    /// I-frames `w·Tp`, so a GOP of length `N` with one I-frame
+    /// averages exactly the per-frame budget `B`.
+    fn type_target(&self, is_key: bool, gop: u32) -> f64 {
+        let n = gop.max(1) as f64;
+        let tp = self.bits_per_frame * n / (n - 1.0 + I_BUDGET_WEIGHT);
+        if is_key {
+            tp * I_BUDGET_WEIGHT
+        } else {
+            tp
+        }
+    }
+
+    /// Buffer-adjusted target for the next frame: drain 1/8 of the
+    /// accumulated over/under-spend, clamped to keep the target sane
+    /// against pathological buffer excursions.
+    fn adjusted_target(&self, type_target: f64) -> f64 {
+        (type_target - self.buffer * 0.125).clamp(type_target * 0.25, type_target * 4.0)
+    }
+}
+
 struct MsMpeg4Encoder {
     codec_id: CodecId,
     version: EncVersion,
     output_params: CodecParameters,
     dims: PictureDims,
     config: EncoderConfig,
+    /// Rate controller (None = constant-quant mode).
+    rc: Option<RateControl>,
     /// Keyframe interval: 1 = every frame intra.
     gop: u32,
     /// Scene-cut threshold: intra-MB percentage above which a P-frame
@@ -136,6 +195,24 @@ impl MsMpeg4Encoder {
         let gop = int_option(params, "gop", 12, 1, 600)?;
         let mv_search_range = int_option(params, "mv_search_range", 8, 0, 63)?;
         let scene_cut = int_option(params, "scene_cut", 60, 0, 100)?;
+        let bitrate = int_option(params, "bitrate", 0, 0, 100_000_000)?;
+        if bitrate != 0 && bitrate < 1_000 {
+            return Err(Error::invalid(format!(
+                "msmpeg4v3 encoder: option bitrate={bitrate} below the 1000 bit/s floor"
+            )));
+        }
+        let rc = (bitrate != 0).then(|| {
+            let fps = params
+                .frame_rate
+                .map(|r| r.num as f64 / r.den as f64)
+                .filter(|f| *f > 0.0)
+                .unwrap_or(25.0);
+            RateControl {
+                bits_per_frame: bitrate as f64 / fps,
+                buffer: 0.0,
+                qp: quant as u8,
+            }
+        });
 
         let mut output_params = params.clone();
         output_params.codec_id = CodecId::new(version.codec_id());
@@ -148,6 +225,7 @@ impl MsMpeg4Encoder {
                 quant: quant as u8,
                 mv_search_range: mv_search_range as u8,
             },
+            rc,
             gop,
             scene_cut,
             frames_since_key: 0,
@@ -205,15 +283,24 @@ impl MsMpeg4Encoder {
     /// census crosses the `scene_cut` intra-percentage threshold, the
     /// P packet is discarded and the frame re-encoded as an I-frame
     /// (the caller restarts the GOP clock off the returned flag).
-    fn encode_frame_bytes(&self, input: &Picture, force_key: bool) -> Result<(Vec<u8>, bool)> {
+    fn encode_frame_bytes(
+        &self,
+        input: &Picture,
+        force_key: bool,
+        quant: u8,
+    ) -> Result<(Vec<u8>, bool)> {
+        let config = EncoderConfig {
+            quant,
+            ..self.config
+        };
         let v1v2 = match self.version {
             EncVersion::V1 => Some(MsV1V2Version::V1),
             EncVersion::V2 => Some(MsV1V2Version::V2),
             EncVersion::V3 => None,
         };
         let encode_i = |input: &Picture| match v1v2 {
-            None => encode_iframe_v3(input, self.dims, &self.config),
-            Some(v) => encode_iframe_v1v2(input, self.dims, &self.config, v),
+            None => encode_iframe_v3(input, self.dims, &config),
+            Some(v) => encode_iframe_v1v2(input, self.dims, &config, v),
         };
         if force_key {
             return Ok((encode_i(input)?, true));
@@ -223,8 +310,8 @@ impl MsMpeg4Encoder {
             .as_ref()
             .expect("P-frame requested without a reference");
         let (bytes, stats) = match v1v2 {
-            None => encode_pframe_v3_with_stats(input, reference, self.dims, &self.config)?,
-            Some(v) => encode_pframe_v1v2_with_stats(input, reference, self.dims, &self.config, v)?,
+            None => encode_pframe_v3_with_stats(input, reference, self.dims, &config)?,
+            Some(v) => encode_pframe_v1v2_with_stats(input, reference, self.dims, &config, v)?,
         };
         if self.scene_cut > 0
             && stats.intra_mbs as u64 * 100 > stats.total_mbs as u64 * self.scene_cut as u64
@@ -232,6 +319,61 @@ impl MsMpeg4Encoder {
             return Ok((encode_i(input)?, true));
         }
         Ok((bytes, false))
+    }
+
+    /// Rate-controlled wrapper around [`Self::encode_frame_bytes`]:
+    /// settles the frame's QP with bounded re-encode trials against
+    /// the buffer-adjusted bit target, then books the spend into the
+    /// virtual buffer and drifts the persistent QP ±1 for the next
+    /// frame. Constant-quant mode passes straight through.
+    fn rate_controlled_encode(
+        &mut self,
+        input: &Picture,
+        force_key: bool,
+    ) -> Result<(Vec<u8>, bool)> {
+        let Some(rc) = self.rc.as_ref() else {
+            return self.encode_frame_bytes(input, force_key, self.config.quant);
+        };
+        let mut qp = rc.qp;
+        let mut trial = self.encode_frame_bytes(input, force_key, qp)?;
+        for _ in 0..RC_MAX_TRIALS {
+            let rc = self.rc.as_ref().expect("checked above");
+            // The frame type is known only after the first trial (the
+            // scene-cut policy may upgrade a P to an I), so the target
+            // is re-derived per trial from the actual outcome.
+            let adj = rc.adjusted_target(rc.type_target(trial.1, self.gop));
+            let bits = (trial.0.len() * 8) as f64;
+            let step = ((qp as f64 * 0.25).ceil() as u8).max(1);
+            let next_qp = if bits > adj * 1.3 && qp < 31 {
+                qp.saturating_add(step).min(31)
+            } else if bits < adj * 0.6 && qp > 1 {
+                qp.saturating_sub(step).max(1)
+            } else {
+                break;
+            };
+            if next_qp == qp {
+                break;
+            }
+            qp = next_qp;
+            trial = self.encode_frame_bytes(input, force_key, qp)?;
+        }
+        let (bytes, is_key) = trial;
+        let bits = (bytes.len() * 8) as f64;
+        let gop = self.gop;
+        let rc = self.rc.as_mut().expect("checked above");
+        let t_type = rc.type_target(is_key, gop);
+        let adj = rc.adjusted_target(t_type);
+        rc.buffer += bits - t_type;
+        // Gentle drift so the next frame starts near the right QP even
+        // when this frame landed inside the re-encode dead-band.
+        rc.qp = if bits > adj * 1.15 {
+            (qp + 1).min(31)
+        } else if bits < adj * 0.85 {
+            qp.saturating_sub(1).max(1)
+        } else {
+            qp
+        };
+        Ok((bytes, is_key))
     }
 }
 
@@ -284,7 +426,7 @@ impl Encoder for MsMpeg4Encoder {
         let input = self.frame_to_picture(vf)?;
 
         let force_key = self.last_recon.is_none() || self.frames_since_key >= self.gop;
-        let (bytes, is_key) = self.encode_frame_bytes(&input, force_key)?;
+        let (bytes, is_key) = self.rate_controlled_encode(&input, force_key)?;
         let v1v2 = match self.version {
             EncVersion::V1 => Some(MsV1V2Version::V1),
             EncVersion::V2 => Some(MsV1V2Version::V2),
@@ -324,9 +466,14 @@ impl Encoder for MsMpeg4Encoder {
     fn flush(&mut self) -> Result<()> {
         // Intra/inter-only codec with no frame delay: nothing buffered
         // beyond the already-queued packets. Reset the GOP state so a
-        // reused encoder restarts on a keyframe.
+        // reused encoder restarts on a keyframe, and the rate
+        // controller so a reused encoder is deterministic.
         self.last_recon = None;
         self.frames_since_key = 0;
+        if let Some(rc) = self.rc.as_mut() {
+            rc.buffer = 0.0;
+            rc.qp = self.config.quant;
+        }
         Ok(())
     }
 }
@@ -508,6 +655,114 @@ mod tests {
             vec![true, false, false, false, false],
             "scene_cut=0 must never upgrade P-frames"
         );
+    }
+
+    /// Evolving busy texture: substantial fresh detail every frame, so
+    /// the per-frame spend genuinely responds to QP across the whole
+    /// 1..=31 range (a merely-translated pattern collapses to cheap MC
+    /// residuals and saturates the controller at qp=1).
+    fn busy_frame(w: usize, h: usize, n: usize) -> VideoFrame {
+        let cw = w.div_ceil(2);
+        let chh = h.div_ceil(2);
+        let mut y = vec![0u8; w * h];
+        for j in 0..h {
+            for i in 0..w {
+                let a = (i * 7 + j * 13 + n * 31) % 251;
+                let b = ((i + n) * (j + 7) / 5) % 89;
+                y[j * w + i] = ((a + b) % 200 + 25) as u8;
+            }
+        }
+        let mut cb = vec![0u8; cw * chh];
+        let mut cr = vec![0u8; cw * chh];
+        for j in 0..chh {
+            for i in 0..cw {
+                cb[j * cw + i] = ((i * 3 + j + n * 17) % 120 + 60) as u8;
+                cr[j * cw + i] = ((i + j * 3 + n * 11) % 120 + 80) as u8;
+            }
+        }
+        VideoFrame {
+            pts: Some(n as i64),
+            planes: vec![
+                oxideav_core::VideoPlane { stride: w, data: y },
+                oxideav_core::VideoPlane {
+                    stride: cw,
+                    data: cb,
+                },
+                oxideav_core::VideoPlane {
+                    stride: cw,
+                    data: cr,
+                },
+            ],
+        }
+    }
+
+    /// Drive `frames` frames of [`busy_frame`] through an encoder
+    /// built from `p`, returning per-frame packet sizes in bytes.
+    fn run_sizes(p: &CodecParameters, frames: usize) -> Vec<usize> {
+        let mut enc = make_encoder(p).unwrap();
+        let mut sizes = Vec::new();
+        for n in 0..frames {
+            enc.send_frame(&Frame::Video(busy_frame(64, 64, n)))
+                .unwrap();
+            sizes.push(enc.receive_packet().unwrap().data.len());
+        }
+        sizes
+    }
+
+    #[test]
+    fn rate_control_converges_on_the_frame_budget() {
+        // 400 kbit/s at the default 25 fps = 16000 bits = 2000 bytes
+        // per frame on average — mid-range for this content (the
+        // constant-quant sweep spans ~440 B/frame at q=31 to ~7.7 kB
+        // at q=1), so the controller has to settle a real QP.
+        let mut p = params(64, 64);
+        p.options.insert("bitrate", "400000");
+        p.options.insert("gop", "10");
+        let sizes = run_sizes(&p, 40);
+        // Steady state (skip the two startup GOPs): the mean spend
+        // must land within 25% of the budget.
+        let steady = &sizes[20..];
+        let mean = steady.iter().sum::<usize>() as f64 / steady.len() as f64;
+        assert!(
+            (mean - 2000.0).abs() < 500.0,
+            "steady-state mean {mean:.0} B/frame vs 2000 B budget"
+        );
+    }
+
+    #[test]
+    fn rate_control_tracks_widely_different_targets() {
+        let mut lo = params(64, 64);
+        lo.options.insert("bitrate", "100000"); // 500 B/frame
+        lo.options.insert("gop", "10");
+        let mut hi = params(64, 64);
+        hi.options.insert("bitrate", "800000"); // 4000 B/frame
+        hi.options.insert("gop", "10");
+        let lo_sizes = run_sizes(&lo, 30);
+        let hi_sizes = run_sizes(&hi, 30);
+        let lo_total: usize = lo_sizes[10..].iter().sum();
+        let hi_total: usize = hi_sizes[10..].iter().sum();
+        assert!(
+            hi_total > lo_total * 3,
+            "8x bitrate should spend several times more bits \
+             (lo={lo_total}, hi={hi_total})"
+        );
+        let lo_mean = lo_total as f64 / 20.0;
+        let hi_mean = hi_total as f64 / 20.0;
+        assert!(
+            (lo_mean - 500.0).abs() < 250.0,
+            "lo mean {lo_mean:.0} B/frame vs 500 B budget"
+        );
+        assert!(
+            (hi_mean - 4000.0).abs() < 1400.0,
+            "hi mean {hi_mean:.0} B/frame vs 4000 B budget"
+        );
+    }
+
+    #[test]
+    fn rate_control_rejects_sub_floor_bitrate() {
+        let mut p = params(32, 32);
+        p.options.insert("bitrate", "500");
+        assert!(make_encoder(&p).is_err());
     }
 
     #[test]
