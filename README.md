@@ -1,5 +1,7 @@
 # oxideav-msmpeg4
 
+[![CI](https://github.com/OxideAV/oxideav-msmpeg4/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-msmpeg4/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-msmpeg4.svg)](https://crates.io/crates/oxideav-msmpeg4) [![docs.rs](https://docs.rs/oxideav-msmpeg4/badge.svg)](https://docs.rs/oxideav-msmpeg4) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Pure-Rust decoder **and encoder** for the **Microsoft MPEG-4** family —
 v1, v2, and v3
 (a.k.a. DivX ;-) 3). These were Microsoft's pre-standard MPEG-4 codecs
