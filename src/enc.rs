@@ -18,8 +18,11 @@
 //!   [`crate::mv_pred::MvGrid`] the decoder maintains, and motion
 //!   vectors are constrained to the spec/06 §3.5 toroidal window
 //!   around that predictor (`mv::mv_component_reachable`);
-//! * AC prediction is not used (`ac_pred = 0` on every MB), so every
-//!   coded block walks the fixed zigzag scan.
+//! * the MB-level `ac_pred` flag is RD-decided: each intra MB's blocks
+//!   are serialised both ways (fixed zigzag vs the per-block
+//!   DC-gradient-derived alternate scans, spec/03 §1.1) and the
+//!   alternate-scan variant is kept only when strictly cheaper. v1 has
+//!   no `ac_pred` bit (spec/07 §1.4) and always walks zigzag.
 //!
 //! Table choices are fixed per frame: intra luma = G5
 //! (`ac_luma_sel = 2`), chroma = G4 (`ac_chroma_sel = 2`), default
@@ -82,6 +85,11 @@ struct IntraBlockPlan {
     /// Bitstream AC levels in natural order (position 0 unused).
     levels: [i32; 64],
     coded: bool,
+    /// The scan this block walks when the MB's `ac_pred` flag is set:
+    /// derived from the DC-predictor gradient direction exactly as the
+    /// decoder derives it (spec/03 §1.1–§1.3), so encoder and decoder
+    /// always agree on the per-block scan.
+    alt_scan: Scan,
 }
 
 /// Encode one picture as a v3 **I-frame**. `input` must carry
@@ -146,6 +154,7 @@ fn analyse_intra_mb(
         dc_diff: 0,
         levels: [0i32; 64],
         coded: false,
+        alt_scan: Scan::Zigzag,
     });
     for (block_idx, plan) in plans.iter_mut().enumerate() {
         let pels = extract_block(input, mb_x, mb_y, block_idx);
@@ -172,6 +181,7 @@ fn analyse_intra_mb(
         }
 
         plan.dc_diff = dc_diff;
+        plan.alt_scan = pred.direction.ac_scan();
         let nz = quantise_block_h263(&f, quant, 1, &mut plan.levels);
         plan.coded = nz > 0;
     }
@@ -185,15 +195,17 @@ fn analyse_intra_mb(
 }
 
 /// Serialise the 6 planned blocks of an intra MB: per-block DC
-/// differential through the version's codeword scheme, then the fixed
-/// zigzag AC walk (ac_pred = 0 on every MB this encoder emits) for
-/// each coded block.
+/// differential through the version's codeword scheme, then the AC
+/// walk for each coded block — fixed zigzag when `ac_pred` is off, or
+/// the per-block DC-gradient-derived alternate scan when it is on
+/// (mirroring the decoder's spec/03 §1.1 scan dispatch).
 fn write_intra_blocks(
     bw: &mut BitWriter,
     plans: &[IntraBlockPlan; 6],
     dc_scheme: DcScheme,
     luma_ac: &AcVlcTable,
     chroma_ac: &AcVlcTable,
+    ac_pred: bool,
 ) -> Result<()> {
     for (block_idx, plan) in plans.iter().enumerate() {
         match dc_scheme {
@@ -202,10 +214,46 @@ fn write_intra_blocks(
         }
         if plan.coded {
             let table = if block_idx <= 3 { luma_ac } else { chroma_ac };
-            encode_intra_ac(bw, &plan.levels, Scan::Zigzag, table, 1)?;
+            let scan = if ac_pred { plan.alt_scan } else { Scan::Zigzag };
+            encode_intra_ac(bw, &plan.levels, scan, table, 1)?;
         }
     }
     Ok(())
+}
+
+/// Exact serialised bit count of [`write_intra_blocks`] for one MB
+/// under the given `ac_pred` polarity (scratch-writer probe — the cost
+/// function is the real serialiser, so the RD decision can never
+/// disagree with the wire).
+fn intra_blocks_bits(
+    plans: &[IntraBlockPlan; 6],
+    dc_scheme: DcScheme,
+    luma_ac: &AcVlcTable,
+    chroma_ac: &AcVlcTable,
+    ac_pred: bool,
+) -> Result<u64> {
+    let mut bw = BitWriter::new();
+    write_intra_blocks(&mut bw, plans, dc_scheme, luma_ac, chroma_ac, ac_pred)?;
+    Ok(bw.bit_position())
+}
+
+/// Rate decision for the MB-level `ac_pred` flag: serialise the MB's
+/// blocks both ways and keep the alternate-scan variant only when it
+/// is strictly cheaper. (The flag itself costs 1 bit in either
+/// polarity, and the reconstruction is scan-independent, so pure rate
+/// comparison IS the RD decision here.)
+fn choose_ac_pred(
+    plans: &[IntraBlockPlan; 6],
+    dc_scheme: DcScheme,
+    luma_ac: &AcVlcTable,
+    chroma_ac: &AcVlcTable,
+) -> Result<bool> {
+    if !plans.iter().any(|p| p.coded) {
+        return Ok(false);
+    }
+    let zig = intra_blocks_bits(plans, dc_scheme, luma_ac, chroma_ac, false)?;
+    let alt = intra_blocks_bits(plans, dc_scheme, luma_ac, chroma_ac, true)?;
+    Ok(alt < zig)
 }
 
 /// Which intra-DC differential codeword scheme a frame uses: the v3
@@ -217,8 +265,9 @@ enum DcScheme {
     V1V2,
 }
 
-/// Analyse + serialise one v3 intra MB (I-frame path; this encoder
-/// never emits intra-in-P MBs).
+/// Analyse + serialise one v3 intra MB (shared by the I-frame path and
+/// the intra-in-P path — the joint MCBPCY index halves differ but the
+/// post-VLC ac_pred bit + block serialisation are identical).
 #[allow(clippy::too_many_arguments)]
 fn encode_intra_mb(
     bw: &mut BitWriter,
@@ -231,12 +280,13 @@ fn encode_intra_mb(
     chroma_ac: &AcVlcTable,
 ) -> Result<()> {
     let (plans, cbpy, cbp_cb, cbp_cr) = analyse_intra_mb(input, dc_cache, mb_x, mb_y, quant);
-    // Joint MCBPCY (I-type half: idx = cbp), then the ac_pred bit
-    // (always 0: fixed zigzag).
+    // Joint MCBPCY (I-type half: idx = cbp), then the RD-decided
+    // ac_pred bit (alternate scans only when strictly cheaper).
     let cbp = compose_cbp(cbpy, cbp_cb, cbp_cr);
     encode_mcbpcy(bw, cbp)?;
-    bw.write_bit(false); // ac_pred = 0
-    write_intra_blocks(bw, &plans, DcScheme::V3, luma_ac, chroma_ac)
+    let ac_pred = choose_ac_pred(&plans, DcScheme::V3, luma_ac, chroma_ac)?;
+    bw.write_bit(ac_pred);
+    write_intra_blocks(bw, &plans, DcScheme::V3, luma_ac, chroma_ac, ac_pred)
 }
 
 // ====================================================================
@@ -807,19 +857,31 @@ pub fn encode_iframe_v1v2(
             let (plans, cbpy, cbp_cb, cbp_cr) =
                 analyse_intra_mb(input, &mut dc_cache, mx, my, quant);
             let cbpc = ((cbp_cb as u8) << 1) | (cbp_cr as u8);
+            let ac_pred = match version {
+                // v1 has no ac_pred bit anywhere (spec/07 §1.4):
+                // always the fixed zigzag.
+                MsV1V2Version::V1 => false,
+                MsV1V2Version::V2 => choose_ac_pred(&plans, DcScheme::V1V2, &luma_ac, &chroma_ac)?,
+            };
             match version {
                 MsV1V2Version::V1 => {
-                    // MB-type 3 (INTRA): mcbpc = 3 << 2 | cbpc. v1 has
-                    // no ac_pred bit anywhere (spec/07 §1.4).
+                    // MB-type 3 (INTRA): mcbpc = 3 << 2 | cbpc.
                     encode_mcbpcy_v1(&mut bw, false, 12 + cbpc, cbpy)?;
                 }
                 MsV1V2Version::V2 => {
                     // Intra quotient (mcbpc / 4 == 1): mcbpc = 4 + cbpc;
-                    // ac_pred = 0 → fixed zigzag.
-                    encode_mcbpcy_v2(&mut bw, V2FrameType::I, false, 4 + cbpc, false, cbpy)?;
+                    // ac_pred RD-decided per MB.
+                    encode_mcbpcy_v2(&mut bw, V2FrameType::I, false, 4 + cbpc, ac_pred, cbpy)?;
                 }
             }
-            write_intra_blocks(&mut bw, &plans, DcScheme::V1V2, &luma_ac, &chroma_ac)?;
+            write_intra_blocks(
+                &mut bw,
+                &plans,
+                DcScheme::V1V2,
+                &luma_ac,
+                &chroma_ac,
+                ac_pred,
+            )?;
         }
     }
     Ok(bw.finish())
@@ -1201,6 +1263,114 @@ mod tests {
         let input = Picture::alloc(dims, PictureType::I);
         let reference = Picture::alloc(other, PictureType::I);
         assert!(encode_pframe_v3(&input, &reference, dims, &EncoderConfig::default()).is_err());
+    }
+
+    #[test]
+    fn ac_pred_rd_prefers_alt_scan_for_front_row_energy() {
+        // Coefficients confined to the first DCT row (natural indices
+        // 1..=5): the alternate-horizontal scan reaches them at scan
+        // positions 1..=3 / 10..=11 while zigzag scatters them out to
+        // position 14 — the RD probe must pick the alternate scan.
+        let mut plans: [IntraBlockPlan; 6] = std::array::from_fn(|_| IntraBlockPlan {
+            dc_diff: 0,
+            levels: [0i32; 64],
+            coded: false,
+            alt_scan: Scan::AlternateHorizontal,
+        });
+        for (i, lv) in [(1usize, 6i32), (2, 4), (3, 3), (4, 2), (5, 1)] {
+            plans[0].levels[i] = lv;
+        }
+        plans[0].coded = true;
+        let luma = AcVlcTable::v3_intra_g5();
+        let chroma = AcVlcTable::g4_inter();
+        let zig = intra_blocks_bits(&plans, DcScheme::V3, &luma, &chroma, false).unwrap();
+        let alt = intra_blocks_bits(&plans, DcScheme::V3, &luma, &chroma, true).unwrap();
+        assert!(alt < zig, "alt scan should be cheaper: alt={alt} zig={zig}");
+        assert!(choose_ac_pred(&plans, DcScheme::V3, &luma, &chroma).unwrap());
+        // And an uncoded MB never pays for the probe.
+        let empty: [IntraBlockPlan; 6] = std::array::from_fn(|_| IntraBlockPlan {
+            dc_diff: 0,
+            levels: [0i32; 64],
+            coded: false,
+            alt_scan: Scan::AlternateVertical,
+        });
+        assert!(!choose_ac_pred(&empty, DcScheme::V3, &luma, &chroma).unwrap());
+    }
+
+    /// Row-banded DC (forces the FromTop / alternate-horizontal
+    /// direction) + strong intra-block horizontal frequency (fills the
+    /// first DCT row): content engineered so the ac_pred RD fires on
+    /// interior MBs.
+    fn fill_row_bands_with_x_texture(pic: &mut Picture) {
+        let h = pic.y.len() / pic.y_stride;
+        for y in 0..h {
+            for x in 0..pic.y_stride {
+                let band = (y / 8) * 12;
+                let tex = [0u8, 24, 48, 24][x % 4] as usize;
+                pic.y[y * pic.y_stride + x] = (60 + band + tex).min(255) as u8;
+            }
+        }
+        // Flat chroma keeps the test focused on the luma scan choice.
+        pic.cb.fill(128);
+        pic.cr.fill(128);
+    }
+
+    #[test]
+    fn iframe_ac_pred_streams_decode_verified_v3_and_v2() {
+        let dims = PictureDims::new(48, 48).unwrap();
+        let mut input = Picture::alloc(dims, PictureType::I);
+        fill_row_bands_with_x_texture(&mut input);
+        let quant = 4u32;
+
+        // The RD must actually fire on this content (replay the
+        // analysis the encoder runs).
+        let luma = AcVlcTable::v3_intra_g5();
+        let chroma = AcVlcTable::g4_inter();
+        let (mb_w, mb_h) = dims.mb_dims();
+        let mut dc_cache = DcCache::new(mb_w, mb_h);
+        let mut fired = 0usize;
+        for my in 0..mb_h {
+            for mx in 0..mb_w {
+                let (plans, _, _, _) = analyse_intra_mb(&input, &mut dc_cache, mx, my, quant);
+                if choose_ac_pred(&plans, DcScheme::V3, &luma, &chroma).unwrap() {
+                    fired += 1;
+                }
+            }
+        }
+        assert!(fired > 0, "content should trigger ac_pred on some MB");
+
+        let config = EncoderConfig {
+            quant: quant as u8,
+            ..Default::default()
+        };
+        // v3: encode + decode through the production path; a scan
+        // mismatch between encoder and decoder would corrupt the
+        // reconstruction far past the quantiser bound.
+        let bytes = encode_iframe_v3(&input, dims, &config).unwrap();
+        let mut br = BitReader::new(&bytes);
+        let out = decode_picture(&mut br, dims, None).unwrap();
+        let mae = out
+            .y
+            .iter()
+            .zip(input.y.iter())
+            .map(|(a, b)| (*a as i64 - *b as i64).unsigned_abs())
+            .sum::<u64>() as f64
+            / out.y.len() as f64;
+        assert!(mae < 3.0, "v3 ac_pred I-frame MAE {mae} too large");
+
+        // v2 carries the ac_pred bit after MCBPC (spec/07 §2.4).
+        let bytes = encode_iframe_v1v2(&input, dims, &config, MsV1V2Version::V2).unwrap();
+        let mut br = BitReader::new(&bytes);
+        let out =
+            crate::picture::decode_picture_v1v2(&mut br, dims, MsV1V2Version::V2, None).unwrap();
+        let mae = out
+            .y
+            .iter()
+            .zip(input.y.iter())
+            .map(|(a, b)| (*a as i64 - *b as i64).unsigned_abs())
+            .sum::<u64>() as f64
+            / out.y.len() as f64;
+        assert!(mae < 3.0, "v2 ac_pred I-frame MAE {mae} too large");
     }
 
     #[test]
