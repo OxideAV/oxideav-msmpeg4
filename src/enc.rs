@@ -265,9 +265,10 @@ enum DcScheme {
     V1V2,
 }
 
-/// Analyse + serialise one v3 intra MB (shared by the I-frame path and
-/// the intra-in-P path — the joint MCBPCY index halves differ but the
-/// post-VLC ac_pred bit + block serialisation are identical).
+/// Analyse + serialise one v3 I-frame intra MB. (The intra-in-P path
+/// in [`encode_pframe_mb_v3`] emits the same joint-MCBPCY I-type half
+/// + ac_pred + block syntax but behind the P-frame skip bit and with
+/// the P-frame's G3-luma table binding.)
 #[allow(clippy::too_many_arguments)]
 fn encode_intra_mb(
     bw: &mut BitWriter,
@@ -321,6 +322,46 @@ pub fn encode_pframe_v3(
             reference.width, reference.height, dims.width, dims.height,
         )));
     }
+    encode_pframe_v3_with_stats(input, reference, dims, config).map(|(bytes, _)| bytes)
+}
+
+/// Per-P-frame macroblock mode census, reported by the
+/// `*_with_stats` P-frame encoders so callers (e.g. the GOP machine's
+/// scene-cut policy) can see how much of the frame refused inter
+/// coding.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PFrameStats {
+    /// Total macroblocks in the frame.
+    pub total_mbs: usize,
+    /// 1-bit skip MBs (zero MV, no coded block).
+    pub skip_mbs: usize,
+    /// Motion-compensated inter MBs (1-MV or INTER4V).
+    pub inter_mbs: usize,
+    /// Intra-in-P MBs (the per-MB scene-change refuge).
+    pub intra_mbs: usize,
+}
+
+/// How one P-frame MB was coded (internal to the per-MB encoders).
+enum MbKind {
+    Skip,
+    Inter,
+    Intra,
+}
+
+/// [`encode_pframe_v3`] plus the per-frame [`PFrameStats`] census.
+pub fn encode_pframe_v3_with_stats(
+    input: &Picture,
+    reference: &Picture,
+    dims: PictureDims,
+    config: &EncoderConfig,
+) -> Result<(Vec<u8>, PFrameStats)> {
+    validate_input(input, dims, config)?;
+    if reference.width != dims.width || reference.height != dims.height {
+        return Err(Error::invalid(format!(
+            "msmpeg4v3 encode: reference dimensions {}x{} differ from current {}x{}",
+            reference.width, reference.height, dims.width, dims.height,
+        )));
+    }
     let (mb_w, mb_h) = dims.mb_dims();
     let quant = config.quant as u32;
 
@@ -336,25 +377,79 @@ pub fn encode_pframe_v3(
     hdr.write(&mut bw)?;
 
     let inter_ac = AcVlcTable::g4_inter();
+    // Intra-in-P AC tables: `ac_luma_sel` is NOT carried on the v3
+    // P-frame wire, so the decoder's dispatch sees the parser's zero
+    // → G3 luma (spec/14 §3.1); chroma follows the transmitted
+    // `ac_chroma_sel = 2` → G4. The encoder must serialise intra-in-P
+    // blocks through the same pair.
+    let intra_luma_ac = AcVlcTable::v3_intra_g3();
+    let intra_chroma_ac = AcVlcTable::g4_inter();
     let mut mv_grid = MvGrid::new(mb_w, mb_h);
+    // DC-prediction cache for intra-in-P MBs, mirroring the decoder's
+    // per-P-frame cache: only intra MBs write cells; everything else
+    // predicts against the neutral substitution.
+    let mut dc_cache = DcCache::new(mb_w, mb_h);
+    let mut stats = PFrameStats {
+        total_mbs: mb_w * mb_h,
+        ..Default::default()
+    };
 
     for my in 0..mb_h {
         for mx in 0..mb_w {
-            encode_inter_mb(
+            let kind = encode_pframe_mb_v3(
                 &mut bw,
                 input,
                 reference,
                 &mut mv_grid,
+                &mut dc_cache,
                 mx,
                 my,
                 quant,
                 config,
                 &inter_ac,
+                &intra_luma_ac,
+                &intra_chroma_ac,
             )?;
+            match kind {
+                MbKind::Skip => stats.skip_mbs += 1,
+                MbKind::Inter => stats.inter_mbs += 1,
+                MbKind::Intra => stats.intra_mbs += 1,
+            }
         }
     }
-    Ok(bw.finish())
+    Ok((bw.finish(), stats))
 }
+
+/// Luma "intra activity" of one MB: sum of absolute deviations from
+/// the MB mean — the classic cheap proxy for the residual energy an
+/// intra coding of the MB would have to spend bits on. Compared
+/// against the motion-compensated SAD (plus a margin biasing towards
+/// inter, whose MV + CBP syntax is cheaper than a 6-block DC
+/// differential set) to decide intra-in-P.
+fn mb_intra_activity(input: &Picture, mb_x: usize, mb_y: usize) -> u32 {
+    let mut sum = 0u32;
+    for j in 0..16 {
+        let row = (mb_y * 16 + j) * input.y_stride + mb_x * 16;
+        for i in 0..16 {
+            sum += input.y[row + i] as u32;
+        }
+    }
+    let mean = (sum + 128) / 256;
+    let mut act = 0u32;
+    for j in 0..16 {
+        let row = (mb_y * 16 + j) * input.y_stride + mb_x * 16;
+        for i in 0..16 {
+            act += (input.y[row + i] as i32 - mean as i32).unsigned_abs();
+        }
+    }
+    act
+}
+
+/// Margin biasing the per-MB inter/intra decision towards inter: the
+/// MC-side syntax (MV + CBP) is cheaper than a full 6-block intra DC
+/// set, so intra must win by a clear distortion margin before it is
+/// worth taking (H.263 TMN-lineage constant).
+const INTRA_IN_P_MARGIN: u32 = 500;
 
 /// One MB's motion-compensated prediction (luma 16×16 + chroma 8×8×2),
 /// produced by the same [`mc_block`] kernel + §7.6.3.4 chroma-MV
@@ -567,19 +662,22 @@ fn motion_search(
     best
 }
 
-/// Analyse + serialise one P-frame MB.
+/// Analyse + serialise one v3 P-frame MB: skip / inter / intra-in-P.
 #[allow(clippy::too_many_arguments)]
-fn encode_inter_mb(
+fn encode_pframe_mb_v3(
     bw: &mut BitWriter,
     input: &Picture,
     reference: &Picture,
     mv_grid: &mut MvGrid,
+    dc_cache: &mut DcCache,
     mb_x: usize,
     mb_y: usize,
     quant: u32,
     config: &EncoderConfig,
     inter_ac: &AcVlcTable,
-) -> Result<()> {
+    intra_luma_ac: &AcVlcTable,
+    intra_chroma_ac: &AcVlcTable,
+) -> Result<MbKind> {
     let predictor = mv_predictor(mv_grid, mb_x, mb_y);
     let mv = motion_search(
         input,
@@ -593,6 +691,30 @@ fn encode_inter_mb(
         MvCoder::V3(MvTable::Default),
     );
 
+    // Scene-change refuge: when even the best MC prediction is worse
+    // than what a from-scratch intra coding would face, code the MB
+    // intra (joint MCBPCY I-type half, idx = cbp < 64). The decoder
+    // leaves the MV-grid cell Absent for intra MBs, so the predictor
+    // chain sees the same neighbourhood on both sides.
+    let inter_sad = mb_sad(input, reference, mb_x, mb_y, (mv.x as i32, mv.y as i32));
+    if mb_intra_activity(input, mb_x, mb_y) + INTRA_IN_P_MARGIN < inter_sad {
+        let (plans, cbpy, cbp_cb, cbp_cr) = analyse_intra_mb(input, dc_cache, mb_x, mb_y, quant);
+        let cbp = compose_cbp(cbpy, cbp_cb, cbp_cr);
+        bw.write_bit(false); // not skipped
+        encode_mcbpcy(bw, cbp)?;
+        let ac_pred = choose_ac_pred(&plans, DcScheme::V3, intra_luma_ac, intra_chroma_ac)?;
+        bw.write_bit(ac_pred);
+        write_intra_blocks(
+            bw,
+            &plans,
+            DcScheme::V3,
+            intra_luma_ac,
+            intra_chroma_ac,
+            ac_pred,
+        )?;
+        return Ok(MbKind::Intra);
+    }
+
     // Residual analysis over all 6 blocks at the chosen MV.
     let (levels, coded) = analyse_inter_residual(input, reference, mb_x, mb_y, mv, quant);
     let any_coded = coded.iter().any(|&c| c);
@@ -601,7 +723,7 @@ fn encode_inter_mb(
         // and stores a zero-MV grid cell.
         bw.write_bit(true);
         mv_grid.set_cell(mb_x, mb_y, MvGridCell::OneMv(Mv::default()));
-        return Ok(());
+        return Ok(MbKind::Skip);
     }
 
     bw.write_bit(false); // not skipped
@@ -611,7 +733,7 @@ fn encode_inter_mb(
     // P-type (inter) half of the joint alphabet: idx = 64 + cbp.
     encode_mcbpcy(bw, 64 + cbp)?;
     // The decoder consumes the post-VLC ac_pred bit on every coded MB
-    // (meaningful only for intra-in-P, which this encoder never emits).
+    // (meaningful only for intra-in-P).
     bw.write_bit(false);
     encode_mv_with_table(bw, predictor, MvTable::Default, mv)?;
     mv_grid.set_cell(mb_x, mb_y, MvGridCell::OneMv(mv));
@@ -621,7 +743,7 @@ fn encode_inter_mb(
             encode_inter_ac(bw, &levels[block_idx], inter_ac)?;
         }
     }
-    Ok(())
+    Ok(MbKind::Inter)
 }
 
 /// Transform + quantise the 6-block MC residual of one inter MB at the
@@ -903,6 +1025,17 @@ pub fn encode_pframe_v1v2(
     config: &EncoderConfig,
     version: MsV1V2Version,
 ) -> Result<Vec<u8>> {
+    encode_pframe_v1v2_with_stats(input, reference, dims, config, version).map(|(bytes, _)| bytes)
+}
+
+/// [`encode_pframe_v1v2`] plus the per-frame [`PFrameStats`] census.
+pub fn encode_pframe_v1v2_with_stats(
+    input: &Picture,
+    reference: &Picture,
+    dims: PictureDims,
+    config: &EncoderConfig,
+    version: MsV1V2Version,
+) -> Result<(Vec<u8>, PFrameStats)> {
     validate_input(input, dims, config)?;
     if reference.width != dims.width || reference.height != dims.height {
         return Err(Error::invalid(format!(
@@ -927,7 +1060,17 @@ pub fn encode_pframe_v1v2(
     }
 
     let inter_ac = AcVlcTable::g4_inter();
+    // Intra-in-P AC tables: v1/v2 bind the default G5 luma / G4 chroma
+    // descriptors with no per-frame selector (spec/14 §3.2) — same
+    // pair as the v1/v2 I-frame path.
+    let intra_luma_ac = AcVlcTable::v3_intra_g5();
+    let intra_chroma_ac = AcVlcTable::g4_inter();
     let mut mv_grid = MvGrid::new(mb_w, mb_h);
+    let mut dc_cache = DcCache::new(mb_w, mb_h);
+    let mut stats = PFrameStats {
+        total_mbs: mb_w * mb_h,
+        ..Default::default()
+    };
 
     for my in 0..mb_h {
         for mx in 0..mb_w {
@@ -943,6 +1086,52 @@ pub fn encode_pframe_v1v2(
                 quant,
                 MvCoder::V1V2,
             );
+
+            // Scene-change refuge (same census rule as v3): when the
+            // best MC prediction is worse than the MB's own intra
+            // activity by a clear margin, code the MB intra — v1
+            // MB-type 3 (mcbpc = 12 + cbpc, no ac_pred bit, spec/07
+            // §1.4), v2 intra quotient (mcbpc = 4 + cbpc, post-MCBPC
+            // ac_pred bit, spec/07 §2.4). Intra MBs leave the MV-grid
+            // cell Absent, mirroring the decoder.
+            let inter_sad = mb_sad(input, reference, mx, my, (mv.x as i32, mv.y as i32));
+            if mb_intra_activity(input, mx, my) + INTRA_IN_P_MARGIN < inter_sad {
+                let (plans, cbpy, cbp_cb, cbp_cr) =
+                    analyse_intra_mb(input, &mut dc_cache, mx, my, quant);
+                let cbpc = ((cbp_cb as u8) << 1) | (cbp_cr as u8);
+                match version {
+                    MsV1V2Version::V1 => {
+                        encode_mcbpcy_v1(&mut bw, false, 12 + cbpc, cbpy)?;
+                        write_intra_blocks(
+                            &mut bw,
+                            &plans,
+                            DcScheme::V1V2,
+                            &intra_luma_ac,
+                            &intra_chroma_ac,
+                            false,
+                        )?;
+                    }
+                    MsV1V2Version::V2 => {
+                        let ac_pred = choose_ac_pred(
+                            &plans,
+                            DcScheme::V1V2,
+                            &intra_luma_ac,
+                            &intra_chroma_ac,
+                        )?;
+                        encode_mcbpcy_v2(&mut bw, V2FrameType::P, false, 4 + cbpc, ac_pred, cbpy)?;
+                        write_intra_blocks(
+                            &mut bw,
+                            &plans,
+                            DcScheme::V1V2,
+                            &intra_luma_ac,
+                            &intra_chroma_ac,
+                            ac_pred,
+                        )?;
+                    }
+                }
+                stats.intra_mbs += 1;
+                continue;
+            }
 
             // v1-only INTER4V (MB-type 2, spec/16 §3.1) mode decision:
             // rate-aware — the greedy per-block search's total cost
@@ -998,6 +1187,7 @@ pub fn encode_pframe_v1v2(
                         encode_inter_ac(&mut bw, &levels[block_idx], &inter_ac)?;
                     }
                 }
+                stats.inter_mbs += 1;
                 continue;
             }
 
@@ -1014,6 +1204,7 @@ pub fn encode_pframe_v1v2(
                     }
                 }
                 mv_grid.set_cell(mx, my, MvGridCell::OneMv(Mv::default()));
+                stats.skip_mbs += 1;
                 continue;
             }
 
@@ -1039,9 +1230,10 @@ pub fn encode_pframe_v1v2(
                     encode_inter_ac(&mut bw, &levels[block_idx], &inter_ac)?;
                 }
             }
+            stats.inter_mbs += 1;
         }
     }
-    Ok(bw.finish())
+    Ok((bw.finish(), stats))
 }
 
 /// Extract one 8×8 block (natural order) from the input picture.
@@ -1254,6 +1446,137 @@ mod tests {
             mae < 2.5,
             "predictor-chained search should recover the out-of-window pan, MAE {mae}"
         );
+    }
+
+    /// A second scene, deliberately smooth (low intra activity) and
+    /// uncorrelated with [`fill_texture`] (high MC SAD), so the
+    /// per-MB intra-in-P decision clearly favours intra after a cut.
+    fn fill_other_texture(pic: &mut Picture) {
+        let h = pic.y.len() / pic.y_stride;
+        for y in 0..h {
+            for x in 0..pic.y_stride {
+                pic.y[y * pic.y_stride + x] = ((x + 2 * y) / 4 % 96 + 130) as u8;
+            }
+        }
+        let ch = pic.cb.len() / pic.c_stride;
+        for y in 0..ch {
+            for x in 0..pic.c_stride {
+                pic.cb[y * pic.c_stride + x] = ((x + y) / 3 % 40 + 90) as u8;
+                pic.cr[y * pic.c_stride + x] = ((x + y) / 4 % 40 + 130) as u8;
+            }
+        }
+    }
+
+    #[test]
+    fn pframe_scene_change_takes_intra_in_p_and_decodes_v3() {
+        let dims = PictureDims::new(64, 64).unwrap();
+        let mut reference = Picture::alloc(dims, PictureType::I);
+        fill_texture(&mut reference);
+        // Scene change: the input shares nothing with the reference.
+        let mut input = Picture::alloc(dims, PictureType::I);
+        fill_other_texture(&mut input);
+        let config = EncoderConfig {
+            quant: 4,
+            mv_search_range: 4,
+        };
+        let (bytes, stats) =
+            encode_pframe_v3_with_stats(&input, &reference, dims, &config).unwrap();
+        assert!(
+            stats.intra_mbs > stats.total_mbs / 2,
+            "scene change should code most MBs intra, got {stats:?}"
+        );
+        let mut br = BitReader::new(&bytes);
+        let out = decode_picture(&mut br, dims, Some(&reference)).unwrap();
+        let mae = out
+            .y
+            .iter()
+            .zip(input.y.iter())
+            .map(|(a, b)| (*a as i64 - *b as i64).unsigned_abs())
+            .sum::<u64>() as f64
+            / out.y.len() as f64;
+        assert!(mae < 3.5, "v3 intra-in-P scene change MAE {mae} too large");
+    }
+
+    #[test]
+    fn pframe_scene_change_takes_intra_in_p_and_decodes_v1_v2() {
+        let dims = PictureDims::new(64, 64).unwrap();
+        let mut reference = Picture::alloc(dims, PictureType::I);
+        fill_texture(&mut reference);
+        let mut input = Picture::alloc(dims, PictureType::I);
+        fill_other_texture(&mut input);
+        let config = EncoderConfig {
+            quant: 4,
+            mv_search_range: 4,
+        };
+        for version in [MsV1V2Version::V1, MsV1V2Version::V2] {
+            let (bytes, stats) =
+                encode_pframe_v1v2_with_stats(&input, &reference, dims, &config, version).unwrap();
+            assert!(
+                stats.intra_mbs > stats.total_mbs / 2,
+                "{version:?}: scene change should code most MBs intra, got {stats:?}"
+            );
+            let mut br = BitReader::new(&bytes);
+            let out = crate::picture::decode_picture_v1v2(&mut br, dims, version, Some(&reference))
+                .unwrap();
+            let mae = out
+                .y
+                .iter()
+                .zip(input.y.iter())
+                .map(|(a, b)| (*a as i64 - *b as i64).unsigned_abs())
+                .sum::<u64>() as f64
+                / out.y.len() as f64;
+            assert!(
+                mae < 3.5,
+                "{version:?} intra-in-P scene change MAE {mae} too large"
+            );
+        }
+    }
+
+    #[test]
+    fn pframe_partial_scene_change_mixes_intra_and_inter() {
+        // Left half pans within the reference texture, right half cuts
+        // to a new texture: the census must show both inter (or skip)
+        // and intra MBs, and the whole frame must still decode.
+        let dims = PictureDims::new(96, 48).unwrap();
+        let mut reference = Picture::alloc(dims, PictureType::I);
+        fill_texture(&mut reference);
+        let mut other = Picture::alloc(dims, PictureType::I);
+        fill_other_texture(&mut other);
+        let mut input = reference.clone();
+        let h = input.y.len() / input.y_stride;
+        for y in 0..h {
+            for x in 48..input.y_stride {
+                input.y[y * input.y_stride + x] = other.y[y * other.y_stride + x];
+            }
+        }
+        let ch = input.cb.len() / input.c_stride;
+        for y in 0..ch {
+            for x in 24..input.c_stride {
+                input.cb[y * input.c_stride + x] = other.cb[y * other.c_stride + x];
+                input.cr[y * input.c_stride + x] = other.cr[y * other.c_stride + x];
+            }
+        }
+        let config = EncoderConfig {
+            quant: 4,
+            mv_search_range: 4,
+        };
+        let (bytes, stats) =
+            encode_pframe_v3_with_stats(&input, &reference, dims, &config).unwrap();
+        assert!(stats.intra_mbs > 0, "right half should go intra: {stats:?}");
+        assert!(
+            stats.skip_mbs + stats.inter_mbs > 0,
+            "left half should stay inter/skip: {stats:?}"
+        );
+        let mut br = BitReader::new(&bytes);
+        let out = decode_picture(&mut br, dims, Some(&reference)).unwrap();
+        let mae = out
+            .y
+            .iter()
+            .zip(input.y.iter())
+            .map(|(a, b)| (*a as i64 - *b as i64).unsigned_abs())
+            .sum::<u64>() as f64
+            / out.y.len() as f64;
+        assert!(mae < 3.5, "mixed P-frame MAE {mae} too large");
     }
 
     #[test]
