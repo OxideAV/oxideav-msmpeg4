@@ -18,6 +18,14 @@
 //! | `quant`           | frame quantiser, 1..=31          | 4       |
 //! | `gop`             | keyframe interval (1 = all-intra)| 12      |
 //! | `mv_search_range` | half-pel search radius, 0..=63   | 8       |
+//! | `scene_cut`       | % of intra MBs that upgrades a P-frame to a fresh I-frame (0 = off) | 60 |
+//!
+//! **Scene-cut policy.** When a P-frame's macroblock census
+//! ([`crate::enc::PFrameStats`]) reports more than `scene_cut`% of the
+//! frame refusing inter coding (the per-MB intra-in-P decision), the
+//! packet is discarded and the frame re-encoded as an I-frame: a frame
+//! that is mostly intra anyway is cheaper and cleaner as a keyframe,
+//! and the GOP clock restarts at the cut.
 
 use std::collections::VecDeque;
 
@@ -28,7 +36,8 @@ use oxideav_core::{
 };
 
 use crate::enc::{
-    encode_iframe_v1v2, encode_iframe_v3, encode_pframe_v1v2, encode_pframe_v3, EncoderConfig,
+    encode_iframe_v1v2, encode_iframe_v3, encode_pframe_v1v2_with_stats,
+    encode_pframe_v3_with_stats, EncoderConfig,
 };
 use crate::header::PictureType;
 use crate::picture::{decode_picture, decode_picture_v1v2, MsV1V2Version, Picture, PictureDims};
@@ -100,6 +109,9 @@ struct MsMpeg4Encoder {
     config: EncoderConfig,
     /// Keyframe interval: 1 = every frame intra.
     gop: u32,
+    /// Scene-cut threshold: intra-MB percentage above which a P-frame
+    /// is upgraded to an I-frame (0 = policy disabled).
+    scene_cut: u32,
     /// Frames emitted since (and including) the last I-frame.
     frames_since_key: u32,
     /// Decoder-side reconstruction of the previously emitted frame.
@@ -123,6 +135,7 @@ impl MsMpeg4Encoder {
         let quant = int_option(params, "quant", 4, 1, 31)?;
         let gop = int_option(params, "gop", 12, 1, 600)?;
         let mv_search_range = int_option(params, "mv_search_range", 8, 0, 63)?;
+        let scene_cut = int_option(params, "scene_cut", 60, 0, 100)?;
 
         let mut output_params = params.clone();
         output_params.codec_id = CodecId::new(version.codec_id());
@@ -136,6 +149,7 @@ impl MsMpeg4Encoder {
                 mv_search_range: mv_search_range as u8,
             },
             gop,
+            scene_cut,
             frames_since_key: 0,
             last_recon: None,
             queue: VecDeque::new(),
@@ -184,6 +198,40 @@ impl MsMpeg4Encoder {
             pic.c_stride,
         )?;
         Ok(pic)
+    }
+
+    /// Encode one picture, returning `(bytes, is_keyframe)`. A frame
+    /// not forced intra is first encoded as a P-frame; if its MB
+    /// census crosses the `scene_cut` intra-percentage threshold, the
+    /// P packet is discarded and the frame re-encoded as an I-frame
+    /// (the caller restarts the GOP clock off the returned flag).
+    fn encode_frame_bytes(&self, input: &Picture, force_key: bool) -> Result<(Vec<u8>, bool)> {
+        let v1v2 = match self.version {
+            EncVersion::V1 => Some(MsV1V2Version::V1),
+            EncVersion::V2 => Some(MsV1V2Version::V2),
+            EncVersion::V3 => None,
+        };
+        let encode_i = |input: &Picture| match v1v2 {
+            None => encode_iframe_v3(input, self.dims, &self.config),
+            Some(v) => encode_iframe_v1v2(input, self.dims, &self.config, v),
+        };
+        if force_key {
+            return Ok((encode_i(input)?, true));
+        }
+        let reference = self
+            .last_recon
+            .as_ref()
+            .expect("P-frame requested without a reference");
+        let (bytes, stats) = match v1v2 {
+            None => encode_pframe_v3_with_stats(input, reference, self.dims, &self.config)?,
+            Some(v) => encode_pframe_v1v2_with_stats(input, reference, self.dims, &self.config, v)?,
+        };
+        if self.scene_cut > 0
+            && stats.intra_mbs as u64 * 100 > stats.total_mbs as u64 * self.scene_cut as u64
+        {
+            return Ok((encode_i(input)?, true));
+        }
+        Ok((bytes, false))
     }
 }
 
@@ -236,24 +284,11 @@ impl Encoder for MsMpeg4Encoder {
         let input = self.frame_to_picture(vf)?;
 
         let force_key = self.last_recon.is_none() || self.frames_since_key >= self.gop;
+        let (bytes, is_key) = self.encode_frame_bytes(&input, force_key)?;
         let v1v2 = match self.version {
             EncVersion::V1 => Some(MsV1V2Version::V1),
             EncVersion::V2 => Some(MsV1V2Version::V2),
             EncVersion::V3 => None,
-        };
-        let (bytes, is_key) = if force_key {
-            let bytes = match v1v2 {
-                None => encode_iframe_v3(&input, self.dims, &self.config)?,
-                Some(v) => encode_iframe_v1v2(&input, self.dims, &self.config, v)?,
-            };
-            (bytes, true)
-        } else {
-            let reference = self.last_recon.as_ref().expect("checked above");
-            let bytes = match v1v2 {
-                None => encode_pframe_v3(&input, reference, self.dims, &self.config)?,
-                Some(v) => encode_pframe_v1v2(&input, reference, self.dims, &self.config, v)?,
-            };
-            (bytes, false)
         };
 
         // Decode our own bytes so the next P-frame references exactly
@@ -399,6 +434,80 @@ mod tests {
             assert!(mae < 3.0, "frame {n}: luma MAE {mae} too large");
             last = Some(out);
         }
+    }
+
+    /// A visually unrelated, smooth second scene (low intra activity,
+    /// useless MC from the `test_frame` family).
+    fn other_scene_frame(w: usize, h: usize, pts: i64) -> VideoFrame {
+        let cw = w.div_ceil(2);
+        let chh = h.div_ceil(2);
+        let mut y = vec![0u8; w * h];
+        for j in 0..h {
+            for i in 0..w {
+                y[j * w + i] = ((i / 4 + j / 2) % 90 + 150) as u8;
+            }
+        }
+        VideoFrame {
+            pts: Some(pts),
+            planes: vec![
+                oxideav_core::VideoPlane { stride: w, data: y },
+                oxideav_core::VideoPlane {
+                    stride: cw,
+                    data: vec![90u8; cw * chh],
+                },
+                oxideav_core::VideoPlane {
+                    stride: cw,
+                    data: vec![170u8; cw * chh],
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn scene_cut_upgrades_pframe_to_keyframe() {
+        let mut p = params(64, 64);
+        p.options.insert("gop", "100");
+        p.options.insert("quant", "4");
+        let mut enc = make_encoder(&p).unwrap();
+        let mut keyflags = Vec::new();
+        for n in 0..6usize {
+            let f = if n < 3 {
+                Frame::Video(test_frame(64, 64, n))
+            } else {
+                Frame::Video(other_scene_frame(64, 64, n as i64))
+            };
+            enc.send_frame(&f).unwrap();
+            keyflags.push(enc.receive_packet().unwrap().flags.keyframe);
+        }
+        assert_eq!(
+            keyflags,
+            vec![true, false, false, true, false, false],
+            "hard cut at frame 3 must restart the GOP on a keyframe"
+        );
+    }
+
+    #[test]
+    fn scene_cut_zero_disables_the_policy() {
+        let mut p = params(64, 64);
+        p.options.insert("gop", "100");
+        p.options.insert("quant", "4");
+        p.options.insert("scene_cut", "0");
+        let mut enc = make_encoder(&p).unwrap();
+        let mut keyflags = Vec::new();
+        for n in 0..5usize {
+            let f = if n < 3 {
+                Frame::Video(test_frame(64, 64, n))
+            } else {
+                Frame::Video(other_scene_frame(64, 64, n as i64))
+            };
+            enc.send_frame(&f).unwrap();
+            keyflags.push(enc.receive_packet().unwrap().flags.keyframe);
+        }
+        assert_eq!(
+            keyflags,
+            vec![true, false, false, false, false],
+            "scene_cut=0 must never upgrade P-frames"
+        );
     }
 
     #[test]
