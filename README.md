@@ -1,6 +1,7 @@
 # oxideav-msmpeg4
 
-Pure-Rust decoder for the **Microsoft MPEG-4** family — v1, v2, and v3
+Pure-Rust decoder **and encoder** for the **Microsoft MPEG-4** family —
+v1, v2, and v3
 (a.k.a. DivX ;-) 3). These were Microsoft's pre-standard MPEG-4 codecs
 shipped in Windows Media Tools (1999-2001) and forked by DivXNetworks
 into the original "DivX" ripper codec. They are **not** the same
@@ -31,6 +32,22 @@ established that v1/v2 use a dedicated H.263 size+value DC scheme
 previous gate. Real-content bit-exactness against an encoder oracle is a
 pending Auditor item.
 
+As of round 383 the crate also carries a **full-family encoder**
+(v1 / v2 / v3, I-frames + motion-searched P-frames): every syntax
+element is written through the bit-level inverse of its decode surface
+over the same extracted tables, and every produced stream round-trips
+through this crate's own production decoders (`picture::decode_picture`
+/ `decode_picture_v1v2`). The registered `oxideav_core::Encoder` (an
+I/P GOP machine with `quant` / `gop` / `mv_search_range` options)
+decodes its own bytes each frame so encoder/decoder prediction state
+cannot drift; direct factories live at `encoder::make_encoder`
+(+ `_v1` / `_v2`). Caveat: for the two tables whose wire codes are
+canonically *reconstructed* rather than binary-extracted (the v3
+128-entry joint MCBPCY, see the docs gap below, and the shared v1/v2
+CBPY table) the encoder matches this crate's decoder by construction,
+and byte-exactness against the original binary remains exactly as
+unverified as on the decode side.
+
 | Piece                                          | Status     |
 | ---------------------------------------------- | ---------- |
 | Bitstream classifier (`classify`)              | complete   |
@@ -58,6 +75,9 @@ pending Auditor item.
 | V1 / V2 shared CBPY VLC                         | complete   |
 | Picture-wide MV grid (`MvGrid`)                | complete   |
 | Per-G-family descriptor / runtime-binding accessors | complete |
+| v3 encoder: I-frame + P-frame (skip / half-pel motion search / G4 residual) | complete (round 383; decoder-verified round-trip, all 31 quants) |
+| v1 / v2 encoder: I-frame + P-frame              | complete (round 383; size+value DC, MCBPC/CBPY wrap, per-component MV) |
+| Registered `Encoder` + `encoder::make_encoder{,_v1,_v2}` | complete (round 383; GOP machine, decode-own-bytes reference) |
 
 ## What's still open for real-content decode
 

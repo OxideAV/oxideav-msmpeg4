@@ -7,6 +7,96 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- round 383: **MS-MPEG-4 family encoder (v1 / v2 / v3) — I-frames +
+  P-frames, decoder-verified end-to-end, registered.** The crate was
+  decode-only; this round adds the complete encode direction over the
+  same extracted tables, driven to round-trip against this crate's own
+  production decoders (`picture::decode_picture` /
+  `decode_picture_v1v2`). Eight commits:
+  1. Encoder-side transform + quantiser: `idct::fdct8x8` /
+     `fdct8x8_from_pels` (exact float inverse of the shipping
+     `idct8x8`) and `iq::quantise_h263` / `quantise_block_h263`
+     (inverse of the spec/08 §5 reconstruction rule
+     `sign·(|level|·2q + q − even_flag)` with a level-0 dead zone,
+     clamped to ±127 for the verbatim ESC tier).
+  2. v3 entropy-encode primitives — bit-level inverses of every v3
+     decode surface: `header::MsV3PictureHeader::write` (I/P selector
+     cluster in frame-type order), `mcbpcy::encode_mcbpcy` (+
+     `compose_cbp`), `mb::encode_intra_dc_diff_v3` (direct-value DC
+     VLC incl. bit-length holes → ESC and the inverted DC sign
+     convention, spec/07 §5.2), `mv::encode_mv_with_table`
+     (shortest-codeword joint-symbol lookup via a per-variant
+     4096-slot inverse LUT over the MVDx/MVDy byte LUTs, ESC + 6+6
+     FLC fallback, and the spec/06 §3.5 toroidal-window reachability
+     rule `mv_component_reachable`), and `ac::encode_token` /
+     `encode_intra_ac` / `encode_inter_ac` (primary → tier-1 level
+     extension → tier-2 run extension → verbatim FLC in decoder order,
+     3×ESC on 3-tier intra tables vs 1×ESC on the 1-tier inter kernel;
+     both block walkers' run/position semantics inverted incl. the
+     inter first-token rule). 16-test round-trip suite
+     (`tests/encode_primitives.rs`) sweeps every primary alphabet
+     entry of all six G-families both signs, all 128 MCBPCY symbols,
+     DC diffs −255..=255, and exhaustive/dense MV windows on both VLC
+     variants.
+  3. v3 I-frame picture encoder (`enc::encode_iframe_v3`): forward
+     DCT, §7.4.3 spatial DC prediction over the same
+     reconstructed-integer-DC `DcCache` the decoder derives, joint
+     MCBPCY (I-type half), ac_pred pinned 0 (fixed zigzag), G5-luma /
+     G4-chroma AC walks. Flat-grey round-trips pel-exact; all-31-quant
+     decodability sweep with per-quant loss bounds
+     (`tests/v3_encoder.rs`).
+  4. v3 P-frame encoder (`enc::encode_pframe_v3`): per-MB §7.6.5
+     median predictor over a shared `MvGrid`, half-pel SAD motion
+     search clipped to the toroidal window, MC through the same
+     `mc_block` kernel + §7.6.3.4 chroma derivation as the decoder,
+     6-block residual quantisation (`level_start = 0`), 1-bit skip vs
+     coded-MB syntax (MCBPCY idx = 64 + cbp, always-consumed ac_pred
+     bit, joint-MV VLC, G4 inter walks). I-P-P sequences chain through
+     the decoder's own reconstruction.
+  5. Registered `oxideav_core::Encoder` (I/P GOP machine; options
+     `quant` / `gop` / `mv_search_range`) + the direct factory
+     `encoder::make_encoder`; emits pts/dts + keyframe-flagged packets
+     and decodes its own bytes each frame so encoder/decoder
+     prediction state cannot drift. Registry loop test drives
+     `first_encoder` → registered-decoder `send_packet` /
+     `receive_frame`.
+  6. v1/v2 entropy-encode primitives: `MsV1V2PictureHeader::write_v1`
+     (37-bit zeroed opaque preamble per spec/99 §2.1 + P-only UMV
+     flag) / `write_v2`, `mcbpcy::encode_mcbpcy_v1` (COD bit +
+     21-symbol MCBPC, STUFFING/ESC rejected) / `encode_mcbpcy_v2`
+     (P-gated skip bit, intra-quotient ac_pred bit) /
+     `encode_cbpy_v1v2` (the spec/07 §1.2 `15 − cbpy` wrap incl. the
+     v2 `remainder == 3` no-wrap sub-type),
+     `mb::encode_intra_dc_diff_v1v2` (H.263 §5.4.1 size+value scheme,
+     spec/16 §2), and `mv::encode_mv_v1v2` (+
+     `mv_v1v2_component_reachable`, the [−32, +32] per-component
+     toroidal residual of spec/07 §3.2).
+  7. v1/v2 picture encoders (`enc::encode_iframe_v1v2` /
+     `encode_pframe_v1v2`) over a version-independent analysis core
+     factored out of the v3 paths (`analyse_intra_mb`,
+     `write_intra_blocks`, `analyse_inter_residual`, and a
+     `motion_search` parameterised over the per-version reachability
+     rule). v1 I-frame MBs emit MB-type 3 INTRA behind the
+     always-present COD bit; v2 emits the intra quotient + ac_pred
+     bit; P-frames share the skip / motion / G4-residual shape with
+     the per-component MV pair (`tests/v1_v2_encoder.rs`, 5 tests ×
+     both versions).
+  8. Registered v1/v2 encoder factories (`encoder::make_encoder_v1` /
+     `make_encoder_v2`) — all three family members are now
+     encode+decode in the registry; the registered-loop test runs for
+     every codec id.
+  Test suite 431 lib-only → 605 total (0 failed). The encoder targets
+  THIS crate's decoder: for the two tables whose wire codes are
+  canonically reconstructed rather than binary-extracted (128-entry
+  joint MCBPCY — see the README docs-gap on `region_05eac8` — and the
+  shared v1/v2 CBPY table), byte-exactness against the original
+  binary remains unverified either way; all binary-extracted tables
+  (G0..G5 primaries, both v3 joint-MV VLCs + byte LUTs, v1/v2
+  MV/MCBPC/DC-size tables, the four v3 intra-DC VLCs) are used
+  verbatim in both directions.
+
 ### Tests
 
 - round 374: **picture-level coverage of the intra-in-P macroblock path
