@@ -19,9 +19,8 @@
 //!
 //! Per `docs/video/msmpeg4-fixtures/README.md`, the fixture corpus is a
 //! black-box reference for the *implementer crate* (this crate), not
-//! the clean-room docs workspace. No FFmpeg source is read; the
-//! `input.avi` bytes and `notes.md` field values are treated as
-//! opaque reference data.
+//! the clean-room docs workspace; the fixture bytes and `notes.md`
+//! field values are treated as opaque reference data.
 
 use std::path::PathBuf;
 
