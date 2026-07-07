@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- v3 FourCC alias coverage: `DVX3` and `COL1` now route to msmpeg4v3
+  in both `classify()` and the registry tag claims (previously only
+  caught by the `_ => v3` classifier fallback, with no registry tag so
+  a tag-only container lookup returned `None`). Grounded in
+  `docs/video/msmpeg4/spec/00-scope.md` (alias-FourCC row) and
+  `spec/99` §— which enumerate the v3 aliases as
+  `DIV3 / DIV4 / MPG3 / DVX3 / AP41 / COL1`.
+- `tests/header_conformance.rs`: black-box assertion that the v3
+  picture-header parser recovers the exact `picture_type` + `PQUANT`
+  from each `docs/video/msmpeg4-fixtures/` fixture's `notes.md` trace
+  summary, across a q ∈ {2, 6, 8, 16, 31} sweep on real v3 I-frame
+  streams (12 fixtures).
+
+### Changed
+
+- `tests/docs_corpus.rs` header: refreshed the stale round-31 note. The
+  `desc+0x1c / +0x20` `pri_A`/`pri_B` binding it cited as the blocker is
+  closed (`spec/14` §6 item 1 — static, one-shot at construction; the
+  per-frame G-family selection is fully specified by `spec/14` §3.1).
+  The documented residual real-content blocker is now the `region_05eac8`
+  joint-MCBPCY re-extraction docs gap: the v3 I-frame decode reaches
+  ≈33–34 of 99 MBs on the 176×144 DIV3 fixture before desyncing,
+  consistent with the canonical-reconstruction (32/128 impossible codes)
+  feeding spurious CBPY into the block loop.
+
 ## [0.0.9](https://github.com/OxideAV/oxideav-msmpeg4/compare/v0.0.8...v0.0.9) - 2026-07-03
 
 ### Other

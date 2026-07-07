@@ -11,7 +11,8 @@ bitstream as standard MPEG-4 Part 2 (ISO/IEC 14496-2) — despite the
 name, the headers, VLC tables, and slice structure all differ.
 
 If you have a file whose FourCC is one of `DIV3`, `DIV4`, `DIV5`,
-`DIV6`, `MP41`, `MP42`, `MP43`, `MPG3`, or `AP41`, you want this crate.
+`DIV6`, `MP41`, `MP42`, `MP43`, `MPG3`, `DVX3`, `AP41`, or `COL1`, you
+want this crate.
 If you have `XVID`, `DIVX` (note the missing 3), `DX50`, `MP4V`, or
 `FMP4` you want [`oxideav-mpeg4video`](https://github.com/OxideAV/oxideav-mpeg4video)
 instead.
@@ -110,7 +111,18 @@ every other table both directions consume is binary-extracted.
   `region_05eac8` carrying the real MSB-first wire codes (a
   `region_05eac8_mcbpcy.csv` with the `symbol_index,code_dec,code_bin,
   bit_length` layout, Kraft 1.0). Until then MCBPCY stays canonical and
-  whether that matches the binary is unverified.
+  whether that matches the binary is unverified. Round 398 confirmed this
+  is *the* live real-content blocker: the `desc+0x1c/+0x20` binding once
+  suspected here is closed (`spec/14` §6 — static at construction; the
+  per-frame G-family selection is fully specified by `spec/14` §3.1), and
+  the picture-header parser is bit-exact on real v3 I-frames — it
+  recovers the exact `picture_type` + `PQUANT` from every
+  `docs/video/msmpeg4-fixtures/` fixture's trace summary across
+  q ∈ {2,6,8,16,31} (`tests/header_conformance.rs`). With the header
+  correct, the DIV3 176×144 fixture decodes ≈33–34 of 99 MBs before
+  desyncing with "no matching codeword" — the failure signature of a
+  subtly-wrong MCBPCY alphabet feeding spurious CBPY/AC into the block
+  loop, exactly what the `region_05eac8` re-extraction would fix.
 - **V3 4-MV-per-MB picture decode (hard docs gap #1895)**: the
   predictor / neighbour-resolver surface is complete and is exercised
   end-to-end on the v1 P-frame INTER4V path (`spec/16` §3.1, the real

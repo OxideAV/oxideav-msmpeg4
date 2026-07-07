@@ -14,15 +14,32 @@
 //! * [`Tier::Ignored`] — disabled (e.g. selector for a still-OPEN
 //!   table-binding question).
 //!
-//! Round 31 wires every fixture as `ReportOnly` because the runtime
-//! `desc+0x1c / +0x20` (live `pri_A` / `pri_B` pointer) assignment is
-//! still OPEN per `audit/04` §2.5 / `spec/13` §8 item 1 — without it
-//! the v3 decoder cannot reliably select between {G0, G1, G2, G3, G4,
-//! G5} for a given frame's chroma + intra-luma slot, so most fixtures
-//! either error out or produce DC-only approximations far from the
-//! reference YUV. The corpus is the input the next-cleanroom-round
-//! Implementer will use to verify the fix once the binding question
-//! lands.
+//! Every fixture is wired as `ReportOnly`. The `desc+0x1c / +0x20`
+//! (`pri_A` / `pri_B` pointer) binding that round 31 flagged as the
+//! blocker is **no longer open**: `spec/14` §6 item 1 closed it — the
+//! binding is static, written once at decoder construction by
+//! `mb_mv_struct_init`, and the per-frame G-family selection
+//! (`spec/14` §3.1) is fully specified (chroma ∈ {G2,G0,G4},
+//! luma ∈ {G3,G1,G5} from the picture-layer unary selectors). Our
+//! header parser reads those selectors correctly — on the DIV3 fixture
+//! it recovers exactly the trace-summary field values in `notes.md`
+//! (I, q=8, `ac_luma_sel`=2 → G5, `dc_size_sel`=1, `mv_table_sel`=0).
+//!
+//! The residual real-content blocker is the **v3 joint 128-entry
+//! MCBPCY table** (`region_05eac8`, `[esi+0xae8]` per `spec/99` §3.1).
+//! Its `tables/region_05eac8.csv` is still the round-24 extraction
+//! whose `.meta` carries `verdict: suspect` (impossible `bit_length`
+//! values in the thousands); the crate builds this alphabet by
+//! canonical reconstruction (README "What's still open" §1), so 32/128
+//! entries are non-conformant wire codes. On these fixtures the v3
+//! I-frame decode progresses ~3 MB rows (≈33–34 of 99 MBs on the
+//! 176×144 DIV3 fixture) and then desyncs with "no matching codeword",
+//! consistent with a subtly-wrong MCBPCY alphabet feeding spurious
+//! CBPY/AC into the block loop. Closing this needs an Extractor-07-style
+//! re-extraction of `region_05eac8` carrying the real MSB-first wire
+//! codes (`region_05eac8_mcbpcy.csv`, Kraft 1.0) — a docs gap, not an
+//! Implementer fix. The corpus is the input the next round will use to
+//! verify that re-extraction once it lands.
 //!
 //! # Known caveat
 //!

@@ -15,7 +15,7 @@
 //! | msmpeg4v2  | MS MPEG-4 v2                           | `MP42`                    |
 //! | msmpeg4v3  | MS MPEG-4 v3 / DivX ;-) 3              | `MP43`, `MPG3`, `DIV3`,   |
 //! |            |                                        | `DIV4`, `DIV5`, `DIV6`,   |
-//! |            |                                        | `AP41`                    |
+//! |            |                                        | `DVX3`, `AP41`, `COL1`    |
 //!
 //! # Why this crate exists
 //!
@@ -238,9 +238,13 @@ pub fn classify(data: &[u8], fourcc: Option<&[u8; 4]>) -> Classification {
         Some(fc) => match &uppercase4(fc) {
             b"MP41" | b"MPG4" => Classification::MsMpeg4V1,
             b"MP42" => Classification::MsMpeg4V2,
-            b"MP43" | b"MPG3" | b"DIV3" | b"DIV4" | b"DIV5" | b"DIV6" | b"AP41" => {
-                Classification::MsMpeg4V3
-            }
+            // The alias FourCCs `DIV3`, `DIV4`, `MPG3`, `DVX3`, `AP41`,
+            // `COL1` all normalise to MS-MPEG4 v3 per
+            // `docs/video/msmpeg4/spec/00-scope.md` (alias-FourCC row) and
+            // `spec/99-current-understanding.md` §—; `DIV5` / `DIV6` are
+            // long-standing wild-encoder aliases retained here.
+            b"MP43" | b"MPG3" | b"DIV3" | b"DIV4" | b"DIV5" | b"DIV6" | b"DVX3" | b"AP41"
+            | b"COL1" => Classification::MsMpeg4V3,
             _ => Classification::MsMpeg4V3,
         },
         None => Classification::MsMpeg4V3,
@@ -314,7 +318,8 @@ pub fn probe_is_msmpeg4(ctx: &ProbeContext) -> f32 {
 ///
 /// **Tag ownership:**
 ///
-/// - `DIV3`, `DIV4`, `DIV5`, `DIV6`, `MP43`, `MPG3`, `AP41` — MS-MPEG4v3.
+/// - `DIV3`, `DIV4`, `DIV5`, `DIV6`, `MP43`, `MPG3`, `DVX3`, `AP41`,
+///   `COL1` — MS-MPEG4v3.
 /// - `MP42` — MS-MPEG4v2.
 /// - `MP41`, `MPG4` — MS-MPEG4v1.
 ///
@@ -376,7 +381,9 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
                 CodecTag::fourcc(b"DIV6"),
                 CodecTag::fourcc(b"MP43"),
                 CodecTag::fourcc(b"MPG3"),
+                CodecTag::fourcc(b"DVX3"),
                 CodecTag::fourcc(b"AP41"),
+                CodecTag::fourcc(b"COL1"),
             ]);
         }
         reg.register(info);
@@ -655,6 +662,17 @@ mod tests {
         assert_eq!(classify(&bytes, Some(b"DIV3")), Classification::MsMpeg4V3);
         // Lower-case FourCC still works via uppercase4 normalisation.
         assert_eq!(classify(&bytes, Some(b"div3")), Classification::MsMpeg4V3);
+        // The full v3 alias set per spec/00 (alias-FourCC row) +
+        // spec/99 §—: DIV3 / DIV4 / MPG3 / DVX3 / AP41 / COL1 all route
+        // to v3. DVX3 and COL1 were previously only caught by the
+        // `_ => v3` fallback (no registry tag); they are now explicit.
+        for fc in [
+            b"DIV4", b"MPG3", b"DVX3", b"AP41", b"COL1", b"DIV5", b"DIV6",
+        ] {
+            assert_eq!(classify(&bytes, Some(fc)), Classification::MsMpeg4V3);
+        }
+        assert_eq!(classify(&bytes, Some(b"dvx3")), Classification::MsMpeg4V3);
+        assert_eq!(classify(&bytes, Some(b"col1")), Classification::MsMpeg4V3);
     }
 
     #[test]
@@ -731,6 +749,21 @@ mod tests {
             CodecResolver::resolve_tag(&reg, &ctx).map(|c| c.as_str().to_string()),
             Some(CODEC_ID_V1.to_string()),
         );
+        // Every documented v3 alias FourCC now carries a registry tag
+        // so a container demuxer resolves the decoder by tag alone —
+        // previously DVX3 / COL1 had no claim and fell through to None.
+        for fc in [
+            b"DIV3", b"DIV4", b"DIV5", b"DIV6", b"MP43", b"MPG3", b"DVX3", b"AP41", b"COL1",
+        ] {
+            let tag = CodecTag::fourcc(fc);
+            let ctx = ProbeContext::new(&tag).packet(&ms_bytes);
+            assert_eq!(
+                CodecResolver::resolve_tag(&reg, &ctx).map(|c| c.as_str().to_string()),
+                Some(CODEC_ID_V3.to_string()),
+                "alias {:?} should resolve to msmpeg4v3",
+                std::str::from_utf8(fc).unwrap(),
+            );
+        }
     }
 
     #[test]
