@@ -46,8 +46,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   encoder's convention. Intra-in-P keeps the low half per the spec/05
   §3.2 `test bl, 0x40; je` polarity.
 
+- **G4 / G5 AC primaries now cover the reserved ESC-marker codeword.**
+  Their packed sources have Kraft = 1 - 1/512: the single 9-bit slot
+  `000000000` is deliberately unassigned, and spec/11 §7 item 4
+  identifies it as "the placeholder the decoder expects to receive as
+  the ESC marker prefix". Real MS-encoded streams emit it — with the
+  corrected MCBPCY alphabet in place, both div3.avi and div4.avi
+  I-frames refused decode exactly on a 9-zero-bit prefix. The runtime
+  table builder now adds `(9, 000000000) → Escape` for G4/G5 (G0..G3
+  saturate Kraft at 1.0 and get no such entry), routing it through the
+  existing spec/04 §2.3 3-tier escape body. First-I-frame decode depth
+  on the pinned Microsoft fixtures: div3.avi 50 → 135 of 330 MBs,
+  div4.avi → 241 of 330; the remaining desync surfaces as the spec/13
+  §3 scan-overflow guard deeper into the frame.
+- VLC decode errors now name the refusing table and bit position
+  (`vlc::decode_named`; e.g. "msmpeg4 ac primary: no matching codeword
+  at bit 2973 (next 12 bits = …)") — a bare "no matching codeword"
+  from a MCBPCY + DC + AC + MV pipeline was unactionable, and the
+  Kraft-complete tables can never legitimately produce it. All runtime
+  decode sites are labelled; the failing-fixture triage that found the
+  reserved-ESC gap above was driven by these labels.
+
 ### Added
 
+- `[esc trace]` per-tier lines (level-ext / run-ext / verbatim) in the
+  escape body, under the same `OXIDEAV_MSMPEG4_AC_TRACE=1` gate.
 - `[mcbpcy trace]` line (decoded joint index + bit position) added to
   the `OXIDEAV_MSMPEG4_AC_TRACE=1` diagnostic stream — this is the
   instrument that pinned the I-frame half convention above.

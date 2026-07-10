@@ -42,12 +42,13 @@ fn pack(fields: &[(u32, u32)]) -> Vec<u8> {
 }
 
 #[test]
-fn g5_table_has_103_entries() {
+fn g5_table_has_104_entries() {
     let table = AcVlcTable::v3_intra_g5();
     assert_eq!(
         table.entries.len(),
-        103,
-        "G5 has 102 alphabet + 1 ESC = 103 entries (one bl=9 codeword reserved)"
+        104,
+        "G5 has 102 alphabet + 1 ESC codeword at idx 102 + the reserved \
+         9-bit `000000000` ESC-marker entry (spec/11 §7 item 4) = 104"
     );
 }
 
@@ -173,7 +174,7 @@ fn g5_alphabet_partition_matches_audit() {
     // Per spec/99 §5: G5 has count_A=102, count_B=66.
     // Sub-class A (idx 0..=66, last=false): 67 entries.
     // Sub-class B (idx 67..=101, last=true): 35 entries.
-    // ESC (idx 102): 1 entry.
+    // ESC: idx 102's codeword + the reserved 9-bit marker = 2 entries.
     let table = AcVlcTable::v3_intra_g5();
     let last_false_count = table
         .entries
@@ -192,10 +193,14 @@ fn g5_alphabet_partition_matches_audit() {
         .count();
     assert_eq!(last_false_count, 67, "sub-A count");
     assert_eq!(last_true_count, 35, "sub-B count");
-    assert_eq!(esc_count, 1, "exactly one ESC entry");
+    // Two ESC entries: the idx-102 codeword (`0000011`, 7 bits; sym ==
+    // count_A per spec/15) plus the reserved 9-bit `000000000` marker
+    // covering the Kraft gap (spec/11 §7 item 4) that real MS-encoded
+    // streams emit (tests/microsoft_fixtures.rs).
+    assert_eq!(esc_count, 2, "idx-102 ESC + reserved 9-bit ESC marker");
     assert_eq!(
         last_false_count + last_true_count + esc_count,
-        103,
-        "total = 103"
+        104,
+        "total = 104"
     );
 }

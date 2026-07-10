@@ -133,7 +133,7 @@ impl McbpcyDecode {
 /// bit 2 = Y3, bit 1 = Cb, bit 0 = Cr. (Bits assigned MSB-first in the
 /// order the spec lists the storage offsets `[esi+0x14..+0x28]`.)
 pub fn decode_mcbpcy(br: &mut BitReader<'_>) -> Result<McbpcyDecode> {
-    let idx = vlc::decode(br, table())?;
+    let idx = vlc::decode_named(br, table(), "v3 joint-mcbpcy")?;
     if std::env::var_os("OXIDEAV_MSMPEG4_AC_TRACE").is_some() {
         eprintln!("[mcbpcy trace] idx={idx} bit_pos={}", br.bit_position());
     }
@@ -349,7 +349,7 @@ impl V1V2McbpcyDecode {
 /// We always return the **post-wrap** value; callers that need the
 /// raw VLC output can XOR back with 0xf.
 fn decode_cbpy_with_wrap(br: &mut BitReader<'_>, apply_wrap: bool) -> Result<u8> {
-    let raw = vlc::decode(br, CBPY_INTRA_TABLE)?;
+    let raw = vlc::decode_named(br, CBPY_INTRA_TABLE, "v1/v2 cbpy")?;
     if raw > 15 {
         return Err(Error::invalid(format!(
             "msmpeg4 v1/v2 cbpy: decoded {raw} > 15 (table corruption?)"
@@ -392,7 +392,7 @@ pub fn decode_mcbpcy_v1(br: &mut BitReader<'_>) -> Result<V1V2McbpcyDecode> {
     if skip {
         return Ok(V1V2McbpcyDecode::skip_mb());
     }
-    let mcbpc = vlc::decode(br, mcbpc_v1_table())?;
+    let mcbpc = vlc::decode_named(br, mcbpc_v1_table(), "v1 mcbpc")?;
     if mcbpc > 20 {
         return Err(Error::invalid(format!(
             "msmpeg4 v1 mcbpc: decoded {mcbpc} > 20 (range check at 1c217224)"
@@ -458,7 +458,7 @@ pub fn decode_mcbpcy_v2(
     if skip {
         return Ok(V1V2McbpcyDecode::skip_mb());
     }
-    let mcbpc = vlc::decode(br, mcbpc_v2_table())?;
+    let mcbpc = vlc::decode_named(br, mcbpc_v2_table(), "v2 mcbpc")?;
     if mcbpc > 7 {
         return Err(Error::invalid(format!(
             "msmpeg4 v2 mcbpc: decoded {mcbpc} > 7 (range check at 1c217318)"

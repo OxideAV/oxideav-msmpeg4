@@ -71,7 +71,7 @@ pub struct IntraMbHeader {
 impl IntraMbHeader {
     pub fn parse(br: &mut BitReader<'_>) -> Result<Self> {
         let ac_pred = br.read_bit()?;
-        let cbpy = vlc::decode(br, CBPY_INTRA_TABLE)?;
+        let cbpy = vlc::decode_named(br, CBPY_INTRA_TABLE, "intra cbpy")?;
         Ok(Self {
             ac_pred,
             cbpy,
@@ -116,7 +116,7 @@ pub fn decode_intra_dc_diff(br: &mut BitReader<'_>, block_idx: usize) -> Result<
     } else {
         DC_SIZE_CHROMA_TABLE
     };
-    let size = vlc::decode(br, table)? as u32;
+    let size = vlc::decode_named(br, table, "legacy intra-DC size")? as u32;
     if size == 0 {
         return Ok(0);
     }
@@ -200,7 +200,7 @@ fn dc_size_v1v2_table(block_idx: usize) -> &'static [VlcEntry<u8>] {
 /// legacy paths in this module).
 pub fn decode_intra_dc_diff_v1v2(br: &mut BitReader<'_>, block_idx: usize) -> Result<i32> {
     let table = dc_size_v1v2_table(block_idx);
-    let size = vlc::decode(br, table)? as u32;
+    let size = vlc::decode_named(br, table, "v1/v2 intra-DC size")? as u32;
     if size == 0 {
         return Ok(0);
     }
@@ -351,7 +351,17 @@ pub fn decode_intra_dc_diff_v3(
 ) -> Result<i32> {
     let table = dc_table(block_idx, dc_size_sel);
     let esc = dc_esc_index(block_idx, dc_size_sel);
-    let idx = vlc::decode(br, table)? as usize;
+    // Label the decode with the concrete table: the direct-value DC
+    // VLCs have bit-length-0 holes, so they are one of the two places
+    // a real-content "no matching codeword" can legitimately originate
+    // (the other being the AC primaries).
+    let what = match (block_idx < 4, dc_size_sel) {
+        (true, 0) => "v3 intra-DC luma sel0",
+        (false, 0) => "v3 intra-DC chroma sel0",
+        (true, _) => "v3 intra-DC luma sel1",
+        (false, _) => "v3 intra-DC chroma sel1",
+    };
+    let idx = vlc::decode_named(br, table, what)? as usize;
     if idx == 0 {
         // idx == 0 ⇒ DC differential = 0, no sign bit consumed
         // (`1c216d2a: test al, al; je 0x1c216d47` per spec/07 §5.2).

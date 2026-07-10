@@ -28,14 +28,37 @@ impl<T: Copy> VlcEntry<T> {
 /// is the true prefix length for each entry. On ambiguous matches
 /// (shouldn't happen for a valid table) the first match wins.
 pub fn decode<T: Copy>(br: &mut BitReader<'_>, table: &[VlcEntry<T>]) -> Result<T> {
+    decode_named(br, table, "vlc")
+}
+
+/// [`decode`] with a caller-supplied table label threaded into every
+/// error, plus the bit position at which the failed decode started.
+///
+/// Real-content desync triage needs to know *which* VLC refused a
+/// codeword and *where*: a bare "no matching codeword" from a picture
+/// decode that runs a MCBPCY + DC + AC + MV pipeline is unactionable,
+/// and the complete (Kraft = 1.0) tables — joint-MCBPCY, joint-MV —
+/// can never produce it, so naming the table immediately narrows the
+/// failure to the tables with holes (the direct-value DC VLCs and the
+/// AC primaries) or to genuine upstream desync.
+pub fn decode_named<T: Copy>(
+    br: &mut BitReader<'_>,
+    table: &[VlcEntry<T>],
+    what: &str,
+) -> Result<T> {
+    let start_bit = br.bit_position();
     let max_bits = table.iter().map(|e| e.bits).max().unwrap_or(0) as u32;
     if max_bits == 0 {
-        return Err(Error::invalid("msmpeg4 vlc: empty table"));
+        return Err(Error::invalid(format!(
+            "msmpeg4 {what}: empty table at bit {start_bit}"
+        )));
     }
     let remaining = br.bits_remaining() as u32;
     let peek_bits = max_bits.min(remaining);
     if peek_bits == 0 {
-        return Err(Error::invalid("msmpeg4 vlc: no bits available"));
+        return Err(Error::invalid(format!(
+            "msmpeg4 {what}: no bits available at bit {start_bit}"
+        )));
     }
     let peeked = br.peek_u32(peek_bits)?;
     let peeked_full = peeked << (max_bits - peek_bits);
@@ -50,7 +73,11 @@ pub fn decode<T: Copy>(br: &mut BitReader<'_>, table: &[VlcEntry<T>]) -> Result<
             return Ok(e.value);
         }
     }
-    Err(Error::invalid("msmpeg4 vlc: no matching codeword"))
+    Err(Error::invalid(format!(
+        "msmpeg4 {what}: no matching codeword at bit {start_bit} \
+         (next {peek_bits} bits = {peeked:0width$b})",
+        width = peek_bits as usize,
+    )))
 }
 
 #[cfg(test)]

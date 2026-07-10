@@ -649,22 +649,16 @@ enum GTable {
 ///
 /// Critical observation (round 26): the `(a, b)` pairs in the binary's
 /// packed-Huffman source are **literal `(bit_pattern, bit_length)`**,
-/// not `(state_byte, bit_length)` as the spec/99 §8.1 wording suggests
-/// for the older MCBPCY extraction.
+/// not `(state_byte, bit_length)`.
 ///
 /// Verified by direct prefix-freedom + Kraft-sum check on G5
 /// (Kraft = 0.998047, every pair is unique among prefixes of
-/// equal-or-shorter length). So we must use the `code` field verbatim —
-/// NOT regenerate canonical codes via the `(code+1)<<(bl-prev_bl)`
-/// recurrence the way `mcbpcy::build_table` does for `region_05eac8`.
-///
-/// `region_05eac8` MCBPCY records carry `code_value` in the second
-/// column purely as a runtime LUT/state byte; the canonical-Huffman
-/// builder there correctly ignores them. The G-table sources at
-/// `0x58e38` / `0x59178` use the same record shape but the
-/// `code_value` field IS the bit-pattern. The two conventions coexist
-/// because helper A loads any `(a:u32, b:u32)` source — the caller
-/// decides whether `a` is a state byte or a bit-pattern.
+/// equal-or-shorter length). So we use the `code` field verbatim —
+/// no canonical reconstruction. As of round 405 this is the uniform
+/// convention across every packed-VLC source in the crate: the
+/// joint-MCBPCY table joined it when `region_05eac8_mcbpcy.csv`
+/// (provenance/22) exposed the real wire codes of `region_05eac8`
+/// (whose earlier dump was a mis-parse, not a state-byte column).
 ///
 /// Steps (per spec/11 §4):
 ///
@@ -713,6 +707,21 @@ fn build_g_primary(raw: &[(u32, u32)], esc_index: usize, table: GTable) -> Vec<V
             }
         };
         entries.push(VlcEntry::new(bl as u8, code, symbol));
+    }
+
+    // G4 / G5 only: cover the reserved codeword. Their packed sources
+    // have Kraft = 1 - 1/512 — the code space deliberately leaves the
+    // single 9-bit slot `000000000` unassigned, and spec/11 §7 item 4
+    // identifies that reserved slot as "the placeholder the decoder
+    // expects to receive as the ESC marker prefix before reading the
+    // raw run/level escape bits". Real MS-encoded streams do emit it:
+    // both pinned Microsoft fixtures' I-frames refused decode exactly
+    // on a 9-zero-bit prefix before this entry existed
+    // (`tests/microsoft_fixtures.rs`). Map it to [`Symbol::Escape`] so
+    // the escape body runs; G0..G3 saturate Kraft to exactly 1 and
+    // have no reserved slot, so they get no such entry.
+    if matches!(table, GTable::G4 | GTable::G5) {
+        entries.push(VlcEntry::new(9, 0b000000000, Symbol::Escape));
     }
     entries
 }
@@ -992,7 +1001,7 @@ impl Scan {
 /// observed PSNR-on-real-content result shows behaves as the standard MPEG-4
 /// convention here.)
 pub fn decode_token(br: &mut BitReader<'_>, table: &AcVlcTable) -> Result<Token> {
-    match vlc::decode(br, table.entries)? {
+    match vlc::decode_named(br, table.entries, "ac primary")? {
         Symbol::RunLevel { last, run, level } => {
             // 1 sign bit follows the VLC match.
             let sign = br.read_bit()?;
@@ -1038,9 +1047,16 @@ pub fn decode_token(br: &mut BitReader<'_>, table: &AcVlcTable) -> Result<Token>
 /// chains the tiers via the much-simpler successive-ESC mechanism per
 /// the addresses called out in spec/04 §2.3.
 fn decode_escape_body(br: &mut BitReader<'_>, table: &AcVlcTable) -> Result<Token> {
+    let trace = std::env::var_os("OXIDEAV_MSMPEG4_AC_TRACE").is_some();
+    if trace {
+        eprintln!(
+            "[esc trace] escape body entered at bit {}",
+            br.bit_position()
+        );
+    }
     // Tier 1 — level extension.
     if let (Some(lmax), Some(_)) = (table.lmax, table.rmax) {
-        match vlc::decode(br, table.entries)? {
+        match vlc::decode_named(br, table.entries, "ac esc tier-1 re-vlc")? {
             Symbol::RunLevel { last, run, level } => {
                 let last_idx = if last { 1 } else { 0 };
                 let run_idx = run as usize;
@@ -1050,6 +1066,12 @@ fn decode_escape_body(br: &mut BitReader<'_>, table: &AcVlcTable) -> Result<Toke
                     0
                 };
                 let level_actual = level.saturating_add(lmax_value);
+                if trace {
+                    eprintln!(
+                        "[esc trace] tier-1 level-ext: last={last} run={run} \
+                         base={level} +lmax={lmax_value} -> {level_actual}"
+                    );
+                }
                 let sign = br.read_bit()?;
                 // Standard MPEG-4 AC sign: bit 1 ⇒ negative.
                 let signed = if sign {
@@ -1072,7 +1094,7 @@ fn decode_escape_body(br: &mut BitReader<'_>, table: &AcVlcTable) -> Result<Toke
 
     // Tier 2 — run extension.
     if let (Some(_), Some(rmax)) = (table.lmax, table.rmax) {
-        match vlc::decode(br, table.entries)? {
+        match vlc::decode_named(br, table.entries, "ac esc tier-2 re-vlc")? {
             Symbol::RunLevel { last, run, level } => {
                 let last_idx = if last { 1 } else { 0 };
                 let level_idx = level as usize;
@@ -1083,6 +1105,12 @@ fn decode_escape_body(br: &mut BitReader<'_>, table: &AcVlcTable) -> Result<Toke
                 };
                 let run_actual_u16 = (run as u16).saturating_add(rmax_value).saturating_add(1);
                 let run_actual = run_actual_u16.min(u8::MAX as u16) as u8;
+                if trace {
+                    eprintln!(
+                        "[esc trace] tier-2 run-ext: last={last} base={run} \
+                         +rmax={rmax_value}+1 -> {run_actual} level={level}"
+                    );
+                }
                 let sign = br.read_bit()?;
                 // Standard MPEG-4 AC sign: bit 1 ⇒ negative.
                 let signed_level = if sign { -(level as i32) } else { level as i32 };
@@ -1103,6 +1131,9 @@ fn decode_escape_body(br: &mut BitReader<'_>, table: &AcVlcTable) -> Result<Toke
     let last = br.read_u32(table.esc_last_bits as u32)? != 0;
     let run = br.read_u32(table.esc_run_bits as u32)? as u8;
     let level_raw = br.read_i32(table.esc_level_bits as u32)?;
+    if trace {
+        eprintln!("[esc trace] tier-3 verbatim: last={last} run={run} level={level_raw}");
+    }
     // Level 0 after sign-extension is reserved / illegal per spec — a
     // decoder may flag it but for robustness we accept zero and treat
     // it as "no coefficient added" (caller loop bails on last=1).

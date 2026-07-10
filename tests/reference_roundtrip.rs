@@ -210,35 +210,32 @@ fn ffmpeg_generated_div3_decodes_to_video_frame() {
     match dec.send_packet(&pkt) {
         Ok(()) => {}
         Err(e) => {
-            // The decode can fail for several documented reasons:
-            //   * the AC placeholder triggers on a coded block
-            //     (intra-AC VLC is still OPEN per spec §9),
-            //   * the MCBPCY canonical-Huffman table uses a symbol
-            //     ordering that doesn't match the reference
-            //     encoder's (the `code_value` column of
-            //     `region_05eac8.csv` is not the Huffman bit-pattern
-            //     — it is a downstream state/LUT byte; our canonical
-            //     builder uses `(bit_length, symbol_index)` order).
-            //   * a subsequent VLC (DC-size, CBPY) peeks into bits
-            //     that MCBPCY already consumed with the wrong shape.
-            //
-            // All of these are pre-existing gaps flagged in the spec
-            // (OPEN items in §9). A failing decode that names the VLC
-            // path is the documented hand-off signal.
+            // The decode can fail for documented reasons: the fixture
+            // comes from a non-conformant reference encoder
+            // (`project_msmpeg4_ffmpeg_fixture_bug.md`), so a VLC in
+            // the DC/AC stage may legitimately refuse a codeword.
+            // Since the r405 wire-code landing, MCBPCY itself is a
+            // complete (Kraft = 1.0) prefix code and can no longer be
+            // the refusal site; `vlc::decode_named` labels whichever
+            // table actually refused, plus the bit position. A failing
+            // decode that names the VLC path is the documented
+            // hand-off signal.
             let msg = format!("{e}");
             assert!(
                 msg.contains("placeholder")
                     || msg.contains("AC")
                     || msg.contains("0x1c")
                     || msg.contains("vlc")
-                    || msg.contains("mcbpcy"),
+                    || msg.contains("mcbpcy")
+                    || msg.contains("intra-DC")
+                    || msg.contains("ac primary")
+                    || msg.contains("ac esc"),
                 "decode error should cite the bitstream-VLC gap; got: {msg}",
             );
             eprintln!(
                 "decode did not complete end-to-end: {msg}\n\
-                 (this is the next-step boundary: either the AC placeholder \
-                  or the MCBPCY canonical-Huffman ordering needs Extractor \
-                  confirmation before richer content rounds out.)"
+                 (this is the next-step boundary: the named VLC is where \
+                  real-content decode currently desyncs.)"
             );
             return;
         }

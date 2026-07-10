@@ -278,7 +278,7 @@ fn decode_mv_variant(
     mvdx_lut: &[u8; 1104],
     mvdy_lut: &[u8; 1104],
 ) -> Result<Mv> {
-    let idx = vlc::decode(br, vlc_table)? as usize;
+    let idx = vlc::decode_named(br, vlc_table, "v3 joint-mv")? as usize;
 
     let (raw_x, raw_y) = if idx == MV_V3_ESC_INDEX {
         // ESC: two 6-bit FLC reads (spec/06 §3.3).
@@ -494,7 +494,7 @@ fn v1v2_table() -> &'static [VlcEntry<u8>] {
 /// `[0, 32]` (the spec's off-by-2× — actually 0..=64; the bias subtraction
 /// `eax + ecx - 0x20` then yields a signed residual in `[-32, +32]`).
 pub fn decode_mvd_v1v2_raw(br: &mut BitReader<'_>) -> Result<u8> {
-    let raw = vlc::decode(br, v1v2_table())?;
+    let raw = vlc::decode_named(br, v1v2_table(), "v1/v2 mv component")?;
     if raw > 64 {
         return Err(Error::invalid(format!(
             "msmpeg4 v1/v2 mv: decoded raw idx {raw} > 64 (alphabet 0..=64)"

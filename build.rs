@@ -268,15 +268,17 @@ fn main() {
     // §3 / §4). Each source is `4 + 103 * 8` bytes:
     //   * `count: u32-LE = 103` (alphabet size including ESC)
     //   * 103 records of `(a:u32-LE, b:u32-LE)` where
-    //         a = code_value (state byte; not the canonical bit-pattern)
+    //         a = code (the literal DLL wire bit-pattern, MSB-first —
+    //             verified prefix-free; consumed verbatim by the
+    //             runtime `ac::build_g_primary`, same as MV / MCBPCY)
     //         b = bit_length (0..12 for G4/G5)
     //
-    // The canonical Huffman bit-pattern is reconstructed from the
-    // bit-length array alone (see `emit_packed_huffman_primary` below).
-    // Kraft sum over 103 bit-lengths = 1 - 2/1024 (one bl=9 codeword
-    // reserved for ESC); the ESC entry is at array index 102 with a
-    // valid bit_length, and decoders treat the recovered idx == 102 as
-    // ESC per spec/11 §7 item 4.
+    // Kraft sum over 103 bit-lengths = 1 - 2/1024: the single 9-bit
+    // slot `000000000` is left unassigned — the reserved ESC-marker
+    // prefix per spec/11 §7 item 4, which the runtime table builder
+    // adds as an extra Escape entry. The idx-102 entry additionally
+    // carries its own valid codeword and decodes as ESC per spec/15
+    // (`sym == count_A` ⇒ ESC).
     //
     // FROM: docs/video/msmpeg4/spec/11-walker-format-resolved.md §3-§4
     // FROM: reference/binaries/wmpcdcs8-2001/mpg4c32.dll @ file 0x58e38
