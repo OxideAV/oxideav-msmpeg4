@@ -59,12 +59,13 @@ rate control (virtual buffer + bounded re-encode trials; requested
 `examples/rate_curve.rs` sequence). Whole-curve: −2.9 %…−6.9 % bytes
 at equal-or-better PSNR (v3, q ∈ {2,4,8,16,31}).
 
-Caveat: for the one table whose wire codes are
-canonically *reconstructed* rather than binary-extracted (the v3
-128-entry joint MCBPCY, see the docs gap below) the encoder matches
-this crate's decoder by construction, and byte-exactness against the
-original binary remains exactly as unverified as on the decode side;
-every other table both directions consume is binary-extracted.
+As of round 405 every VLC both directions consume is binary-extracted
+wire codes — the last canonical reconstruction (the v3 128-entry joint
+MCBPCY) was retired when the `region_05eac8_mcbpcy` re-extraction
+landed (Kraft = 1.0; the old canonical assignment matched the real
+codes for 0 of 128 symbols). The v3 I-frame encoder also now emits the
+high-half joint symbol (`64 + cbp`), matching what real MS-encoded
+streams carry.
 
 | Piece                                          | Status     |
 | ---------------------------------------------- | ---------- |
@@ -75,7 +76,7 @@ every other table both directions consume is binary-extracted.
 | Quantiser dequantisation + DC scalers          | complete   |
 | CBPY + DC-size VLCs                             | complete   |
 | Intra MB header + DC differential decode       | complete   |
-| Joint MCBPCY VLC (v3, 128-entry canonical)     | complete (intra/inter partition corrected to patent polarity 0..63=intra, round 362) |
+| Joint MCBPCY VLC (v3, 128-entry, extracted wire codes) | complete (round 405: decodes the `region_05eac8_mcbpcy` re-extraction directly, Kraft=1.0; partition polarity 0..63=intra per round 362) |
 | DC spatial predictor + AC scan dispatcher      | complete   |
 | Intra MB pipeline (DC pred + IDCT + store)     | complete   |
 | G0..G5 canonical-Huffman primary AC VLC        | complete   |
@@ -99,30 +100,30 @@ every other table both directions consume is binary-extracted.
 
 ## What's still open for real-content decode
 
-- **V3 joint-MCBPCY wire codes (docs gap)**: round 356 corrected the v3
-  joint-MV VLC to decode against its actual extracted wire codes (spec/16
-  §1 / spec/12 §2 — the per-slot walker builder is fed literal `(code, bl)`
-  records, and the codes are NOT a textbook-canonical assignment). The
-  128-entry joint-MCBPCY table (`region_05eac8`) is still built via
-  canonical reconstruction, and its CSV `code` column is the *old*
-  mis-decoded extraction (32 of 128 entries have `code ≥ 2^bit_length`,
-  i.e. impossible as wire codes). To apply the same correctness fix to
-  MCBPCY, the docs need an Extractor-07-style re-extraction of
-  `region_05eac8` carrying the real MSB-first wire codes (a
-  `region_05eac8_mcbpcy.csv` with the `symbol_index,code_dec,code_bin,
-  bit_length` layout, Kraft 1.0). Until then MCBPCY stays canonical and
-  whether that matches the binary is unverified. Round 398 confirmed this
-  is *the* live real-content blocker: the `desc+0x1c/+0x20` binding once
-  suspected here is closed (`spec/14` §6 — static at construction; the
-  per-frame G-family selection is fully specified by `spec/14` §3.1), and
-  the picture-header parser is bit-exact on real v3 I-frames — it
-  recovers the exact `picture_type` + `PQUANT` from every
-  `docs/video/msmpeg4-fixtures/` fixture's trace summary across
-  q ∈ {2,6,8,16,31} (`tests/header_conformance.rs`). With the header
-  correct, the DIV3 176×144 fixture decodes ≈33–34 of 99 MBs before
-  desyncing with "no matching codeword" — the failure signature of a
-  subtly-wrong MCBPCY alphabet feeding spurious CBPY/AC into the block
-  loop, exactly what the `region_05eac8` re-extraction would fix.
+- **V3 real-content intra AC desync (the live blocker after round
+  405)**: the joint-MCBPCY docs gap is CLOSED — round 405 wired the
+  `region_05eac8_mcbpcy` re-extraction (provenance/22, Kraft = 1.0)
+  and the decoder consumes the real MSB-first wire codes directly.
+  Round 405 also covered the reserved G4/G5 9-bit ESC-marker codeword
+  (`000000000`, the Kraft 1 − 1/512 gap, spec/11 §7 item 4) after both
+  real Microsoft AVI fixtures refused decode exactly on it. Result on
+  the pinned real MS-encoded fixtures (`tests/microsoft_fixtures.rs`):
+  the first I-frame of div4.avi decodes 241 of 330 MBs, div3.avi 135
+  of 330, mp43.wmv 15 of 400, all ending in the spec/13 §3
+  scan-overflow guard (`scan_pos ≥ 64` inside an intra AC block walk)
+  — i.e. tokens decode plausibly but a subtle upstream desync
+  accumulates run values past 63. Every VLC en route is now
+  binary-extracted, so the remaining suspects are semantic: the
+  escape-tier chaining details (does the reserved 9-bit marker select
+  a specific tier rather than re-firing the chain? — spec/04 §2.3
+  documents markers only as "successive ESC re-fires"), the
+  `ac_pred`-driven scan selection on real content, or a per-block
+  condition the traced kernels gate on that the crate doesn't model.
+  **Docs ask:** trace the binary's handling of the reserved
+  `000000000` marker in the G4/G5 walkers (which tier body it enters,
+  and whether the idx-102 `0000011` codeword and the reserved marker
+  route differently), and extend the spec/13-style single-block trace
+  to a real Microsoft I-frame block that contains one.
 - **V3 4-MV-per-MB picture decode (hard docs gap #1895)**: the
   predictor / neighbour-resolver surface is complete and is exercised
   end-to-end on the v1 P-frame INTER4V path (`spec/16` §3.1, the real
