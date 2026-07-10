@@ -1,0 +1,35 @@
+# region_05eac8_mcbpcy.meta
+source_path: /home/magicaltux/projects/oxideav-workspace/docs/video/msmpeg4/reference/binaries/wmpcdcs8-2001/mpg4c32.dll
+source_sha256: aedb4cf3d33c8554ab8acf04afe2d936eaa7c49107c5fefe163bca2e94b3c099
+tool: python3 + struct.unpack (format located via `ud decompile`)
+method: u32 count header, then count*(u32 code LE, u32 bit_length LE).
+  Same packed-VLC loader as the MV VLC tables: VMA 0x1c25f6c8 is pushed
+  into the wrapper "load packed VLC" vtable method [eax+4] at the v3
+  decoder constructor sub_10b19 (VMA 0x1c210b19), alongside 0x1c25cbc0 /
+  0x1c25a0b8. symbol = record index (0..127); codes are MSB-first wire
+  codes. Consumed by the v3 joint-MCBPCY MB-header decoder 0x1c21782f
+  via descriptor slot [esi+0x8f8].
+kind: v3_joint_mcbpcy_vlc
+vma_start_hex: 0x1c25f6c8
+file_offset_start_hex: 0x05eac8
+file_offset_header_hex: 0x05eac8            # u32 count = 128
+file_offset_records_start_hex: 0x05eacc     # first (code,bit_length) pair
+file_offset_end_exclusive_hex: 0x05eecc     # 4 + 128*8 = 1028 bytes
+region_end_exclusive_hex: 0x05eed0          # +4 bytes 00000000 alignment/pad
+byte_length: 1028
+header_count: 128
+record_count: 128
+record_size_bytes: 8
+table_slice_sha256: 57f060e59cb4e6b5956244036ccbd7103972efbbd53e51a09c43b41e7c53222d
+region_slice_sha256: a63a1fe7c580b2358c1f7bc880a50e3b9a6f7e18cb4c841db8e3382811a5edbc
+kraft_sum: 1.000000   # 1.0 => complete prefix code
+bit_length_min: 2
+bit_length_max: 21
+codes_fit_length: true          # every code < 2^bit_length
+distinct_codewords: true        # no duplicate (bit_length,code) pairs
+role_note: joint MCBPCY (MB-type + CBPY), 128 entries; matches patent
+  6,563,953 Table 1 by entry count. Symbol->(MB-type,CBPY) decomposition
+  is decoder-body / Auditor territory, not encoded in the wire table.
+supersedes: region_05eac8.csv/.meta (suspect: mis-parsed field order +
+  header offset). See provenance/22.
+verdict: pass

@@ -1,28 +1,27 @@
 //! v3 joint MCBPCY (MB-type + coded-block-pattern) VLC decode.
 //!
 //! MSMPEG4 v3 replaces H.263's separate MCBPC + CBPY with a single
-//! 128-entry canonical-Huffman alphabet jointly coding MB-type and the
-//! 6-bit per-block CBP pattern (4 luma + 2 chroma).
+//! 128-entry Huffman alphabet jointly coding MB-type and the 6-bit
+//! per-block CBP pattern (4 luma + 2 chroma).
 //!
-//! * Source: `docs/video/msmpeg4/tables/region_05eac8.csv` — 128 records
-//!   of `(bit_length, code_value)` consumed by the decoder at
-//!   `0x1c21782f` through descriptor slot `[esi+0x8f8]`.
-//! * Provenance: `docs/video/msmpeg4/spec/99-current-understanding.md`
-//!   §3.1, §8.1 (the extractor CSV has a label-swap noted in the
-//!   `.meta` — bytes are correct, role labelling is the artefact).
-//! * Kraft sum over the 128 payload bit-lengths = 1 (spec/99 §3.1),
-//!   confirming a complete canonical prefix code.
-//! * Partition: `count_B = 64` splits the alphabet in two halves —
-//!   indices 0..63 are I-type MBs, 64..127 are P-type (spec/99 §3.1
-//!   "the 64 matches patent Table 1's I/P index split").
-//!
-//! The `code_value` column of the source CSV is **not** the
-//! bit-pattern of the Huffman code (values exceed `2^bit_length - 1`
-//! for most entries). It's a state / LUT byte consumed by the
-//! downstream walker (spec/04 §1.3 pri_B semantics, §4.4). Its exact
-//! role for the joint-MCBPCY table is not documented in the clean-room
-//! spec and we don't need it to recover the joint index — canonical
-//! Huffman codes are fully determined by the length array alone.
+//! * Source: `docs/video/msmpeg4/tables/region_05eac8_mcbpcy.csv` — 128
+//!   records of `(code, bit_length)` (Extractor 08, provenance/22)
+//!   loaded by the same packed-VLC loader as the MV tables (`[eax+4]`
+//!   in ctor `sub_10b19`) and consumed by the decoder at `0x1c21782f`
+//!   through descriptor slot `[esi+0x8f8]`.
+//! * Kraft sum over the 128 bit-lengths = exactly 1 (the `.meta`'s
+//!   `kraft_sum` field), confirming a complete prefix code.
+//! * The `code` column is the **actual DLL wire bit-pattern**
+//!   (MSB-first). It is NOT a textbook-canonical assignment: the
+//!   canonical reconstruction this crate used before the provenance/22
+//!   re-extraction matched the real wire codes for 0 of 128 symbols, so
+//!   the runtime decodes against the extracted codes directly — exactly
+//!   like the v3 joint-MV path (spec/16 §1, spec/12 §2).
+//! * Partition: indices 0..63 are I-type MBs, 64..127 are P-type. The
+//!   partition is not carried in the wire table (provenance/22: the
+//!   `(128, 64)` header reading was a mis-parse; the `64` is record 0's
+//!   code); it comes from patent US 6,563,953 Table 1 (`audit/02` §1.4)
+//!   corroborated by the binary's `test bl, 0x40` split (spec/05 §3.2).
 
 use oxideav_core::bits::{BitReader, BitWriter};
 use oxideav_core::{Error, Result};
@@ -33,48 +32,21 @@ use crate::tables_data::{
 };
 use crate::vlc::{self, VlcEntry};
 
-/// Canonical-Huffman VLC table built from `MCBPCY_V3_RAW` bit lengths.
-/// `value` = joint symbol index 0..127.
+/// v3 joint-MCBPCY VLC table built from the `MCBPCY_V3_RAW`
+/// `(bit_length, code)` records. `value` = joint symbol index 0..127.
 ///
-/// Build algorithm (canonical Huffman, MSB-first):
-///   1. Enumerate symbols in `(bit_length, symbol_index)` ascending order.
-///   2. Assign `code = 0` to the first symbol.
-///   3. For each subsequent symbol: `code = (code + 1) << (bl_cur - bl_prev)`.
+/// The `code` field is the extracted DLL wire bit-pattern (MSB-first,
+/// provenance/22) consumed **directly** — no canonical reconstruction.
+/// The table is a complete prefix code (Kraft = 1.0, validated at build
+/// time by `build.rs`), so a linear-scan decode is unambiguous.
 static MCBPCY_V3_TABLE: std::sync::OnceLock<Vec<VlcEntry<u8>>> = std::sync::OnceLock::new();
 
 fn build_table() -> Vec<VlcEntry<u8>> {
-    // Symbols whose bit_length is zero are "not present" — filter them out
-    // so they never match a decoder peek.
-    let mut symbols: Vec<(u32, u8)> = MCBPCY_V3_RAW
+    MCBPCY_V3_RAW
         .iter()
         .enumerate()
-        .filter_map(
-            |(idx, &(bl, _code))| {
-                if bl == 0 {
-                    None
-                } else {
-                    Some((bl, idx as u8))
-                }
-            },
-        )
-        .collect();
-
-    // Canonical order: primary key = bit_length ascending, secondary = symbol index.
-    symbols.sort_by_key(|&(bl, idx)| (bl, idx));
-
-    let mut entries: Vec<VlcEntry<u8>> = Vec::with_capacity(symbols.len());
-    let mut code: u32 = 0;
-    let mut prev_bl: u32 = 0;
-    for (i, &(bl, idx)) in symbols.iter().enumerate() {
-        if i == 0 {
-            code = 0;
-        } else {
-            code = (code + 1) << (bl - prev_bl);
-        }
-        entries.push(VlcEntry::new(bl as u8, code, idx));
-        prev_bl = bl;
-    }
-    entries
+        .map(|(idx, &(bl, code))| VlcEntry::new(bl as u8, code, idx as u8))
+        .collect()
 }
 
 fn table() -> &'static [VlcEntry<u8>] {
@@ -147,7 +119,7 @@ impl McbpcyDecode {
 }
 
 /// Decode one MCBPCY joint symbol from the bit stream using the v3
-/// 128-entry canonical-Huffman table, and split the resulting index
+/// 128-entry extracted wire-code table, and split the resulting index
 /// into the (MB-type, 6-bit CBP) components.
 ///
 /// Per `docs/video/msmpeg4/spec/05-ab0-resolution.md` §3.2 and patent
@@ -162,6 +134,9 @@ impl McbpcyDecode {
 /// order the spec lists the storage offsets `[esi+0x14..+0x28]`.)
 pub fn decode_mcbpcy(br: &mut BitReader<'_>) -> Result<McbpcyDecode> {
     let idx = vlc::decode(br, table())?;
+    if std::env::var_os("OXIDEAV_MSMPEG4_AC_TRACE").is_some() {
+        eprintln!("[mcbpcy trace] idx={idx} bit_pos={}", br.bit_position());
+    }
     if idx as usize >= MCBPCY_V3_RAW.len() {
         return Err(Error::invalid(format!(
             "msmpeg4v3 mcbpcy: decoded index {idx} >= alphabet 128"
@@ -190,12 +165,11 @@ pub fn decode_mcbpcy(br: &mut BitReader<'_>) -> Result<McbpcyDecode> {
 /// US 6,563,953 Table 1 / `audit/02` §1.4 — an I-frame or intra-in-P
 /// MB uses `idx = cbp` (0..=63), an inter MB uses `idx = 64 + cbp`.
 ///
-/// The codeword written is the same canonical-Huffman assignment the
-/// decoder's table builder reconstructs from the `region_05eac8`
-/// bit-length array (spec/99 §3.1), so encode → decode round-trips by
-/// construction. (Whether that canonical assignment matches the
-/// original binary's wire codes is the open MCBPCY re-extraction item
-/// documented in the README; the encoder targets this crate's decoder.)
+/// The codeword written is the extracted DLL wire bit-pattern from
+/// `region_05eac8_mcbpcy.csv` (provenance/22), so encode → decode
+/// round-trips by construction AND the emitted bits are the original
+/// binary's own codes — the former canonical-reconstruction caveat is
+/// closed by the Extractor-08 re-extraction.
 pub fn encode_mcbpcy(bw: &mut BitWriter, idx: u8) -> Result<()> {
     if idx as usize >= MCBPCY_V3_RAW.len() {
         return Err(Error::invalid(format!(
@@ -623,18 +597,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn canonical_table_has_128_entries() {
-        // All 128 symbols have non-zero bit_length per spec/99 §3.1
-        // ("Kraft's sum is exactly 1 over the 128 payload bit-lengths").
+    fn wire_table_has_128_entries() {
+        // All 128 symbols carry a codeword (Kraft sum over the extracted
+        // bit-lengths is exactly 1 per the _mcbpcy.meta / provenance/22).
         let t = table();
         assert_eq!(t.len(), 128);
     }
 
     #[test]
-    fn canonical_codes_respect_kraft() {
-        // If the canonical builder is correct, no two entries share a
-        // prefix — a runtime decode can't be ambiguous. Verify by
-        // checking that shorter codes are never prefixes of longer ones.
+    fn wire_codes_are_prefix_free() {
+        // The extracted wire codes must form a prefix-free set — a
+        // runtime decode can't be ambiguous. Verify by checking that
+        // shorter codes are never prefixes of longer ones.
         let t = table();
         for (i, a) in t.iter().enumerate() {
             for (j, b) in t.iter().enumerate() {
@@ -647,7 +621,7 @@ mod tests {
                 assert_ne!(
                     long_prefix,
                     short.code,
-                    "canonical Huffman: {:0width$b} is a prefix of {:0longw$b} (syms {}, {})",
+                    "wire codes: {:0width$b} is a prefix of {:0longw$b} (syms {}, {})",
                     short.code,
                     long.code,
                     short.value,
@@ -660,7 +634,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_round_trip_per_symbol() {
+    fn wire_code_round_trip_per_symbol() {
         // Every symbol should round-trip: re-pack its code, decode back.
         let t = table();
         for e in t {
@@ -713,7 +687,7 @@ mod tests {
     fn v3_mcbpcy_partition_low_half_is_intra() {
         // Patent US 6,563,953 Table 1 (audit/02 §1.4): joint-MCBPCY
         // indices 0..63 are MB type = I (intra), 64..127 are MB type = P
-        // (inter). Decode every symbol via the canonical round-trip and
+        // (inter). Decode every symbol via the wire-code round-trip and
         // assert `is_intra` is exactly the low-half membership. This pins
         // the partition polarity so a future regression cannot silently
         // re-invert it (the pre-correction code had `is_intra = idx >=
@@ -724,7 +698,7 @@ mod tests {
         let mut saw_intra = false;
         let mut saw_inter = false;
         for e in t {
-            // Same byte-packing as `canonical_round_trip_per_symbol`.
+            // Same byte-packing as `wire_code_round_trip_per_symbol`.
             let mut acc: u64 = 0;
             let mut bits: u32 = 0;
             acc = (acc << e.bits) | (e.code as u64);

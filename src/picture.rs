@@ -1562,6 +1562,16 @@ fn write_block_to_picture(
 mod tests {
     use super::*;
 
+    /// `(bit_length, code)` wire codeword for a joint-MCBPCY symbol,
+    /// read straight from the extracted table
+    /// (`region_05eac8_mcbpcy.csv`, provenance/22). The codes are the
+    /// DLL's own MSB-first wire patterns and the runtime decodes them
+    /// directly, so handcrafted bitstreams pack them directly too —
+    /// no canonical reconstruction anywhere.
+    fn mcbpcy_wire(idx: u8) -> (u32, u32) {
+        crate::tables_data::MCBPCY_V3_RAW[idx as usize]
+    }
+
     #[test]
     fn dims_validate_range() {
         assert!(PictureDims::new(0, 480).is_err());
@@ -1588,13 +1598,13 @@ mod tests {
 
     /// Hand-crafted 32×32 I-frame that exercises the full DC-spatial-
     /// predictor + MCBPCY + scan dispatch pipeline end-to-end. No AC —
-    /// every MB's MCBPCY symbol is sym idx 64 (bl=2, code `00`,
-    /// CBP=`000000`), so no block has coded AC and the decoder's
-    /// AC-placeholder path is not exercised.
+    /// every MB's MCBPCY symbol is sym idx 0 (intra half, CBP=`000000`),
+    /// so no block has coded AC and the decoder's AC-placeholder path is
+    /// not exercised.
     ///
     /// What this verifies:
     /// * `IntraMbHeader::parse_v3_mcbpcy` correctly decodes the
-    ///   joint-MCBPCY canonical-Huffman table and reads the
+    ///   joint-MCBPCY VLC (extracted wire codes) and reads the
     ///   post-VLC `ac_pred_flag`.
     /// * `DcCache` and `predict_dc` produce a spatial-gradient DC
     ///   predictor per MPEG-4 §7.4.3 for every block.
@@ -1636,17 +1646,21 @@ mod tests {
             (0, 1), // ac_luma_sel = 0
             (0, 1), // dc_size_sel = 0
         ];
-        // For each of 2x2 MBs: MCBPCY sym 64 (code `00`, bl=2), ac_pred=0,
-        // then 6 DC-size-0 codes (luma `011`, chroma `11`).
+        // For each of 2x2 MBs: MCBPCY sym 0 (intra half, CBP=0) wire
+        // code, ac_pred=0, then 6 zero DC differentials through the v3
+        // direct-value DC VLC (dc_size_sel=0): luma symbol 0 = `1`
+        // (region_05f0d8, bl=1), chroma symbol 0 = `10` (region_05f868,
+        // bl=2); symbol 0 carries no sign bit (spec/07 §5.2).
+        let (mc_bl, mc_code) = mcbpcy_wire(0);
         for _ in 0..4 {
-            fields.push((0b00, 2)); // MCBPCY sym 64
+            fields.push((mc_code, mc_bl)); // MCBPCY sym 0 (intra, CBP=0)
             fields.push((0, 1)); // ac_pred = 0
-            fields.push((0b011, 3)); // luma DC size 0 (Y0)
-            fields.push((0b011, 3)); // Y1
-            fields.push((0b011, 3)); // Y2
-            fields.push((0b011, 3)); // Y3
-            fields.push((0b11, 2)); // chroma DC size 0 (Cb)
-            fields.push((0b11, 2)); // Cr
+            fields.push((0b1, 1)); // luma DC diff 0 (Y0)
+            fields.push((0b1, 1)); // Y1
+            fields.push((0b1, 1)); // Y2
+            fields.push((0b1, 1)); // Y3
+            fields.push((0b10, 2)); // chroma DC diff 0 (Cb)
+            fields.push((0b10, 2)); // Cr
         }
         // Tail padding.
         fields.push((0, 32));
@@ -1710,18 +1724,21 @@ mod tests {
 
         // Picture header: I-frame q=8.
         let mut fields: Vec<(u32, u32)> = vec![(0, 2), (8, 5), (0, 1), (0, 1), (0, 1)];
-        // 16×16 → one MB. MCBPCY sym 64 → CBP=0. ac_pred=0.
-        // Then for each of 6 blocks: DC size 1 = luma `11` / chroma `10`;
-        // DC mag bit = 1 (positive diff = +1 level).
-        fields.push((0b00, 2));
+        // 16×16 → one MB. MCBPCY sym 0 (intra half) → CBP=0. ac_pred=0.
+        // Then for each of 6 blocks a +1 DC differential through the v3
+        // direct-value DC VLC (dc_size_sel=0): luma symbol 1 = `01`
+        // (region_05f0d8), chroma symbol 1 = `11` (region_05f868), each
+        // followed by sign bit 1 (set ⇒ positive per spec/07 §5.2).
+        let (mc_bl, mc_code) = mcbpcy_wire(0);
+        fields.push((mc_code, mc_bl));
         fields.push((0, 1));
         for _ in 0..4 {
-            fields.push((0b11, 2)); // luma size 1
-            fields.push((1, 1)); // +1
+            fields.push((0b01, 2)); // luma DC diff magnitude 1
+            fields.push((1, 1)); // sign: +
         }
         for _ in 0..2 {
-            fields.push((0b10, 2)); // chroma size 1
-            fields.push((1, 1)); // +1
+            fields.push((0b11, 2)); // chroma DC diff magnitude 1
+            fields.push((1, 1)); // sign: +
         }
         fields.push((0, 32));
         let bytes = pack(&fields);
@@ -1745,8 +1762,13 @@ mod tests {
         let tl = pic.y[0] as i32;
         let br_y = pic.y[pic.y.len() - 1] as i32;
         assert!(
-            br_y >= tl,
-            "expected monotone DC propagation (tl={tl}, br={br_y})"
+            (129..=131).contains(&tl),
+            "top-left block DC should decode to ~130/pel (got {tl})"
+        );
+        assert!(
+            br_y > tl,
+            "expected strictly increasing DC propagation into the \
+             bottom-right block (tl={tl}, br={br_y})"
         );
     }
 
@@ -1815,36 +1837,11 @@ mod tests {
         // Per `decode_mcbpcy`, intra is the LOW half (idx < 64, patent
         // Table 1 I-type entries — audit/02 §1.4) and CBP = idx & 0x3f.
         // We want CBP = 0x3f in the intra (low) half, so target idx =
-        // 0x3f = 63. Find that entry's canonical code. (This is an
-        // I-frame, so the intra/inter partition only governs the CBP
-        // value here; the I-frame path treats every MB as intra.)
-        let mut syms: Vec<(u32, u8)> = crate::tables_data::MCBPCY_V3_RAW
-            .iter()
-            .enumerate()
-            .filter_map(|(i, &(bl, _))| if bl == 0 { None } else { Some((bl, i as u8)) })
-            .collect();
-        syms.sort_by_key(|&(bl, idx)| (bl, idx));
-        let mut mc_code = 0u32;
-        let mut prev_bl = 0u32;
-        let mut mc_bl = 0u32;
-        let mut mc_found = false;
-        for (i, &(bl, idx)) in syms.iter().enumerate() {
-            if i == 0 {
-                mc_code = 0;
-            } else {
-                mc_code = (mc_code + 1) << (bl - prev_bl);
-            }
-            prev_bl = bl;
-            if idx == 63 {
-                mc_bl = bl;
-                mc_found = true;
-                break;
-            }
-        }
-        assert!(
-            mc_found,
-            "MCBPCY table must contain idx 63 (all-coded intra, low half)"
-        );
+        // 0x3f = 63. Its wire code comes straight from the extracted
+        // table. (This is an I-frame, so the intra/inter partition only
+        // governs the CBP value here; the I-frame path treats every MB
+        // as intra.)
+        let (mc_bl, mc_code) = mcbpcy_wire(63);
 
         // Picture header: I-frame, q=8, all selectors default (0).
         let mut fields: Vec<(u32, u32)> = vec![(0, 2), (8, 5), (0, 1), (0, 1), (0, 1)];
@@ -2052,38 +2049,13 @@ mod tests {
         }
 
         // Reuse the inter-MB MCBPCY symbol-0 build from
-        // `handcrafted_inter_mb_copies_reference` — the canonical
-        // MCBPCY code for the first inter (P-type) symbol with CBP = 0.
-        // The 128-entry joint alphabet partitions at 64: 0..63 are I-type
+        // `handcrafted_inter_mb_copies_reference` — the extracted wire
+        // code for the first inter (P-type) symbol with CBP = 0. The
+        // 128-entry joint alphabet partitions at 64: 0..63 are I-type
         // (intra), 64..127 are P-type (inter) per patent Table 1
         // (audit/02 §1.4), so an inter MB with no coded blocks is idx 64
         // (CBP = 64 & 0x3f = 0).
-        let t_mcbpcy = {
-            let mut syms: Vec<(u32, u8)> = crate::tables_data::MCBPCY_V3_RAW
-                .iter()
-                .enumerate()
-                .filter_map(|(i, &(bl, _))| if bl == 0 { None } else { Some((bl, i as u8)) })
-                .collect();
-            syms.sort_by_key(|&(bl, idx)| (bl, idx));
-            let mut entries: Vec<(u8, u32, u8)> = Vec::new();
-            let mut code: u32 = 0;
-            let mut prev_bl: u32 = 0;
-            for (i, &(bl, idx)) in syms.iter().enumerate() {
-                if i == 0 {
-                    code = 0;
-                } else {
-                    code = (code + 1) << (bl - prev_bl);
-                }
-                entries.push((bl as u8, code, idx));
-                prev_bl = bl;
-            }
-            entries
-        };
-        let (bl_inter, code_inter) = t_mcbpcy
-            .iter()
-            .find(|(_, _, sym)| *sym == 64)
-            .map(|(bl, code, _)| (*bl as u32, *code))
-            .expect("inter symbol 64 in canonical MCBPCY");
+        let (bl_inter, code_inter) = mcbpcy_wire(64);
 
         // Alternate MV VLC symbol 0 canonical code is the 2-bit `00`
         // (the shortest code; alt bit-lengths start at 2). Encoding two
@@ -2179,36 +2151,11 @@ mod tests {
             out
         }
 
-        // Canonical MCBPCY inter-symbol (P-type, CBP = 0) build — same
-        // helper shape as the surrounding hand-crafted tests. An inter MB
+        // Extracted MCBPCY inter-symbol wire code (P-type, CBP = 0) —
+        // same lookup as the surrounding hand-crafted tests. An inter MB
         // with no coded blocks is idx 64 (the first P-type entry; 0..63
         // are I-type / intra per patent Table 1, audit/02 §1.4).
-        let t_mcbpcy = {
-            let mut syms: Vec<(u32, u8)> = crate::tables_data::MCBPCY_V3_RAW
-                .iter()
-                .enumerate()
-                .filter_map(|(i, &(bl, _))| if bl == 0 { None } else { Some((bl, i as u8)) })
-                .collect();
-            syms.sort_by_key(|&(bl, idx)| (bl, idx));
-            let mut entries: Vec<(u8, u32, u8)> = Vec::new();
-            let mut code: u32 = 0;
-            let mut prev_bl: u32 = 0;
-            for (i, &(bl, idx)) in syms.iter().enumerate() {
-                if i == 0 {
-                    code = 0;
-                } else {
-                    code = (code + 1) << (bl - prev_bl);
-                }
-                entries.push((bl as u8, code, idx));
-                prev_bl = bl;
-            }
-            entries
-        };
-        let (bl_inter, code_inter) = t_mcbpcy
-            .iter()
-            .find(|(_, _, sym)| *sym == 64)
-            .map(|(bl, code, _)| (*bl as u32, *code))
-            .expect("inter symbol 64 in canonical MCBPCY");
+        let (bl_inter, code_inter) = mcbpcy_wire(64);
 
         // The alternate VLC must really map this wire pattern to symbol 36
         // and the alternate byte LUTs must give the (+4, 0) half-pel MV.
@@ -2356,49 +2303,12 @@ mod tests {
             reference.y[i] = (i % 211) as u8;
         }
 
-        // MCBPCY joint idx 0 has low-6-bits = 0 (CBP=0, no coded blocks)
-        // and bit-6 = 0 → inter MB. Its canonical code is the first
-        // entry in canonical order. Per spec/99 §3.1 the first
-        // canonical entry is symbol 0 (bit 1, all-zero CBP, skip/no-ac).
-        //
-        // The canonical MCBPCY table is built in mcbpcy.rs and the
-        // smallest bit_length is 2 per the region_05eac8 extract
-        // (row 0 = (bl=7, code=5065) but that's the first *in CSV
-        // order*, not the first canonical). The minimum bit-length
-        // actually observed is 2 (two entries), and the first
-        // canonical code is 0b00.
-        //
-        // For this test we bypass that uncertainty by using the
-        // mcbpcy module directly to find what code goes with idx 0.
-        let t_mcbpcy = {
-            // Helper mirroring the canonical build in mcbpcy.rs.
-            let mut syms: Vec<(u32, u8)> = crate::tables_data::MCBPCY_V3_RAW
-                .iter()
-                .enumerate()
-                .filter_map(|(i, &(bl, _))| if bl == 0 { None } else { Some((bl, i as u8)) })
-                .collect();
-            syms.sort_by_key(|&(bl, idx)| (bl, idx));
-            let mut entries: Vec<(u8, u32, u8)> = Vec::new();
-            let mut code: u32 = 0;
-            let mut prev_bl: u32 = 0;
-            for (i, &(bl, idx)) in syms.iter().enumerate() {
-                if i == 0 {
-                    code = 0;
-                } else {
-                    code = (code + 1) << (bl - prev_bl);
-                }
-                entries.push((bl as u8, code, idx));
-                prev_bl = bl;
-            }
-            entries
-        };
-        // Find the first inter (P-type) entry with CBP=0 — idx 64. The
+        // The first inter (P-type) entry with CBP=0 is idx 64. The
         // 0..63 half is I-type / intra (patent Table 1, audit/02 §1.4).
-        let (bl_inter, code_inter) = t_mcbpcy
-            .iter()
-            .find(|(_, _, sym)| *sym == 64)
-            .map(|(bl, code, _)| (*bl as u32, *code))
-            .expect("inter symbol 64 in canonical MCBPCY");
+        // Its wire code comes straight from the extracted table
+        // (provenance/22) — the runtime decodes the DLL's own MSB-first
+        // codes directly, no canonical reconstruction.
+        let (bl_inter, code_inter) = mcbpcy_wire(64);
 
         // MV VLC symbol 0 → MVDx/MVDy raw = 0x20 = 32. Pred (0,0),
         // 32 - 32 = 0 → MV output = (0, 0). The default joint-MV table's
@@ -2473,40 +2383,13 @@ mod tests {
             out
         }
 
-        // Canonical MCBPCY table (mirrors mcbpcy.rs).
-        let t_mcbpcy = {
-            let mut syms: Vec<(u32, u8)> = crate::tables_data::MCBPCY_V3_RAW
-                .iter()
-                .enumerate()
-                .filter_map(|(i, &(bl, _))| if bl == 0 { None } else { Some((bl, i as u8)) })
-                .collect();
-            syms.sort_by_key(|&(bl, idx)| (bl, idx));
-            let mut entries: Vec<(u8, u32, u8)> = Vec::new();
-            let mut code: u32 = 0;
-            let mut prev_bl: u32 = 0;
-            for (i, &(bl, idx)) in syms.iter().enumerate() {
-                if i == 0 {
-                    code = 0;
-                } else {
-                    code = (code + 1) << (bl - prev_bl);
-                }
-                entries.push((bl as u8, code, idx));
-                prev_bl = bl;
-            }
-            entries
-        };
-
         // We want an inter MB (P-type half, idx >= 64) with luma block 0
         // coded: cbpy bit 3 set ⇒ cbpy = 0b1000 = 8 ⇒ pattern = 8 << 2
         // = 32 ⇒ idx = 64 + 32 = 96 (chroma + Y1..Y3 uncoded). The 0..63
         // half is I-type / intra per patent Table 1 (audit/02 §1.4), so
-        // an inter MB lives at idx 64..127. Find its canonical code.
-        let target_idx: u8 = 96;
-        let (bl_mb, code_mb) = t_mcbpcy
-            .iter()
-            .find(|(_, _, sym)| *sym == target_idx)
-            .map(|(bl, code, _)| (*bl as u32, *code))
-            .expect("MCBPCY symbol 96 (inter, Y0-coded) in canonical table");
+        // an inter MB lives at idx 64..127. Its wire code comes straight
+        // from the extracted table.
+        let (bl_mb, code_mb) = mcbpcy_wire(96);
 
         // G4 inter residual: pick the shortest sub-class-B (last=1)
         // terminator. The single token writes its level at zigzag
@@ -2926,34 +2809,11 @@ mod tests {
             out
         }
 
-        // Canonical MCBPCY code for the first inter (P-type) symbol with
-        // CBP=0 — idx 64. The 0..63 half is I-type / intra (patent Table
-        // 1, audit/02 §1.4), so an inter MB with no coded blocks is idx
-        // 64. Mirrors the build in `mcbpcy.rs` (and the other P-frame
-        // inter tests above).
-        let (bl_mcbpcy_inter, code_mcbpcy_inter) = {
-            let mut syms: Vec<(u32, u8)> = crate::tables_data::MCBPCY_V3_RAW
-                .iter()
-                .enumerate()
-                .filter_map(|(i, &(bl, _))| if bl == 0 { None } else { Some((bl, i as u8)) })
-                .collect();
-            syms.sort_by_key(|&(bl, idx)| (bl, idx));
-            let mut code: u32 = 0;
-            let mut prev_bl: u32 = 0;
-            let mut found = None;
-            for (i, &(bl, idx)) in syms.iter().enumerate() {
-                if i == 0 {
-                    code = 0;
-                } else {
-                    code = (code + 1) << (bl - prev_bl);
-                }
-                if idx == 64 {
-                    found = Some((bl, code));
-                }
-                prev_bl = bl;
-            }
-            found.expect("inter symbol 64 in canonical MCBPCY")
-        };
+        // Extracted MCBPCY wire code for the first inter (P-type) symbol
+        // with CBP=0 — idx 64. The 0..63 half is I-type / intra (patent
+        // Table 1, audit/02 §1.4), so an inter MB with no coded blocks
+        // is idx 64.
+        let (bl_mcbpcy_inter, code_mcbpcy_inter) = mcbpcy_wire(64);
 
         // Joint-MV wire codes are the extracted `(bit_length, code)` pairs
         // (spec/16 §1), read straight from MV_V3_RAW. Pick the first
@@ -3100,34 +2960,11 @@ mod tests {
             out
         }
 
-        // Canonical MCBPCY codes for (a) the first intra symbol idx 0
-        // (low/intra half, CBP=0) and (b) the first inter symbol idx 64
-        // (P-type half, CBP=0). Mirrors the build in `mcbpcy.rs`.
-        let mcbpcy_code = |target: u8| -> (u32, u32) {
-            let mut syms: Vec<(u32, u8)> = crate::tables_data::MCBPCY_V3_RAW
-                .iter()
-                .enumerate()
-                .filter_map(|(i, &(bl, _))| if bl == 0 { None } else { Some((bl, i as u8)) })
-                .collect();
-            syms.sort_by_key(|&(bl, idx)| (bl, idx));
-            let mut code: u32 = 0;
-            let mut prev_bl: u32 = 0;
-            let mut found = None;
-            for (i, &(bl, idx)) in syms.iter().enumerate() {
-                if i == 0 {
-                    code = 0;
-                } else {
-                    code = (code + 1) << (bl - prev_bl);
-                }
-                if idx == target {
-                    found = Some((code, bl));
-                }
-                prev_bl = bl;
-            }
-            found.expect("symbol in canonical MCBPCY")
-        };
-        let (code_intra, bl_intra) = mcbpcy_code(0); // intra, CBP=0
-        let (code_inter, bl_inter) = mcbpcy_code(64); // inter, CBP=0
+        // Extracted MCBPCY wire codes for (a) the first intra symbol
+        // idx 0 (low/intra half, CBP=0) and (b) the first inter symbol
+        // idx 64 (P-type half, CBP=0).
+        let (bl_intra, code_intra) = mcbpcy_wire(0); // intra, CBP=0
+        let (bl_inter, code_inter) = mcbpcy_wire(64); // inter, CBP=0
 
         // Pick a non-zero even (integer-pixel) joint-MV symbol — same
         // selection rule as `pframe_median_predictor_propagates_neighbour_mv`,

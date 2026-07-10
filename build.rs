@@ -7,8 +7,13 @@
 //!
 //! Tables emitted (all under `$OUT_DIR/`, included via `src/tables_data.rs`):
 //!
-//! * `mcbpcy_v3.rs` — v3 joint-MCBPCY VLC source (`region_05eac8.csv`,
-//!   spec/99 §3.1 / §8.1). 128 `(bit_length, code_value)` pairs.
+//! * `mcbpcy_v3.rs` — v3 joint-MCBPCY VLC source
+//!   (`region_05eac8_mcbpcy.csv`, spec/99 §3.1 / §8.1 / provenance/22).
+//!   128 `(bit_length, code)` pairs indexed by symbol; `code` is the
+//!   actual DLL wire bit-pattern (MSB-first), a complete prefix code
+//!   (Kraft = 1.0) but NOT a textbook-canonical assignment. Supersedes
+//!   the retired `region_05eac8.csv` (a 4-byte-phase mis-parse whose
+//!   bit-lengths were correct but whose codes were unusable).
 //! * `mv_v3.rs` / `mv_v3_alt.rs` — v3 joint (X, Y) MV VLC source,
 //!   default (`region_05bfc0_mvvlc.csv`, VMA `0x1c25cbc0`) and alternate
 //!   (`region_0594b8_mvvlc.csv`, VMA `0x1c25a0b8`) variants, per spec/16
@@ -34,16 +39,18 @@
 //!   constructor (`AcVlcTable::v3_intra_candidate`) so callers opt in
 //!   explicitly.
 //!
-//! Some older CSVs (MCBPCY, intra-AC candidate) have a historically
+//! One older CSV (the intra-AC candidate) has a historically
 //! mis-labelled column naming where `symbol_dec` holds the `bit_length`
 //! and `bit_length` holds the `code_value`; see
 //! `docs/video/msmpeg4/spec/99-current-understanding.md` §8.1 for the
-//! provenance chain. For those, canonical-Huffman codes are derived from
-//! the `bit_length` array. The Extractor-07 `_mvvlc.csv` re-extractions
-//! use the cleaner `symbol_index,file_offset_hex,code_dec,code_bin,
-//! bit_length` layout and their `code_dec` IS consumed: spec/12 §2 shows
-//! the per-slot walker builder is fed the actual `(code, bl)` records,
-//! and the codes are not a textbook-canonical assignment.
+//! provenance chain. For that one, canonical-Huffman codes are derived
+//! from the `bit_length` array. The Extractor re-extractions (`_mvvlc`
+//! per spec/16 §1 / Extractor 07, `_mcbpcy` per provenance/22 /
+//! Extractor 08) use the cleaner `symbol_index,file_offset_hex,
+//! code_dec,code_bin,bit_length` layout and their `code_dec` IS
+//! consumed: spec/12 §2 shows the per-slot walker builder is fed the
+//! actual `(code, bl)` records, and the codes are not a
+//! textbook-canonical assignment.
 
 use std::env;
 use std::fs;
@@ -111,8 +118,18 @@ fn main() {
     // `emit_g_descriptor_cluster`).
     emit_g_counts_spec15(&out_dir.join("g_counts.rs"));
 
-    // MCBPCY table — 05eac8.
-    let mcbpcy_csv = tables_dir.join("region_05eac8.csv");
+    // v3 joint-MCBPCY VLC — region_05eac8_mcbpcy.csv (VMA 0x1c25f6c8,
+    // file 0x5eac8). The Extractor-08 re-extraction (provenance/22)
+    // supersedes the earlier `region_05eac8.csv`, which mis-parsed the
+    // region at the wrong 4-byte phase (header eaten as a record +
+    // swapped fields): its bit-lengths happened to line up per symbol
+    // (hence Kraft=1 held) but its code column was unusable, forcing a
+    // canonical reconstruction that matched the real wire codes for 0 of
+    // 128 symbols. The corrected CSV carries the real DLL-internal
+    // MSB-first wire codes consumed by the same packed-VLC loader as the
+    // MV tables ([eax+4] in ctor sub_10b19), so the runtime decodes
+    // against `code_dec` directly.
+    let mcbpcy_csv = tables_dir.join("region_05eac8_mcbpcy.csv");
     println!("cargo:rerun-if-changed={}", mcbpcy_csv.display());
     emit_mcbpcy_v3(&mcbpcy_csv, &out_dir.join("mcbpcy_v3.rs"));
 
@@ -895,13 +912,38 @@ fn emit_dc_size_v1v2(
     writeln!(f, "];").unwrap();
 }
 
-/// Parse `region_05eac8.csv` and emit a Rust file with the raw
-/// `(bit_length, code_value)` pairs and the header fields.
+/// Parse the Extractor-08 `region_05eac8_mcbpcy.csv` (columns
+/// `symbol_index,file_offset_hex,code_dec,code_bin,bit_length`, 128 data
+/// rows for symbols 0..=127) and emit the v3 joint-MCBPCY VLC as raw
+/// `(bit_length, code)` pairs indexed by symbol.
+///
+/// The `code` is the **actual DLL-internal wire bit-pattern**
+/// (MSB-first) loaded by the same packed-VLC loader as the MV tables
+/// (`[eax+4]` in ctor `sub_10b19`, per provenance/22) and consumed by
+/// the v3 joint-MCBPCY MB-header decoder `0x1c21782f` via descriptor
+/// slot `[esi+0x8f8]`. It is a complete prefix code (Kraft = 1.0) but
+/// NOT the textbook-canonical assignment — the canonical reconstruction
+/// the crate previously used matched the real wire codes for 0 of 128
+/// symbols — so the runtime decodes against this `code` directly,
+/// exactly like the v3 joint-MV path (spec/16 §1, spec/12 §2).
+///
+/// The alphabet partition (indices 0..63 = I-type/intra MBs, 64..127 =
+/// P-type/inter) is NOT carried in the wire table; it comes from patent
+/// US 6,563,953 Table 1 (`audit/02` §1.4) corroborated by the binary's
+/// `test bl, 0x40` split (spec/05 §3.2), and is emitted here as the
+/// `MCBPCY_V3_PARTITION` constant.
+///
+/// Provenance: `region_05eac8_mcbpcy.csv` (VMA 0x1c25f6c8, file
+/// 0x5eac8), extracted from `mpg4c32.dll` (SHA-256 `aedb4cf3...b3c099`)
+/// per provenance/22 (Extractor 08). The predecessor
+/// `region_05eac8.csv` is retired: it read the region at the wrong
+/// 4-byte phase (header eaten as a record + swapped fields).
 fn emit_mcbpcy_v3(csv_path: &Path, out_path: &Path) {
     let text = fs::read_to_string(csv_path)
         .unwrap_or_else(|e| panic!("failed to read {}: {e}", csv_path.display()));
 
-    let mut records: Vec<(u32, u32)> = Vec::with_capacity(129);
+    // Records indexed by symbol_index; collected as (idx, bit_length, code).
+    let mut records: Vec<(u32, u32, u32)> = Vec::with_capacity(128);
     for (line_no, line) in text.lines().enumerate() {
         if line_no == 0 {
             // Skip CSV column header.
@@ -915,35 +957,95 @@ fn emit_mcbpcy_v3(csv_path: &Path, out_path: &Path) {
         if parts.len() < 5 {
             panic!("malformed row at line {}: {line}", line_no + 1);
         }
-        let bit_length: u32 = parts[3]
+        let idx: u32 = parts[0]
             .parse()
-            .unwrap_or_else(|_| panic!("bad bit_length at line {}: {}", line_no + 1, parts[3]));
-        let code_value: u32 = parts[4]
+            .unwrap_or_else(|_| panic!("bad symbol_index at line {}: {}", line_no + 1, parts[0]));
+        let code: u32 = parts[2]
             .parse()
-            .unwrap_or_else(|_| panic!("bad code_value at line {}: {}", line_no + 1, parts[4]));
-        records.push((bit_length, code_value));
+            .unwrap_or_else(|_| panic!("bad code_dec at line {}: {}", line_no + 1, parts[2]));
+        let bit_length: u32 = parts[4]
+            .parse()
+            .unwrap_or_else(|_| panic!("bad bit_length at line {}: {}", line_no + 1, parts[4]));
+        records.push((idx, bit_length, code));
     }
 
-    if records.len() != 129 {
+    if records.len() != 128 {
         panic!(
-            "expected 129 records in {} (1 header + 128 payload), got {}",
+            "expected 128 records in {} (symbols 0..=127), got {}",
             csv_path.display(),
             records.len()
         );
     }
 
-    let (alphabet_size, partition) = records[0];
-    if alphabet_size != 128 {
+    // Rows must be the contiguous symbol indices 0..=127 in order — the
+    // runtime indexes the emitted slice by symbol position.
+    for (pos, &(idx, _, _)) in records.iter().enumerate() {
+        if idx as usize != pos {
+            panic!(
+                "{}: row {pos} has symbol_index {idx}; rows must be the \
+                 contiguous symbol sequence 0..=127 in order",
+                csv_path.display()
+            );
+        }
+    }
+
+    // Every code must fit its bit-length and every bit-length must be
+    // plausible (the .meta pins the span 2..=21).
+    for &(idx, bl, code) in &records {
+        if bl == 0 || bl > 24 {
+            panic!(
+                "{}: symbol {idx} has implausible bit_length {bl}",
+                csv_path.display()
+            );
+        }
+        if u64::from(code) >= (1u64 << bl) {
+            panic!(
+                "{}: symbol {idx} code {code} does not fit bit_length {bl}",
+                csv_path.display()
+            );
+        }
+    }
+
+    // Cross-check prefix-code completeness from the bit-lengths (Kraft
+    // sum Σ 2^-bl == 1, fixed-point against 2^maxbl).
+    let max_bl = records.iter().map(|&(_, bl, _)| bl).max().unwrap();
+    let kraft_num: u64 = records
+        .iter()
+        .map(|&(_, bl, _)| 1u64 << (max_bl - bl))
+        .sum();
+    if kraft_num != (1u64 << max_bl) {
         panic!(
-            "unexpected alphabet size {alphabet_size} in {} (expected 128)",
-            csv_path.display()
+            "{}: bit-lengths are not a complete prefix code (Kraft \
+             numerator {kraft_num} != 2^{max_bl} = {})",
+            csv_path.display(),
+            1u64 << max_bl
         );
     }
-    if partition != 64 {
-        panic!(
-            "unexpected partition {partition} in {} (expected 64)",
-            csv_path.display()
-        );
+
+    // Cross-check the actual codes form a prefix-free set: extend each
+    // code to `max_bl` bits and confirm the [lo, hi) leaf ranges are
+    // pairwise disjoint. This validates the codes we actually emit.
+    let mut ranges: Vec<(u64, u64)> = records
+        .iter()
+        .map(|&(_, bl, code)| {
+            let span = 1u64 << (max_bl - bl);
+            let lo = (code as u64) << (max_bl - bl);
+            (lo, lo + span)
+        })
+        .collect();
+    ranges.sort_unstable();
+    for w in ranges.windows(2) {
+        if w[1].0 < w[0].1 {
+            panic!(
+                "{}: extracted codes are not prefix-free (leaf ranges \
+                 [{}, {}) and [{}, {}) overlap)",
+                csv_path.display(),
+                w[0].0,
+                w[0].1,
+                w[1].0,
+                w[1].1
+            );
+        }
     }
 
     let mut f = fs::File::create(out_path)
@@ -951,22 +1053,32 @@ fn emit_mcbpcy_v3(csv_path: &Path, out_path: &Path) {
     writeln!(
         f,
         "// Auto-generated by build.rs from \
-         docs/video/msmpeg4/tables/region_05eac8.csv. DO NOT EDIT.\n\
+         docs/video/msmpeg4/tables/region_05eac8_mcbpcy.csv. DO NOT EDIT.\n\
          // Source binary: mpg4c32.dll SHA-256 \
          aedb4cf3d33c8554ab8acf04afe2d936eaa7c49107c5fefe163bca2e94b3c099\n\
-         // Role: v3 joint-MCBPCY VLC source (per spec/99 §3.1 / §8.1).\n\
+         // Role: v3 joint-MCBPCY VLC source (VMA 0x1c25f6c8, per spec/99\n\
+         // §3.1 / §8.1 and provenance/22 / Extractor 08).\n\
          \n\
-         pub const MCBPCY_V3_ALPHABET_SIZE: usize = {};\n\
-         pub const MCBPCY_V3_PARTITION: usize = {};\n\
+         pub const MCBPCY_V3_ALPHABET_SIZE: usize = 128;\n\
          \n\
-         /// 128 × (bit_length, code_value) canonical-Huffman entries for\n\
-         /// the v3 joint-MCBPCY VLC. Index 0..63 are I-type MBs; 64..127\n\
-         /// are P-type. See spec/99 §3.1 for consumer semantics.\n\
+         /// Alphabet partition: indices 0..63 are I-type (intra) MBs,\n\
+         /// 64..127 are P-type (inter). Not carried in the wire table —\n\
+         /// sourced from patent US 6,563,953 Table 1 (audit/02 §1.4),\n\
+         /// corroborated by the binary's `test bl, 0x40` split\n\
+         /// (spec/05 §3.2).\n\
+         pub const MCBPCY_V3_PARTITION: usize = 64;\n\
+         \n\
+         /// 128 × (bit_length, code) entries indexed by joint symbol.\n\
+         /// `code` is the actual DLL wire bit-pattern (MSB-first), a\n\
+         /// complete prefix code (Kraft = 1.0) but not the\n\
+         /// textbook-canonical assignment; the runtime decodes against\n\
+         /// it directly (provenance/22, spec/12 §2). Index 0..63 are\n\
+         /// I-type MBs; 64..127 are P-type. See spec/99 §3.1 for\n\
+         /// consumer semantics.\n\
          pub const MCBPCY_V3_RAW: &[(u32, u32)] = &[",
-        alphabet_size, partition,
     )
     .unwrap();
-    for &(bl, code) in &records[1..] {
+    for &(_, bl, code) in &records {
         writeln!(f, "    ({bl}, {code}),").unwrap();
     }
     writeln!(f, "];").unwrap();

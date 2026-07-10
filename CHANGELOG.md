@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **v3 joint-MCBPCY VLC now decodes against the extracted wire codes**
+  (`region_05eac8_mcbpcy.csv`, Extractor 08 / provenance/22, Kraft sum
+  exactly 1.0). The re-extraction resolved the long-standing
+  `region_05eac8` docs gap: the old CSV was a 4-byte-phase mis-parse
+  (the `u32 count=128` header eaten as a record + swapped fields) whose
+  per-symbol bit-lengths happened to line up but whose codes were
+  unusable, so the crate reconstructed a canonical assignment from the
+  lengths alone — and that assignment matches the real DLL wire codes
+  for **0 of 128 symbols**. `build.rs` now parses the
+  `symbol_index,file_offset_hex,code_dec,code_bin,bit_length` layout,
+  validates contiguity, per-code fit (`code < 2^bit_length`), Kraft
+  completeness, and pairwise prefix-freedom, and emits the codes for
+  direct decode — the same treatment the v3 joint-MV VLC received when
+  its wire codes landed. The encoder writes the same extracted codes,
+  closing the former "canonical, byte-exactness unverified" caveat for
+  this table.
+- Hand-crafted picture tests now pack MCBPCY codewords straight from
+  the extracted table (a shared `mcbpcy_wire(idx)` test helper replaces
+  seven copies of the canonical-reconstruction walk), and the two DC
+  smoke tests emit the correct v3 direct-value DC codewords (luma
+  `1`/`01`+sign, chroma `10`/`11`+sign) instead of patterns that only
+  worked by parse coincidence — the DC-propagation test now really
+  drives a non-zero differential through the predictor chain and pins
+  the ~130/~132 per-pel outputs.
+
 ### Added
 
 - v3 FourCC alias coverage: `DVX3` and `COL1` now route to msmpeg4v3
