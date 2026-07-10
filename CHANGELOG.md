@@ -34,8 +34,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   drives a non-zero differential through the predictor chain and pins
   the ~130/~132 per-pel outputs.
 
+- **v3 I-frame encoder now emits the high-half joint-MCBPCY symbol**
+  (`idx = 64 + cbp`). With the extracted wire codes in place, every
+  synced MCBPCY decode on the I-frames of both pinned real MS-encoded
+  fixtures (`tests/microsoft_fixtures.rs`: div3.avi and the 2001
+  WMFSDK-7.00 mp43.wmv) lands in the 64..127 half with `idx - 64` equal
+  to the MB's CBP — 70/72 across both files, the 2 outliers being
+  post-desync reads. The decode side is half-agnostic on I-frames
+  (every I-frame MB is intra; CBP = `idx & 0x3f`), so round-trip
+  behaviour is unchanged — the emitted bits now match the original
+  encoder's convention. Intra-in-P keeps the low half per the spec/05
+  §3.2 `test bl, 0x40; je` polarity.
+
 ### Added
 
+- `[mcbpcy trace]` line (decoded joint index + bit position) added to
+  the `OXIDEAV_MSMPEG4_AC_TRACE=1` diagnostic stream — this is the
+  instrument that pinned the I-frame half convention above.
 - v3 FourCC alias coverage: `DVX3` and `COL1` now route to msmpeg4v3
   in both `classify()` and the registry tag claims (previously only
   caught by the `_ => v3` classifier fallback, with no registry tag so

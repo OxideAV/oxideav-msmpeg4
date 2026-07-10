@@ -162,8 +162,13 @@ pub fn decode_mcbpcy(br: &mut BitReader<'_>) -> Result<McbpcyDecode> {
 /// [`decode_mcbpcy`]. `idx` is the raw joint index 0..=127: the low 6
 /// bits are the CBP pattern (bit 5 = Y0 … bit 1 = Cb, bit 0 = Cr) and
 /// bit 6 selects the P-type (inter) half of the alphabet per patent
-/// US 6,563,953 Table 1 / `audit/02` §1.4 — an I-frame or intra-in-P
-/// MB uses `idx = cbp` (0..=63), an inter MB uses `idx = 64 + cbp`.
+/// US 6,563,953 Table 1 / `audit/02` §1.4 — an intra-in-P MB uses
+/// `idx = cbp` (0..=63), an inter MB uses `idx = 64 + cbp`, and an
+/// **I-frame** MB uses `idx = 64 + cbp` as well: real MS-encoded v3
+/// streams place every I-frame joint symbol in the high half (both
+/// pinned Microsoft fixtures, see `tests/microsoft_fixtures.rs`), and
+/// the decode side is half-agnostic on I-frames (CBP = `idx & 0x3f`;
+/// every I-frame MB is intra by definition).
 ///
 /// The codeword written is the extracted DLL wire bit-pattern from
 /// `region_05eac8_mcbpcy.csv` (provenance/22), so encode → decode

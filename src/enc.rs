@@ -54,6 +54,7 @@ use crate::mv_pred::{
     MvGridCell,
 };
 use crate::picture::{MsV1V2Version, Picture, PictureDims};
+use crate::tables_data::MCBPCY_V3_PARTITION;
 
 /// Per-frame encoder settings.
 #[derive(Clone, Copy, Debug)]
@@ -317,7 +318,18 @@ fn assemble_iframe_v3(
     let scheme = DcScheme::V3(dc_size_sel);
     for (plans, cbpy, cbp_cb, cbp_cr) in mbs {
         let cbp = compose_cbp(*cbpy, *cbp_cb, *cbp_cr);
-        encode_mcbpcy(&mut bw, cbp)?;
+        // I-frame joint symbol = 64 + CBP (the high half of the joint
+        // alphabet). Empirically pinned against real MS-encoded v3
+        // streams: every synced MCBPCY decode on the I-frames of both
+        // pinned Microsoft fixtures (`tests/microsoft_fixtures.rs`,
+        // div3.avi 1999-lineage + mp43.wmv WMFSDK-7.00 2001) lands in
+        // the 64..127 half, with `idx - 64` = the MB's CBP pattern. The
+        // decoder side is half-agnostic on I-frames (every I-frame MB
+        // is intra by definition and CBP = idx & 0x3f), so this only
+        // affects the bits we emit — matching what the original
+        // encoder emits. The low half stays in use for intra-in-P
+        // (spec/05 §3.2 `test bl, 0x40; je` polarity).
+        encode_mcbpcy(&mut bw, MCBPCY_V3_PARTITION as u8 + cbp)?;
         let ac_pred = choose_ac_pred(plans, scheme, &luma_ac, &chroma_ac)?;
         bw.write_bit(ac_pred);
         write_intra_blocks(&mut bw, plans, scheme, &luma_ac, &chroma_ac, ac_pred)?;
@@ -771,7 +783,7 @@ fn encode_pframe_mb_v3(
         (coded[0] as u8) << 3 | (coded[1] as u8) << 2 | (coded[2] as u8) << 1 | (coded[3] as u8);
     let cbp = compose_cbp(cbpy, coded[4], coded[5]);
     // P-type (inter) half of the joint alphabet: idx = 64 + cbp.
-    encode_mcbpcy(bw, 64 + cbp)?;
+    encode_mcbpcy(bw, MCBPCY_V3_PARTITION as u8 + cbp)?;
     // The decoder consumes the post-VLC ac_pred bit on every coded MB
     // (meaningful only for intra-in-P).
     bw.write_bit(false);
