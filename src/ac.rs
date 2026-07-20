@@ -144,24 +144,9 @@ impl AcVlcTable {
     /// Placeholder for the MS-MPEG4v3 intra-AC primary VLC. **Empty by
     /// design** so callers that reach the AC walk on a coded block bail
     /// out with the actionable error in [`crate::mb::decode_intra_mb`]
-    /// rather than running off the end of the table.
-    ///
-    /// This is the **production default** for v3 stream decode and will
-    /// remain so until the G5 (intra-luma DCT AC TCOEF) descriptor's
-    /// canonical-Huffman code-length array is extracted into `tables/`.
-    /// The G5 packed-Huffman input source lives at VMA `0x1c259d78`
-    /// (file `0x59178`) per spec/99 §8.1 / §10.3, but the constructor
-    /// algorithm that turns the packed input into a runtime descriptor
-    /// (located at VMA `0x1c210ee6` per spec/99 §10.1) has not been
-    /// disassembled, so the live `count_A = 102, count_B = 66`
-    /// canonical-Huffman shape required by §5 cannot yet be wired.
-    ///
-    /// Use [`AcVlcTable::v3_intra_candidate`] for the candidate table
-    /// extracted from `docs/video/msmpeg4/tables/region_05eed0.csv`
-    /// (VMA `0x1c25fad0`). That candidate is **structurally not** the
-    /// G5 source (alphabet shape mismatches — see the candidate's
-    /// doc-comment) and is intended only for synthetic-stream pipeline
-    /// tests, not real-content decode.
+    /// rather than running off the end of the table. Retained for the
+    /// DC-only test paths; production decode uses the per-selector
+    /// G-family constructors below.
     pub const V3_INTRA_PLACEHOLDER: AcVlcTable = AcVlcTable {
         entries: &[],
         esc_last_bits: Self::MPEG4_ESC_LAST_BITS,
@@ -418,153 +403,6 @@ impl AcVlcTable {
             lmax: Some(g3_lmax()),
             rmax: Some(g3_rmax()),
         }
-    }
-
-    /// Build the candidate v3 intra-AC primary VLC table from the
-    /// canonical-Huffman code-length array in
-    /// `tables/region_05eed0.csv` (VMA `0x1c25fad0`, 64 payload entries,
-    /// Kraft sum 1).
-    ///
-    /// **Role attribution is OPEN.** Per spec/99 §0.1 row 8 the original
-    /// `spec/03 §5.3` claim that this VMA holds an intra-AC primary VLC
-    /// is downgraded to a candidate; spec/99 §9 OPEN-O6 lists the same
-    /// VMA as a candidate v2-MCBPCY source. The bytes are extraction-
-    /// grounded regardless and form a complete prefix code. This
-    /// constructor materialises them into the runtime decoder API so
-    /// downstream wiring + tests can exercise the canonical-Huffman
-    /// walker, but **the (last, run, level) mapping below is the
-    /// Implementer's hypothesis**, not an extraction artefact.
-    ///
-    /// **Structural mismatch with G5 (intra-luma DCT AC TCOEF).** Per
-    /// spec/99 §5, the v3 intra-AC primary VLC is the G5 descriptor
-    /// with `count_A = 102, count_B = 66`. The 64-entry / partition-1
-    /// shape of `region_05eed0` therefore cannot be the runtime G5
-    /// descriptor that the per-block AC kernel `0x1c216d97` consumes.
-    /// The likeliest correct attribution per spec/99 §9 OPEN-O6 is
-    /// **v2 MCBPCY**, not v3 intra-AC. Until a future Extractor session
-    /// (a) disassembles the packed-Huffman constructor at VMA
-    /// `0x1c210ee6` and (b) extracts the G5 packed-Huffman input source
-    /// at VMA `0x1c259d78` (file `0x59178`) to a code-length array, the
-    /// real v3 intra-AC table cannot be wired. The candidate retained
-    /// here is plumbing for synthetic-stream tests, NOT a real-content
-    /// table.
-    ///
-    /// # `(last, run, level)` interpretation (HYPOTHESIS)
-    ///
-    /// The table's CSV header is `(count_A=64, count_B=1)`. Apply the
-    /// v1 inter-DCT kernel partition (`spec/04` §1.3 step 3) verbatim:
-    ///
-    /// * `idx ∈ [0, count_B] = [0, 1]` → sub-class A: `last = false`.
-    /// * `idx ∈ (count_B, count_A) = (1, 64)` → sub-class B: `last = true`.
-    /// * `idx == count_A == 64` → ESC sentinel (handled separately by
-    ///   the kernel, not by the primary VLC).
-    ///
-    /// For the (run, level) decomposition we make the most-conservative
-    /// choice consistent with `spec/04` §1.3 step 5: the level magnitude
-    /// is **always 1** for primary entries (the binary's pri_A array,
-    /// which we do **not** have for this region, would supply the real
-    /// per-index level — see spec/99 §5.1; without it the candidate
-    /// decoder folds all primary entries onto `|level|=1` and lets the
-    /// 3-tier ESC body in `decode_escape_body` handle larger levels).
-    /// The run is `idx` for sub-A and `idx - (count_B + 1)` for sub-B,
-    /// so a stream encoding `(last=0, run=0, level=1)` lines up with the
-    /// shortest codeword (idx=0).
-    ///
-    /// This is **not bit-exact** against real msmpeg4v3 content; it's a
-    /// structurally-valid candidate that exercises the
-    /// AC pipeline end-to-end on synthetic streams. Producing real-file
-    /// parity requires either (a) confirmed pri_A / pri_B for the
-    /// matching G-descriptor, or (b) the full constructor algorithm at
-    /// `0x1c210ee6` from the binary, neither of which is in
-    /// `docs/video/msmpeg4/` yet.
-    ///
-    /// FROM: `docs/video/msmpeg4/tables/region_05eed0.csv`
-    /// FROM: `docs/video/msmpeg4/spec/99-current-understanding.md` §0.1 row 8, §9 OPEN-O6
-    /// FROM: `docs/video/msmpeg4/spec/03-corrections.md` §5.3
-    /// FROM: `docs/video/msmpeg4/spec/04-decoder-kernels.md` §1.3 (partition test)
-    pub fn v3_intra_candidate() -> AcVlcTable {
-        AcVlcTable {
-            entries: candidate_entries_v3_intra(),
-            esc_last_bits: Self::MPEG4_ESC_LAST_BITS,
-            esc_run_bits: Self::MPEG4_ESC_RUN_BITS,
-            esc_level_bits: Self::MPEG4_ESC_LEVEL_BITS,
-            // The candidate hypothesis maps every primary symbol to
-            // |level|=1, so LMAX/RMAX would degenerate to 1 / 0
-            // respectively. Synthetic-stream pipeline tests never need
-            // the multi-tier walk; keep the verbatim-only fallback.
-            lmax: None,
-            rmax: None,
-        }
-    }
-}
-
-/// Lazily-built `Vec<VlcEntry<Symbol>>` for the v3 intra-AC candidate
-/// VLC (region_05eed0). See [`AcVlcTable::v3_intra_candidate`] for the
-/// role-attribution caveats.
-static V3_INTRA_CANDIDATE_TABLE: std::sync::OnceLock<Vec<VlcEntry<Symbol>>> =
-    std::sync::OnceLock::new();
-
-fn candidate_entries_v3_intra() -> &'static [VlcEntry<Symbol>] {
-    V3_INTRA_CANDIDATE_TABLE.get_or_init(build_candidate_v3_intra)
-}
-
-/// Canonical-Huffman builder for the 64-entry v3 intra-AC candidate
-/// table. The algorithm matches `crate::mcbpcy::build_table` (and the
-/// reference `spec/04` §1.7 helper `0x1c219351` family):
-///
-///   1. Filter symbols whose declared bit_length is zero (none in this
-///      table — every entry is present).
-///   2. Sort by `(bit_length ascending, symbol_index ascending)`.
-///   3. Assign canonical codes: `code₀ = 0`,
-///      `codeₙ = (codeₙ₋₁ + 1) << (blₙ - blₙ₋₁)`.
-///   4. Map each symbol index through
-///      [`candidate_index_to_symbol`] to derive the
-///      `(last, run, |level|)` triple, then store as [`Symbol::RunLevel`].
-fn build_candidate_v3_intra() -> Vec<VlcEntry<Symbol>> {
-    use crate::tables_data::{INTRA_AC_V3_CANDIDATE_PARTITION, INTRA_AC_V3_CANDIDATE_RAW};
-
-    let mut symbols: Vec<(u32, u8)> = INTRA_AC_V3_CANDIDATE_RAW
-        .iter()
-        .enumerate()
-        .filter_map(
-            |(idx, &(bl, _))| {
-                if bl == 0 {
-                    None
-                } else {
-                    Some((bl, idx as u8))
-                }
-            },
-        )
-        .collect();
-    symbols.sort_by_key(|&(bl, idx)| (bl, idx));
-
-    let partition = INTRA_AC_V3_CANDIDATE_PARTITION as u8;
-    let mut entries: Vec<VlcEntry<Symbol>> = Vec::with_capacity(symbols.len());
-    let mut code: u32 = 0;
-    let mut prev_bl: u32 = 0;
-    for (i, &(bl, idx)) in symbols.iter().enumerate() {
-        if i == 0 {
-            code = 0;
-        } else {
-            code = (code + 1) << (bl - prev_bl);
-        }
-        let symbol = candidate_index_to_symbol(idx, partition);
-        entries.push(VlcEntry::new(bl as u8, code, symbol));
-        prev_bl = bl;
-    }
-    entries
-}
-
-/// Hypothesis-driven `(last, run, |level|)` mapping for the candidate
-/// v3 intra-AC alphabet. See [`AcVlcTable::v3_intra_candidate`] for the
-/// rationale. `partition = count_B = 1` from the table's header row.
-fn candidate_index_to_symbol(idx: u8, partition: u8) -> Symbol {
-    let last = idx > partition;
-    let run = if last { idx - (partition + 1) } else { idx };
-    Symbol::RunLevel {
-        last,
-        run,
-        level: 1,
     }
 }
 
@@ -1054,80 +892,106 @@ fn decode_escape_body(br: &mut BitReader<'_>, table: &AcVlcTable) -> Result<Toke
             br.bit_position()
         );
     }
-    // Tier 1 — level extension.
-    if let (Some(lmax), Some(_)) = (table.lmax, table.rmax) {
-        match vlc::decode_named(br, table.entries, "ac esc tier-1 re-vlc")? {
-            Symbol::RunLevel { last, run, level } => {
-                let last_idx = if last { 1 } else { 0 };
-                let run_idx = run as usize;
-                let lmax_value = if run_idx < 64 {
-                    lmax[last_idx][run_idx] as u16
-                } else {
-                    0
-                };
-                let level_actual = level.saturating_add(lmax_value);
-                if trace {
-                    eprintln!(
-                        "[esc trace] tier-1 level-ext: last={last} run={run} \
-                         base={level} +lmax={lmax_value} -> {level_actual}"
-                    );
+    // Round 420: the tier dispatch for the intra 3-tier kernel is a
+    // **one-bit selector read immediately after the ESC marker**, not
+    // the earlier "successive ESC re-fires" reading of spec/04 §2.3.
+    // Evidence:
+    //   * spec/13 §3 items (`je 0x1c21700c` at `1c216e96` / `1c216f1d`)
+    //     shows a nested ESC inside either extension body is the
+    //     kernel's hard -100 error — so ESC-ESC chaining can never
+    //     reach tier 2, refuting the chain model.
+    //   * The staged real-content fixtures (`tests/microsoft_fixtures.rs`
+    //     ground truth) only parse coherently when each ESC marker is
+    //     followed by one selector bit and then a single re-VLC:
+    //     selector `1` → the level-extension tier, `0` → the
+    //     run-extension tier (validated on the first-I-frame escape
+    //     population of both DIV3 AVI fixtures; see CHANGELOG r420).
+    //
+    // The selector dispatch applies to the intra kernel (LMAX/RMAX
+    // present). The inter kernel (`lmax`/`rmax` = None) keeps its
+    // single verbatim FLC tier per spec/04 §1.3 step 10.
+    if let (Some(lmax), Some(rmax)) = (table.lmax, table.rmax) {
+        let level_ext = br.read_bit()?;
+        if level_ext {
+            // Tier 1 — level extension: re-VLC a (last, run, base)
+            // symbol and add LMAX[last][run].
+            match vlc::decode_named(br, table.entries, "ac esc tier-1 re-vlc")? {
+                Symbol::RunLevel { last, run, level } => {
+                    let last_idx = if last { 1 } else { 0 };
+                    let lmax_value = if (run as usize) < 64 {
+                        lmax[last_idx][run as usize] as u16
+                    } else {
+                        0
+                    };
+                    let level_actual = level.saturating_add(lmax_value);
+                    let sign = br.read_bit()?;
+                    let signed = if sign {
+                        -(level_actual as i32)
+                    } else {
+                        level_actual as i32
+                    };
+                    if trace {
+                        eprintln!(
+                            "[esc trace] tier-1 level-ext: last={last} run={run} lvl={signed}"
+                        );
+                    }
+                    return Ok(Token {
+                        last,
+                        run,
+                        level: signed.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+                    });
                 }
-                let sign = br.read_bit()?;
-                // Standard MPEG-4 AC sign: bit 1 ⇒ negative.
-                let signed = if sign {
-                    -(level_actual as i32)
-                } else {
-                    level_actual as i32
-                };
-                let signed = signed.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
-                return Ok(Token {
-                    last,
-                    run,
-                    level: signed,
-                });
-            }
-            Symbol::Escape => {
-                // Tier 1 ESC re-fired → fall through to tier 2.
+                Symbol::Escape => {
+                    // Nested ESC inside the level-extension body: the
+                    // traced kernel returns -100 here (spec/13 §3).
+                    // Our own encoder uses this otherwise-dead pattern
+                    // as the verbatim-FLC fallback for tokens the two
+                    // extension tiers cannot represent, so decode it
+                    // as the FLC triple instead of erroring; real
+                    // MS-encoded streams never reach this arm.
+                    return decode_escape_flc(br, table, trace);
+                }
             }
         }
-    }
-
-    // Tier 2 — run extension.
-    if let (Some(_), Some(rmax)) = (table.lmax, table.rmax) {
+        // Tier 2 — run extension: re-VLC a (last, base, |level|)
+        // symbol and add RMAX[last][|level|] + 1 to the run.
         match vlc::decode_named(br, table.entries, "ac esc tier-2 re-vlc")? {
             Symbol::RunLevel { last, run, level } => {
                 let last_idx = if last { 1 } else { 0 };
-                let level_idx = level as usize;
-                let rmax_value = if level_idx < 32 {
-                    rmax[last_idx][level_idx] as u16
+                let rmax_value = if (level as usize) < 32 {
+                    rmax[last_idx][level as usize] as u16
                 } else {
                     0
                 };
-                let run_actual_u16 = (run as u16).saturating_add(rmax_value).saturating_add(1);
-                let run_actual = run_actual_u16.min(u8::MAX as u16) as u8;
+                let run_actual = ((run as u16).saturating_add(rmax_value).saturating_add(1))
+                    .min(u8::MAX as u16) as u8;
+                let sign = br.read_bit()?;
+                let signed = if sign { -(level as i32) } else { level as i32 };
                 if trace {
                     eprintln!(
-                        "[esc trace] tier-2 run-ext: last={last} base={run} \
-                         +rmax={rmax_value}+1 -> {run_actual} level={level}"
+                        "[esc trace] tier-2 run-ext: last={last} run={run_actual} lvl={signed}"
                     );
                 }
-                let sign = br.read_bit()?;
-                // Standard MPEG-4 AC sign: bit 1 ⇒ negative.
-                let signed_level = if sign { -(level as i32) } else { level as i32 };
-                let signed_level = signed_level.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
                 return Ok(Token {
                     last,
                     run: run_actual,
-                    level: signed_level,
+                    level: signed.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
                 });
             }
             Symbol::Escape => {
-                // Tier 2 ESC re-fired → fall through to tier 3.
+                // Same encoder-compat fallback as the tier-1 arm.
+                return decode_escape_flc(br, table, trace);
             }
         }
     }
+    decode_escape_flc(br, table, trace)
+}
 
-    // Tier 3 — verbatim FLC triple.
+/// Verbatim fixed-length escape triple: `last(1) + run(6) + level(8,
+/// two's-complement)`. This is the inter kernel's only ESC body
+/// (spec/04 §1.3 step 10) and the intra kernel's encoder-compat
+/// fallback tier.
+fn decode_escape_flc(br: &mut BitReader<'_>, table: &AcVlcTable, trace: bool) -> Result<Token> {
     let last = br.read_u32(table.esc_last_bits as u32)? != 0;
     let run = br.read_u32(table.esc_run_bits as u32)? as u8;
     let level_raw = br.read_i32(table.esc_level_bits as u32)?;
@@ -1168,19 +1032,22 @@ fn escape_entry(table: &AcVlcTable) -> Option<&'static VlcEntry<Symbol>> {
 }
 
 /// Encode one `(last, run, level)` token — the bit-level inverse of
-/// [`decode_token`]. Tier preference mirrors the escape chain the
-/// decoder walks (spec/04 §2.3):
+/// [`decode_token`]. Tier preference mirrors the selector-bit escape
+/// dispatch the decoder implements (round 420; see
+/// [`decode_escape_body`] for the evidence):
 ///
 /// 1. **Primary**: the triple has its own codeword → codeword + AC
 ///    sign bit (standard MPEG-4 convention, bit `1` ⇒ negative).
 /// 2. **Tier-1 level extension** (tables with LMAX/RMAX, i.e. the
-///    intra 3-tier kernel): `ESC` + the codeword of
+///    intra kernel): `ESC` + selector bit `1` + the codeword of
 ///    `(last, run, |level| − LMAX[last][run])` + sign.
-/// 3. **Tier-2 run extension**: `ESC ESC` + the codeword of
-///    `(last, run − RMAX[last][|level|] − 1, |level|)` + sign.
-/// 4. **Verbatim FLC tier**: for 3-tier tables `ESC ESC ESC`, for
-///    1-tier tables (`lmax`/`rmax` absent — the inter kernel,
-///    spec/04 §1.3 step 10) a single `ESC`; then the fixed-length
+/// 3. **Tier-2 run extension**: `ESC` + selector bit `0` + the
+///    codeword of `(last, run − RMAX[last][|level|] − 1, |level|)`
+///    + sign.
+/// 4. **Verbatim FLC tier**: for the intra tables `ESC` + selector
+///    `1` + `ESC` (the nested-ESC encoder-compat arm), for 1-tier
+///    tables (`lmax`/`rmax` absent — the inter kernel, spec/04 §1.3
+///    step 10) a single `ESC`; then the fixed-length
 ///    `last(1) + run(6) + level(8, two's-complement)` triple.
 ///
 /// `level` must be non-zero, `run <= 63`, and `|level| <= 127` (every
@@ -1216,25 +1083,28 @@ pub fn encode_token(bw: &mut BitWriter, table: &AcVlcTable, tok: Token) -> Resul
 
     if let (Some(lmax), Some(rmax)) = (table.lmax, table.rmax) {
         // Tier 1 — level extension: |level| = base + LMAX[last][run].
+        // Wire form: ESC + selector `1` + base codeword + sign.
         let last_idx = tok.last as usize;
         let lmax_v = lmax[last_idx][tok.run as usize] as u16;
         if lmax_v > 0 && level_mag > lmax_v {
             let base = level_mag - lmax_v;
             if let Some(e) = find_run_level_entry(table, tok.last, tok.run, base) {
                 bw.write_u32(esc.code, esc.bits as u32);
+                bw.write_bit(true);
                 bw.write_u32(e.code, e.bits as u32);
                 bw.write_bit(negative);
                 return Ok(());
             }
         }
         // Tier 2 — run extension: run = base + RMAX[last][|level|] + 1.
+        // Wire form: ESC + selector `0` + base codeword + sign.
         if (level_mag as usize) < 32 {
             let rmax_v = rmax[last_idx][level_mag as usize];
             if tok.run > rmax_v {
                 let run_base = tok.run - rmax_v - 1;
                 if let Some(e) = find_run_level_entry(table, tok.last, run_base, level_mag) {
                     bw.write_u32(esc.code, esc.bits as u32);
-                    bw.write_u32(esc.code, esc.bits as u32);
+                    bw.write_bit(false);
                     bw.write_u32(e.code, e.bits as u32);
                     bw.write_bit(negative);
                     return Ok(());
@@ -1250,8 +1120,13 @@ pub fn encode_token(bw: &mut BitWriter, table: &AcVlcTable, tok: Token) -> Resul
             tok.level
         )));
     }
-    let esc_fires = if three_tier { 3 } else { 1 };
-    for _ in 0..esc_fires {
+    if three_tier {
+        // Intra tables: ESC + selector `1` + nested ESC (the
+        // encoder-compat verbatim arm in `decode_escape_body`).
+        bw.write_u32(esc.code, esc.bits as u32);
+        bw.write_bit(true);
+        bw.write_u32(esc.code, esc.bits as u32);
+    } else {
         bw.write_u32(esc.code, esc.bits as u32);
     }
     bw.write_u32(tok.last as u32, table.esc_last_bits as u32);
@@ -1786,111 +1661,6 @@ mod tests {
     }
 
     #[test]
-    fn candidate_v3_intra_table_has_64_entries() {
-        // Every entry in region_05eed0.csv has a non-zero bit_length
-        // (verified by tables_data::tests::intra_ac_v3_candidate_kraft_sum_is_one),
-        // so the candidate table holds the full alphabet of 64 symbols.
-        let t = AcVlcTable::v3_intra_candidate();
-        assert_eq!(t.entries.len(), 64);
-    }
-
-    #[test]
-    fn candidate_v3_intra_table_is_prefix_free() {
-        // Canonical-Huffman correctness: no entry's code may be a
-        // prefix of another's code. This is the runtime equivalent of
-        // the build-time Kraft check.
-        let t = AcVlcTable::v3_intra_candidate();
-        let entries = t.entries;
-        for (i, a) in entries.iter().enumerate() {
-            for (j, b) in entries.iter().enumerate() {
-                if i == j || a.bits == b.bits {
-                    continue;
-                }
-                let (short, long) = if a.bits < b.bits { (a, b) } else { (b, a) };
-                let shift = long.bits - short.bits;
-                let long_prefix = long.code >> shift;
-                assert_ne!(
-                    long_prefix, short.code,
-                    "candidate intra-AC: shorter code is a prefix of a longer one"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn candidate_v3_intra_round_trips_every_symbol() {
-        // Encode each table entry's code at the head of a byte-aligned
-        // stream, then decode_token must recover the same `(last, run,
-        // |level|)` triple. This is the same pattern as MCBPCY's
-        // canonical_round_trip_per_symbol.
-        let table = AcVlcTable::v3_intra_candidate();
-        for (idx_in_table, entry) in table.entries.iter().enumerate() {
-            // Pack: VLC code (entry.bits wide) + sign bit `0` (positive).
-            let mut acc: u64 = 0;
-            let mut bits: u32 = 0;
-            acc = (acc << entry.bits) | (entry.code as u64);
-            bits += entry.bits as u32;
-            // Sign bit (= 0 → level positive).
-            acc <<= 1;
-            bits += 1;
-            let mut out = Vec::new();
-            while bits >= 8 {
-                let shift = bits - 8;
-                out.push(((acc >> shift) & 0xff) as u8);
-                acc &= (1u64 << shift) - 1;
-                bits -= 8;
-            }
-            if bits > 0 {
-                out.push(((acc << (8 - bits)) & 0xff) as u8);
-            }
-            out.extend_from_slice(&[0u8; 8]);
-            let mut br = BitReader::new(&out);
-            let tok = decode_token(&mut br, &table).unwrap();
-            // Reverse the candidate hypothesis to predict the expected
-            // triple from the symbol index.
-            let Symbol::RunLevel { last, run, level } = entry.value else {
-                unreachable!("candidate table only stores RunLevel symbols");
-            };
-            assert_eq!(tok.last, last, "entry {idx_in_table}: last mismatch");
-            assert_eq!(tok.run, run, "entry {idx_in_table}: run mismatch");
-            assert_eq!(
-                tok.level as i32, level as i32,
-                "entry {idx_in_table}: |level| mismatch"
-            );
-        }
-    }
-
-    #[test]
-    fn candidate_v3_intra_partition_matches_v1_kernel_rule() {
-        // Per spec/04 §1.3 step 3 the partition test is `idx > count_B`
-        // for sub-class B (last=1). With count_B=1 from the CSV header,
-        // exactly idx=0 and idx=1 should be sub-class A (last=0).
-        let table = AcVlcTable::v3_intra_candidate();
-        for entry in table.entries {
-            let Symbol::RunLevel { last, .. } = entry.value else {
-                continue;
-            };
-            // Recover original index from the canonical code-table; the
-            // entries don't carry the original index directly so we
-            // inspect the partition shape via run vs last.
-            // (Two entries with last=0 by hypothesis; the rest are last=1.)
-            let _ = last;
-        }
-        let last0 = table
-            .entries
-            .iter()
-            .filter(|e| matches!(e.value, Symbol::RunLevel { last: false, .. }))
-            .count();
-        let last1 = table
-            .entries
-            .iter()
-            .filter(|e| matches!(e.value, Symbol::RunLevel { last: true, .. }))
-            .count();
-        assert_eq!(last0, 2, "expected 2 sub-class-A entries (idx 0..=1)");
-        assert_eq!(last1, 62, "expected 62 sub-class-B entries (idx 2..=63)");
-    }
-
-    #[test]
     fn placeholder_v3_intra_is_empty() {
         // The placeholder exists specifically as a sentinel: its
         // `entries` slice is empty by design so callers can detect
@@ -1983,17 +1753,22 @@ mod tests {
 
     #[test]
     fn esc_tier1_extends_level_via_lmax() {
-        // Tier 1 = level extension: ESC marker, then a regular VLC for
-        // (last=false, run=0, level_base=1), then sign bit. The G5
-        // primary VLC for (idx 0 = run=0, level=1) is `10` (2-bit).
-        // LMAX[0][0] = 27, so actual level = 1 + 27 = 28.
+        // Tier 1 = level extension: ESC marker, selector bit `1`, then
+        // a regular VLC for (last=false, run=0, level_base=1), then
+        // sign bit. The G5 primary VLC for (idx 0 = run=0, level=1) is
+        // `10` (2-bit). LMAX[0][0] = 27, so actual level = 1 + 27 = 28.
         let t = AcVlcTable::v3_intra_g5();
         let esc_entry = t
             .entries
             .iter()
             .find(|e| matches!(e.value, Symbol::Escape))
             .expect("G5 ESC entry");
-        let bytes = pack(&[(esc_entry.code, esc_entry.bits as u32), (0b10, 2), (0, 1)]);
+        let bytes = pack(&[
+            (esc_entry.code, esc_entry.bits as u32),
+            (1, 1), // selector: level-extension tier
+            (0b10, 2),
+            (0, 1),
+        ]);
         let mut br = BitReader::new(&bytes);
         let tok = decode_token(&mut br, &t).expect("decode tier-1 ESC body");
         assert_eq!(tok.last, false, "tier 1: last preserved from re-VLC");
@@ -2015,6 +1790,7 @@ mod tests {
             .expect("G5 ESC entry");
         let bytes = pack(&[
             (esc_entry.code, esc_entry.bits as u32),
+            (1, 1), // selector: level-extension tier
             (0b10, 2),
             (1, 1), // sign = 1 → negative
         ]);
@@ -2025,7 +1801,7 @@ mod tests {
 
     #[test]
     fn esc_tier2_extends_run_via_rmax() {
-        // Tier 2 = run extension: ESC marker → ESC again (re-fire) →
+        // Tier 2 = run extension: ESC marker → selector bit `0` →
         // re-VLC (= idx 0 (run=0, level=1, last=0)) → sign. RMAX[0][1]
         // = 14 (max run for sub-A level 1). So run_actual =
         // 0 + 14 + 1 = 15.
@@ -2037,9 +1813,9 @@ mod tests {
             .expect("G5 ESC entry");
         let bytes = pack(&[
             (esc_entry.code, esc_entry.bits as u32),
-            (esc_entry.code, esc_entry.bits as u32), // tier-1 fires again → tier 2
-            (0b10, 2),                               // (run=0, level=1, last=0)
-            (0, 1),                                  // sign = 0 → positive
+            (0, 1),    // selector: run-extension tier
+            (0b10, 2), // (run=0, level=1, last=0)
+            (0, 1),    // sign = 0 → positive
         ]);
         let mut br = BitReader::new(&bytes);
         let tok = decode_token(&mut br, &t).expect("decode tier-2 ESC body");
@@ -2052,9 +1828,13 @@ mod tests {
     }
 
     #[test]
-    fn esc_tier3_falls_through_when_both_extensions_escape() {
-        // Tier 3 = verbatim: three ESCs in a row, then the verbatim
-        // (last, run, level) FLC triple.
+    fn esc_verbatim_arm_via_nested_esc() {
+        // Encoder-compat verbatim arm: ESC marker → selector `1` →
+        // nested ESC → the verbatim (last, run, level) FLC triple.
+        // (Real MS-encoded streams never emit nested ESC — the traced
+        // kernel treats it as a hard error per spec/13 §3; this arm
+        // exists so our own encoder has a lossless fallback for
+        // tokens the two extension tiers cannot represent.)
         let t = AcVlcTable::v3_intra_g5();
         let esc_entry = t
             .entries
@@ -2063,14 +1843,14 @@ mod tests {
             .expect("G5 ESC entry");
         let bytes = pack(&[
             (esc_entry.code, esc_entry.bits as u32),
-            (esc_entry.code, esc_entry.bits as u32),
-            (esc_entry.code, esc_entry.bits as u32),
-            (1, 1),    // last = 1
-            (5, 6),    // run = 5
-            (0xfd, 8), // level = -3 as 8-bit signed (0xfd = -3)
+            (1, 1),                                  // selector: level-extension tier
+            (esc_entry.code, esc_entry.bits as u32), // nested ESC → verbatim
+            (1, 1),                                  // last = 1
+            (5, 6),                                  // run = 5
+            (0xfd, 8),                               // level = -3 as 8-bit signed (0xfd = -3)
         ]);
         let mut br = BitReader::new(&bytes);
-        let tok = decode_token(&mut br, &t).expect("decode tier-3 ESC body");
+        let tok = decode_token(&mut br, &t).expect("decode verbatim ESC body");
         assert!(tok.last);
         assert_eq!(tok.run, 5);
         assert_eq!(tok.level, -3);

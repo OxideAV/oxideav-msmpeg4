@@ -63,9 +63,17 @@ As of round 405 every VLC both directions consume is binary-extracted
 wire codes — the last canonical reconstruction (the v3 128-entry joint
 MCBPCY) was retired when the `region_05eac8_mcbpcy` re-extraction
 landed (Kraft = 1.0; the old canonical assignment matched the real
-codes for 0 of 128 symbols). The v3 I-frame encoder also now emits the
-high-half joint symbol (`64 + cbp`), matching what real MS-encoded
-streams carry.
+codes for 0 of 128 symbols).
+
+Round 420 rebuilt the **v3 I-frame MB layer** against the pinned real
+Microsoft fixtures: I-frames use a dedicated 64-entry intra-CBPCY VLC
+with XOR-predicted luma bits (the 128-entry joint table is
+P-frame-only), the DC gradient/tie rule and DC sign convention were
+corrected, the four `dc_size_sel` DC tables were re-paired, the intra
+AC escape became a selector-bit dispatch, and the first-of-sequence
+5-bit header extension is consumed/emitted. The first I-frame of
+div4.avi now decodes pixel-exactly through its leading MB rows (see
+"What's still open" for the remaining frontier).
 
 | Piece                                          | Status     |
 | ---------------------------------------------- | ---------- |
@@ -76,7 +84,8 @@ streams carry.
 | Quantiser dequantisation + DC scalers          | complete   |
 | CBPY + DC-size VLCs                             | complete   |
 | Intra MB header + DC differential decode       | complete   |
-| Joint MCBPCY VLC (v3, 128-entry, extracted wire codes) | complete (round 405: decodes the `region_05eac8_mcbpcy` re-extraction directly, Kraft=1.0; partition polarity 0..63=intra per round 362) |
+| Joint MCBPCY VLC (v3 **P-frames**, 128-entry, extracted wire codes) | complete (round 405 wire codes, Kraft=1.0; round 420 pinned the table as P-frame-only per its staged `tables-ff` companion role) |
+| Intra CBPCY VLC (v3 **I-frames**, 64-entry, XOR-predicted luma bits) | complete (round 420: re-aligned `region_05eed0` ≡ staged `msmp4-mb-i-table`, Kraft=1.0; patent 7,054,494 CBPCY-XOR rule pinned on both DIV3 fixtures) |
 | DC spatial predictor + AC scan dispatcher      | complete   |
 | Intra MB pipeline (DC pred + IDCT + store)     | complete   |
 | G0..G5 canonical-Huffman primary AC VLC        | complete   |
@@ -100,30 +109,32 @@ streams carry.
 
 ## What's still open for real-content decode
 
-- **V3 real-content intra AC desync (the live blocker after round
-  405)**: the joint-MCBPCY docs gap is CLOSED — round 405 wired the
-  `region_05eac8_mcbpcy` re-extraction (provenance/22, Kraft = 1.0)
-  and the decoder consumes the real MSB-first wire codes directly.
-  Round 405 also covered the reserved G4/G5 9-bit ESC-marker codeword
-  (`000000000`, the Kraft 1 − 1/512 gap, spec/11 §7 item 4) after both
-  real Microsoft AVI fixtures refused decode exactly on it. Result on
-  the pinned real MS-encoded fixtures (`tests/microsoft_fixtures.rs`):
-  the first I-frame of div4.avi decodes 241 of 330 MBs, div3.avi 135
-  of 330, mp43.wmv 15 of 400, all ending in the spec/13 §3
-  scan-overflow guard (`scan_pos ≥ 64` inside an intra AC block walk)
-  — i.e. tokens decode plausibly but a subtle upstream desync
-  accumulates run values past 63. Every VLC en route is now
-  binary-extracted, so the remaining suspects are semantic: the
-  escape-tier chaining details (does the reserved 9-bit marker select
-  a specific tier rather than re-firing the chain? — spec/04 §2.3
-  documents markers only as "successive ESC re-fires"), the
-  `ac_pred`-driven scan selection on real content, or a per-block
-  condition the traced kernels gate on that the crate doesn't model.
-  **Docs ask:** trace the binary's handling of the reserved
-  `000000000` marker in the G4/G5 walkers (which tier body it enters,
-  and whether the idx-102 `0000011` codeword and the reserved marker
-  route differently), and extend the spec/13-style single-block trace
-  to a real Microsoft I-frame block that contains one.
+- **V3 real-content I-frame decode (round 420 frontier)**: the round
+  405 "intra AC desync" is resolved — it was never the AC tables. Round
+  420 found and fixed seven compounding I-frame semantics errors (see
+  CHANGELOG): the I-frame MB header uses a dedicated 64-entry intra
+  CBPCY VLC (re-aligned `region_05eed0`, VMA `0x1c25fad0` — closing
+  that region's OPEN role) with patent-7,054,494 XOR-predicted luma
+  bits; the DC gradient rule was inverted (TOP iff `|A−D| <= |D−B|`,
+  ties TOP); the v3 DC sign convention is standard (1 ⇒ negative); the
+  four `dc_size_sel` DC tables pair per spec/99 §4.5 (sel0 =
+  {`05f0d8`, `05f4a0`}, sel1 = {`05f868`, `05fc30`}); the intra escape
+  is marker + one selector bit + re-VLC (spec/13 §3 refutes ESC-ESC
+  chaining); and the first I-frame of a sequence carries a 5-bit
+  extension. Result on the pinned fixtures: div4.avi's first I-frame
+  decodes **pixel-exactly** (block means < 1 grey off the reference)
+  through the leading MB rows and parses 162/330 MBs; div3.avi
+  83/330; mp43.wmv 9/400. Remaining opens for full-frame: (a) the
+  escape selector polarity (1 ⇒ level-ext vs run-ext is provisional —
+  both parse identically; only coefficient values differ), (b)
+  whether the chroma CBP bits also carry a prediction, (c) a residual
+  mid-frame drift starting around MB row 8 on div4 whose first
+  symptom is a chroma DC a few steps off. **Docs asks:** trace the
+  ESC-body selector-bit branch at `1c216e5e..1c216e7b` (which
+  selector value routes to the level-extension body at `1c216e7b` vs
+  the run-extension body at `1c216f02`, and what — if anything —
+  reaches the verbatim body at `1c216f5f`); and trace the chroma-CBP
+  bit handling in the I-frame MB header decoder (raw vs predicted).
 - **V3 4-MV-per-MB picture decode (hard docs gap #1895)**: the
   predictor / neighbour-resolver surface is complete and is exercised
   end-to-end on the v1 P-frame INTER4V path (`spec/16` §3.1, the real

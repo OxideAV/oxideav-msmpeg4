@@ -44,9 +44,8 @@
 
 use oxideav_core::bits::BitReader;
 use oxideav_msmpeg4::ac::{AcVlcTable, Symbol};
-use oxideav_msmpeg4::mcbpcy::decode_mcbpcy;
 use oxideav_msmpeg4::picture::{decode_picture, decode_picture_with_ac, AcSelection, PictureDims};
-use oxideav_msmpeg4::tables_data::{INTRA_DC_LUMA_SEL0_RAW, MCBPCY_V3_PARTITION};
+use oxideav_msmpeg4::tables_data::{INTRA_DC_LUMA_SEL0_RAW, MCBPCY_V3_INTRA_RAW};
 
 /// Bit-pack helper: append each `(value, width)` MSB-first, then pad the
 /// tail with 8 zero bytes so a trailing bit-reader peek does not starve.
@@ -70,31 +69,6 @@ fn pack(fields: &[(u32, u32)]) -> Vec<u8> {
     }
     out.extend_from_slice(&[0u8; 8]);
     out
-}
-
-/// Find the canonical-Huffman `(code, bit_length)` for a target
-/// joint-MCBPCY symbol index by using the production [`decode_mcbpcy`]
-/// as a black-box oracle. We scan candidate `(code, bit_length)` pairs
-/// in canonical order (length ascending, then code value); the first
-/// pair that decodes back to `target` and consumes exactly `bit_length`
-/// bits is the encoding. This avoids depending on the private canonical
-/// table builder while still producing a stream the production decoder
-/// accepts.
-fn mcbpcy_code_for(target: u8) -> (u32, u32) {
-    for bl in 1u32..=13 {
-        for code in 0u32..(1u32 << bl) {
-            // Build a stream of just this code, padded so the reader can
-            // peek the full max-bitlen window.
-            let bytes = pack(&[(code, bl)]);
-            let mut br = BitReader::new(&bytes);
-            if let Ok(dec) = decode_mcbpcy(&mut br) {
-                if dec.idx == target && br.bit_position() == bl as u64 {
-                    return (code, bl);
-                }
-            }
-        }
-    }
-    panic!("no MCBPCY code found for symbol {target}");
 }
 
 /// Look up the G3 primary-VLC `(code, bit_length)` for a regular
@@ -135,14 +109,14 @@ fn build_g3_coded_iframe() -> Vec<u8> {
         (0, 1), // dc_size_sel = 0
     ];
 
-    // --- Macroblock header (spec/05 §3.2): joint-MCBPCY + ac_pred bit ---
-    // Choose an intra symbol (idx < partition 64 — patent Table 1 I-type
-    // half, audit/02 §1.4) whose low-6 CBP pattern codes luma block 0
-    // only: cbpy bit 3 set ⇒ cbpy = 0b1000 = 8 ⇒ pattern = 8 << 2 =
-    // 0b100000 = 32. So idx = 32 (already in the intra/low half).
-    let mcbpcy_idx = 32u8;
-    debug_assert!((mcbpcy_idx as usize) < MCBPCY_V3_PARTITION);
-    let (mc_code, mc_bl) = mcbpcy_code_for(mcbpcy_idx);
+    // --- Macroblock header (round 420): 64-entry intra-CBPCY symbol +
+    // ac_pred bit. The symbol bits are in block-decode order (MSB
+    // first: Y(0,0), Y(1,0), Y(0,1), Y(1,1), Cb, Cr) and the luma bits
+    // are XOR-predicted — for the first MB of a picture every
+    // predicted bit is 0, so the symbol equals the actual CBP. Luma
+    // block 0 only ⇒ sym = 0b100000 = 32.
+    let intra_cbpcy_sym = 32usize;
+    let (mc_bl, mc_code) = MCBPCY_V3_INTRA_RAW[intra_cbpcy_sym];
     fields.push((mc_code, mc_bl));
     fields.push((0, 1)); // ac_pred = 0 → zigzag scan, no AC prediction
 

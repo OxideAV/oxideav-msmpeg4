@@ -161,12 +161,12 @@ fn intra_block_dc_diff_and_terminator() {
     let pred_dc = 1024i32;
     let dc_magnitude: usize = 3;
     let (dc_bl, dc_code) = dc_luma_sel0_code(dc_magnitude);
-    // Per spec/07 §5.2: sign bit unset ⇒ negate. We want positive so
-    // sign = 1.
+    // Round 420 standard sign convention: sign bit set ⇒ negative. We
+    // want positive so sign = 0.
     let (term_code, term_bits, term_run, term_level) = g5_shortest_terminator();
     let bytes = pack(&[
         (dc_code, dc_bl),
-        (1, 1), // DC sign bit = 1 ⇒ positive
+        (0, 1), // DC sign bit = 0 ⇒ positive
         (term_code, term_bits as u32),
         (0, 1), // AC sign bit = 0 ⇒ POSITIVE per ac.rs decode_token (bit 0 = +, bit 1 = -)
     ]);
@@ -270,10 +270,11 @@ fn intra_block_tier_1_esc_level_extension() {
 
     let bytes = pack(&[
         (dc_code, dc_bl),
-        (1, 1), // DC sign
+        (0, 1), // DC sign (0 ⇒ positive, round 420)
         (esc_code, esc_bits as u32),
+        (1, 1), // selector: level-extension tier (round 420)
         (inner_code, inner_bits as u32),
-        (0, 1), // tier-1 sign bit (sign=0 ⇒ positive per decode_escape_body)
+        (0, 1), // tier-1 sign bit (sign=0 ⇒ positive)
         (term_code, term_bits as u32),
         (1, 1), // terminator sign
     ]);
@@ -311,10 +312,10 @@ fn intra_block_tier_1_esc_level_extension() {
 // Test 4 — Tier 2 ESC body (run extension) reached after DC decode.
 // =====================================================================
 
-/// Tier 2: ESC → ESC (re-fire) → primary VLC → sign. The emitted run
-/// is `run_base + RMAX[last][|level|] + 1`. Use inner = idx 0
-/// (run=0, level=1, last=false): RMAX[0][1] = 14 per audit/01 §4.1,
-/// so the emitted run is 0 + 14 + 1 = 15.
+/// Run-extension tier (round 420): ESC → selector `0` → primary VLC →
+/// sign. The emitted run is `run_base + RMAX[last][|level|] + 1`. Use
+/// inner = idx 0 (run=0, level=1, last=false): RMAX[0][1] = 14 per
+/// audit/01 §4.1, so the emitted run is 0 + 14 + 1 = 15.
 #[test]
 fn intra_block_tier_2_esc_run_extension() {
     let pred_dc = 1024i32;
@@ -326,8 +327,8 @@ fn intra_block_tier_2_esc_run_extension() {
     let bytes = pack(&[
         (dc_code, dc_bl),
         // (no DC sign — diff is 0)
-        (esc_code, esc_bits as u32),     // tier-1 marker
-        (esc_code, esc_bits as u32),     // tier-1 re-fires → enter tier 2
+        (esc_code, esc_bits as u32),     // ESC marker
+        (0, 1),                          // selector: run-extension tier
         (inner_code, inner_bits as u32), // re-VLC payload for tier 2
         (0, 1),                          // tier-2 sign bit (positive)
         (term_code, term_bits as u32),
@@ -371,9 +372,10 @@ fn intra_block_tier_2_esc_run_extension() {
 // Test 5 — Tier 3 ESC body (verbatim FLC triple) reached after DC.
 // =====================================================================
 
-/// Tier 3: ESC → ESC → ESC → 1+6+8-bit verbatim FLC triple. The
-/// terminator is encoded inline (last=1 set inside the FLC), so no
-/// separate terminator entry is needed.
+/// Verbatim arm (round 420 encoder-compat): ESC → selector `1` →
+/// nested ESC → 1+6+8-bit verbatim FLC triple. The terminator is
+/// encoded inline (last=1 set inside the FLC), so no separate
+/// terminator entry is needed.
 #[test]
 fn intra_block_tier_3_esc_verbatim() {
     let pred_dc = 1024i32;
@@ -383,8 +385,8 @@ fn intra_block_tier_3_esc_verbatim() {
     let bytes = pack(&[
         (dc_code, dc_bl),
         (esc_code, esc_bits as u32),
-        (esc_code, esc_bits as u32),
-        (esc_code, esc_bits as u32),
+        (1, 1),                      // selector: level-extension tier
+        (esc_code, esc_bits as u32), // nested ESC → verbatim FLC
         // Verbatim triple: last=1, run=7, level=-5 (0xfb as signed 8-bit).
         (1, 1),
         (7, 6),
@@ -433,7 +435,7 @@ fn intra_block_cbp_zero_skips_ac_walk() {
     // they're not consumed.
     let bytes = pack(&[
         (dc_code, dc_bl),
-        (1, 1), // DC sign (positive)
+        (0, 1), // DC sign (0 ⇒ positive, round 420)
         (0xff, 8),
         (0xff, 8),
     ]);
@@ -485,7 +487,7 @@ fn intra_block_chroma_uses_chroma_dc_scaler() {
     let (term_code, term_bits, _term_run, _term_level) = g5_shortest_terminator();
     let bytes = pack(&[
         (dc_code, dc_bl),
-        (1, 1),
+        (0, 1), // DC sign (0 ⇒ positive, round 420)
         (term_code, term_bits as u32),
         (1, 1),
     ]);
@@ -531,12 +533,12 @@ fn intra_block_dc_esc_tier_decodes() {
     // idx 119 = ESC sentinel.
     let (esc_bl, esc_code) = dc_luma_sel0_code(119);
     let (term_code, term_bits, term_run, _) = g5_shortest_terminator();
-    // ESC raw = 0x80, sign = 1 ⇒ positive 128. Per spec/07 §5.2: sign
-    // bit set ⇒ keep raw, sign bit unset ⇒ negate.
+    // ESC raw = 0x80, sign = 0 ⇒ positive 128 (round 420 standard
+    // convention: sign bit set ⇒ negative).
     let bytes = pack(&[
         (esc_code, esc_bl),
         (0x80, 8),
-        (1, 1), // sign bit ⇒ positive
+        (0, 1), // sign bit clear ⇒ positive
         (term_code, term_bits as u32),
         (1, 1),
     ]);

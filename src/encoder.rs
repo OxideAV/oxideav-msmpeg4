@@ -49,11 +49,11 @@ use oxideav_core::{
 };
 
 use crate::enc::{
-    encode_iframe_v1v2, encode_iframe_v3, encode_pframe_v1v2_with_stats,
+    encode_iframe_v1v2, encode_iframe_v3_opts, encode_pframe_v1v2_with_stats,
     encode_pframe_v3_with_stats, EncoderConfig,
 };
 use crate::header::PictureType;
-use crate::picture::{decode_picture, decode_picture_v1v2, MsV1V2Version, Picture, PictureDims};
+use crate::picture::{decode_picture_v1v2, MsV1V2Version, Picture, PictureDims};
 
 /// Which MS-MPEG4 bitstream version an encoder instance emits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -298,8 +298,11 @@ impl MsMpeg4Encoder {
             EncVersion::V2 => Some(MsV1V2Version::V2),
             EncVersion::V3 => None,
         };
+        // First frame of the whole encode: v3 I-frames carry the
+        // 5-bit per-sequence extension (spec/99 §2.2; round 420).
+        let first_of_sequence = self.last_recon.is_none();
         let encode_i = |input: &Picture| match v1v2 {
-            None => encode_iframe_v3(input, self.dims, &config),
+            None => encode_iframe_v3_opts(input, self.dims, &config, first_of_sequence),
             Some(v) => encode_iframe_v1v2(input, self.dims, &config, v),
         };
         if force_key {
@@ -436,8 +439,15 @@ impl Encoder for MsMpeg4Encoder {
         // Decode our own bytes so the next P-frame references exactly
         // what a decoder will hold (no encoder/decoder drift possible).
         let mut br = BitReader::new(&bytes);
+        let first_of_sequence = self.last_recon.is_none();
         let recon = match v1v2 {
-            None => decode_picture(&mut br, self.dims, self.last_recon.as_ref())?,
+            None => crate::picture::decode_picture_opts(
+                &mut br,
+                self.dims,
+                self.last_recon.as_ref(),
+                crate::picture::AcSelection::default(),
+                first_of_sequence,
+            )?,
             Some(v) => decode_picture_v1v2(&mut br, self.dims, v, self.last_recon.as_ref())?,
         };
         self.last_recon = Some(recon);
@@ -567,7 +577,14 @@ mod tests {
             enc.send_frame(&Frame::Video(vf.clone())).unwrap();
             let pkt = enc.receive_packet().unwrap();
             let mut br = BitReader::new(&pkt.data);
-            let out = decode_picture(&mut br, dims, last.as_ref()).unwrap();
+            let out = crate::picture::decode_picture_opts(
+                &mut br,
+                dims,
+                last.as_ref(),
+                crate::picture::AcSelection::default(),
+                n == 0,
+            )
+            .unwrap();
             // Compare the visible region against the source frame.
             let mut sum = 0u64;
             for j in 0..48 {

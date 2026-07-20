@@ -25,21 +25,16 @@
 //!   `region_05e228.hex` / `region_05e678.hex`, VMAs `0x1c25ee28` /
 //!   `0x1c25f278`). 1104 bytes each; only indices 0..1099 are read by
 //!   the decoder.
-//! * `intra_ac_v3.rs` — candidate v3 intra AC TCOEF run/level/last
-//!   primary VLC source (`region_05eed0.csv`, VMA `0x1c25fad0`, file
-//!   offset `0x5eed0`). 64 `(bit_length, code_value)` payload entries
-//!   plus a `(count_A=64, count_B=1)` header row. Kraft sum over the
-//!   64 bit-lengths is exactly 1, confirming the table is a complete
-//!   canonical-Huffman prefix code. Per spec/99 §0.1 row 8 the role
-//!   attribution of this region is **OPEN** (candidate v2 MCBPCY
-//!   source vs intra-AC TCOEF candidate per spec/03 §5.3); the bytes
-//!   are extracted reproducibly regardless and the Implementer wires
-//!   them through the same canonical-Huffman builder used for MCBPCY,
-//!   leaving the (last, run, level) symbol decoding behind a guarded
-//!   constructor (`AcVlcTable::v3_intra_candidate`) so callers opt in
-//!   explicitly.
+//! * `intra_cbpcy_v3.rs` — v3 **I-frame intra CBPCY** VLC source
+//!   (`region_05eed0.csv` re-aligned, VMA `0x1c25fad0`, file offset
+//!   `0x5eed0`). 64 `(bit_length, wire code)` entries indexed by the
+//!   6-bit CBP pattern; Kraft sum is exactly 1. Round 420 resolved
+//!   this region's role (spec/99 §0.1 row 8 was OPEN): the re-aligned
+//!   pairs are byte-identical to the independently staged
+//!   `tables-ff/msmp4-mb-i-table.csv` and real Microsoft I-frames
+//!   parse only through this table.
 //!
-//! One older CSV (the intra-AC candidate) has a historically
+//! One older CSV (`region_05eed0.csv`) has a historically
 //! mis-labelled column naming where `symbol_dec` holds the `bit_length`
 //! and `bit_length` holds the `code_value`; see
 //! `docs/video/msmpeg4/spec/99-current-understanding.md` §8.1 for the
@@ -188,7 +183,7 @@ fn main() {
     // 64-entry canonical Huffman; role attribution OPEN per spec/99 §0.1.
     let ac_csv = tables_dir.join("region_05eed0.csv");
     println!("cargo:rerun-if-changed={}", ac_csv.display());
-    emit_intra_ac_v3(&ac_csv, &out_dir.join("intra_ac_v3.rs"));
+    emit_intra_cbpcy_v3(&ac_csv, &out_dir.join("intra_cbpcy_v3.rs"));
 
     // v1/v2 MCBPC tables — 053140 (combined LUT region 0x53140..0x53640;
     // 1024 bytes are v1 MCBPC 9-bit LUT, then 256 bytes are v2 MCBPC
@@ -398,8 +393,8 @@ fn main() {
     // grouping where the luma path (VMA 0x1c214b0e) accesses the first
     // pair and the chroma paths (Cb / Cr) access the second pair.
     let dc_luma_sel0 = tables_dir.join("region_05f0d8.hex");
-    let dc_luma_sel1 = tables_dir.join("region_05f4a0.hex");
-    let dc_chroma_sel0 = tables_dir.join("region_05f868.hex");
+    let dc_luma_sel1 = tables_dir.join("region_05f868.hex");
+    let dc_chroma_sel0 = tables_dir.join("region_05f4a0.hex");
     let dc_chroma_sel1 = tables_dir.join("region_05fc30.hex");
     println!("cargo:rerun-if-changed={}", dc_luma_sel0.display());
     println!("cargo:rerun-if-changed={}", dc_luma_sel1.display());
@@ -1360,24 +1355,39 @@ fn emit_mv_byte_lut_v3_alt(mvdx_path: &Path, mvdy_path: &Path, out_path: &Path) 
     writeln!(f, "];").unwrap();
 }
 
-/// Parse `region_05eed0.csv` and emit the candidate v3 intra AC TCOEF
-/// primary VLC source. The CSV uses the same column convention as
-/// MCBPCY: the `symbol_dec` column is the bit_length, the `bit_length`
-/// column is the code_value (see spec/99 §8.1). Row 0 is the header
-/// `(count_A=64, count_B=1)`; rows 1..=64 are the 64 payload entries.
+/// Parse `region_05eed0.csv` and emit the **v3 I-frame intra CBPCY
+/// VLC source** (round 420 role resolution of VMA `0x1c25fad0`).
 ///
-/// Provenance: `docs/video/msmpeg4/tables/region_05eed0.csv` —
-/// extracted from `mpg4c32.dll` (SHA-256
-/// `aedb4cf3...b3c099`) at file offset `0x5eed0`, VMA `0x1c25fad0`.
-/// Spec/99 §0.1 row 8 flags this VMA as a candidate intra-AC primary
-/// VLC (per spec/03 §5.3) but also notes it could be the v2 MCBPCY
-/// source (`spec/99` §9 OPEN-O6) — the role is unresolved. The bytes
-/// are extraction-grounded regardless and Kraft sums to exactly 1
-/// over the 64 payload bit-lengths (verified at build time below).
-fn emit_intra_ac_v3(csv_path: &Path, out_path: &Path) {
+/// The region's raw layout is `[count:u32 = 64]` followed by 64
+/// `(code:u32-LE, bit_length:u32-LE)` records — the same packed-VLC
+/// loader shape as the joint-MCBPCY source (`region_05eac8`, spec/99
+/// §8.1). The Extractor-03 CSV mis-aligned the dump by one u32 (the
+/// count header was folded into record 0 and the fields swapped —
+/// the same mis-parse class provenance/22 fixed for `region_05eac8`),
+/// so this emitter re-aligns: `code_i = row[i].col4`,
+/// `bit_length_i = row[i+1].col3`.
+///
+/// Role evidence (round 420):
+/// * Re-aligned, the 64 `(code, bit_length)` pairs are byte-identical
+///   to the staged `tables-ff/msmp4-mb-i-table.csv` ("intra picture
+///   macroblock coded block pattern") — two independent staged
+///   sources agree.
+/// * Kraft over the 64 bit-lengths is exactly 1.0 (verified below).
+/// * The staged real Microsoft I-frame fixtures parse coherently and
+///   reconstruct reference pixels only when the I-frame MB header is
+///   decoded through this table (the 128-entry `region_05eac8` joint
+///   table is the **P-frame** MCBPCY per its `tables-ff` companion
+///   role, "non intra picture macroblock coded block pattern + mb
+///   type").
+///
+/// This closes spec/99 §0.1 row 8's OPEN role for `0x1c25fad0` (the
+/// "candidate v2 MCBPCY / candidate intra-AC" hypotheses are both
+/// refuted).
+fn emit_intra_cbpcy_v3(csv_path: &Path, out_path: &Path) {
     let text = fs::read_to_string(csv_path)
         .unwrap_or_else(|e| panic!("failed to read {}: {e}", csv_path.display()));
 
+    // Raw u32 pairs exactly as dumped (mis-aligned; see doc above).
     let mut records: Vec<(u32, u32)> = Vec::with_capacity(65);
     for (line_no, line) in text.lines().enumerate() {
         if line_no == 0 {
@@ -1391,90 +1401,83 @@ fn emit_intra_ac_v3(csv_path: &Path, out_path: &Path) {
         if parts.len() < 5 {
             panic!("malformed row at line {}: {line}", line_no + 1);
         }
-        // Same column convention as MCBPCY: parts[3] = symbol_dec column =
-        // bit_length value; parts[4] = bit_length column = code_value.
-        let bit_length: u32 = parts[3]
+        let a: u32 = parts[3]
             .parse()
-            .unwrap_or_else(|_| panic!("bad bit_length at line {}: {}", line_no + 1, parts[3]));
-        let code_value: u32 = parts[4]
+            .unwrap_or_else(|_| panic!("bad col-3 at line {}: {}", line_no + 1, parts[3]));
+        let b: u32 = parts[4]
             .parse()
-            .unwrap_or_else(|_| panic!("bad code_value at line {}: {}", line_no + 1, parts[4]));
-        records.push((bit_length, code_value));
+            .unwrap_or_else(|_| panic!("bad col-4 at line {}: {}", line_no + 1, parts[4]));
+        records.push((a, b));
     }
 
     if records.len() != 65 {
         panic!(
-            "expected 65 records in {} (1 header + 64 payload), got {}",
+            "expected 65 records in {} (count header + 64 payload), got {}",
             csv_path.display(),
             records.len()
         );
     }
-
-    let (alphabet_size, partition) = records[0];
-    if alphabet_size != 64 {
+    let count = records[0].0;
+    if count != 64 {
         panic!(
-            "unexpected alphabet size {alphabet_size} in {} (expected 64)",
-            csv_path.display()
-        );
-    }
-    if partition != 1 {
-        panic!(
-            "unexpected partition {partition} in {} (expected 1)",
+            "unexpected count header {count} in {} (expected 64)",
             csv_path.display()
         );
     }
 
-    // Verify Kraft sum == 1 over the 64 payload bit-lengths (in 2^-bl
-    // arithmetic). All bls must be in [1, 32] for a valid
-    // canonical-Huffman code. Compute exactly using the LCM trick:
-    // sum of 2^-bl == 1 iff sum of 2^(MAX-bl) == 2^MAX.
-    let max_bl = 32u32;
-    let target: u64 = 1u64 << max_bl;
-    let mut sum: u64 = 0;
-    for &(bl, _) in &records[1..] {
-        if !(1..=32).contains(&bl) {
+    // Re-align: code_i = records[i].1, bit_length_i = records[i + 1].0.
+    let mut entries: Vec<(u32, u32)> = Vec::with_capacity(64); // (bl, code)
+    for i in 0..64 {
+        let code = records[i].1;
+        let bl = records[i + 1].0;
+        if !(1..=13).contains(&bl) {
             panic!(
-                "intra-AC candidate: bit_length {bl} out of range [1, 32] — \
-                 cannot form a canonical-Huffman code"
+                "intra-CBPCY: bit_length {bl} out of range [1, 13] at idx {i} — \
+                 re-alignment failed"
             );
         }
-        sum += 1u64 << (max_bl - bl);
+        entries.push((bl, code));
     }
+
+    // Kraft sum must be exactly 1 (complete prefix code).
+    let target: u64 = 1u64 << 32;
+    let sum: u64 = entries.iter().map(|&(bl, _)| 1u64 << (32 - bl)).sum();
     if sum != target {
         panic!(
-            "intra-AC candidate: Kraft sum != 1 (sum of 2^-bl gives {} / {} \
-             in fixed-point); the table is not a complete prefix code",
-            sum, target
+            "intra-CBPCY: Kraft sum != 1 ({sum} / {target} fixed-point); \
+             the table is not a complete prefix code"
         );
     }
+
+    // Spot-check the re-alignment against the independently staged
+    // numeric table (tables-ff/msmp4-mb-i-table.csv rows 0/1/5):
+    // cbp 0 -> (code 0x1, len 1); cbp 1 -> (0x17, 6); cbp 5 -> (0x47, 9).
+    assert_eq!(entries[0], (1, 1), "intra-CBPCY idx 0 mismatch");
+    assert_eq!(entries[1], (6, 0x17), "intra-CBPCY idx 1 mismatch");
+    assert_eq!(entries[5], (9, 0x47), "intra-CBPCY idx 5 mismatch");
 
     let mut f = fs::File::create(out_path)
         .unwrap_or_else(|e| panic!("failed to create {}: {e}", out_path.display()));
     writeln!(
         f,
         "// Auto-generated by build.rs from \
-         docs/video/msmpeg4/tables/region_05eed0.csv. DO NOT EDIT.\n\
+         docs/video/msmpeg4/tables/region_05eed0.csv (re-aligned). DO NOT EDIT.\n\
          // Source binary: mpg4c32.dll SHA-256 \
          aedb4cf3d33c8554ab8acf04afe2d936eaa7c49107c5fefe163bca2e94b3c099\n\
-         // Role (CANDIDATE — OPEN per spec/99 §0.1 row 8 / §9 OPEN-O6):\n\
-         //   v3 intra AC TCOEF run/level/last primary VLC source\n\
-         //   (alternative: v2 joint-MCBPCY source). Kraft sum of the\n\
-         //   64 payload bit-lengths is exactly 1 (verified at build time).\n\
+         // Role: v3 I-frame intra CBPCY VLC source (VMA 0x1c25fad0);\n\
+         //   64-entry canonical prefix code, Kraft = 1.0, byte-identical\n\
+         //   to the staged tables-ff/msmp4-mb-i-table.csv. Index == the\n\
+         //   6-bit CBP pattern in block-decode order (Y0 Y1 Y2 Y3 Cb Cr,\n\
+         //   MSB first); the luma bits are XOR-predicted (see\n\
+         //   crate::mcbpcy::decode_intra_cbpcy_v3).\n\
          \n\
-         pub const INTRA_AC_V3_CANDIDATE_ALPHABET: usize = {};\n\
-         pub const INTRA_AC_V3_CANDIDATE_PARTITION: usize = {};\n\
+         pub const MCBPCY_V3_INTRA_ALPHABET: usize = 64;\n\
          \n\
-         /// 64 × (bit_length, code_value) canonical-Huffman entries for\n\
-         /// the v3 intra AC TCOEF primary VLC candidate. The `code_value`\n\
-         /// column is the runtime LUT/state byte (same convention as\n\
-         /// MCBPCY — spec/99 §8.1) and is **not** the Huffman bit-pattern;\n\
-         /// the bit-pattern is reconstructed by the canonical-Huffman\n\
-         /// builder from the bit_length array alone.\n\
-         pub const INTRA_AC_V3_CANDIDATE_RAW: &[(u32, u32)] = &[",
-        alphabet_size, partition,
+         /// 64 x (bit_length, wire code) entries; index == CBP pattern.\n\
+         pub const MCBPCY_V3_INTRA_RAW: &[(u32, u32)] = &["
     )
     .unwrap();
-    for &(bl, code) in &records[1..] {
+    for &(bl, code) in &entries {
         writeln!(f, "    ({bl}, {code}),").unwrap();
     }
     writeln!(f, "];").unwrap();
@@ -2293,7 +2296,7 @@ fn emit_packed_huffman_primary(
                  budget; extraction misalignment suspected"
             );
         }
-        records.push((b, a)); // store as (bit_length, code_value) for parity with INTRA_AC_V3_CANDIDATE_RAW
+        records.push((b, a)); // store as (bit_length, code_value)
     }
 
     // Kraft sum check. Per spec/11 §5 both G4 and G5 saturate at

@@ -28,7 +28,8 @@ use oxideav_core::{Error, Result};
 
 use crate::tables::CBPY_INTRA_TABLE;
 use crate::tables_data::{
-    MB_TYPE_V1_INFO, MCBPCY_V3_PARTITION, MCBPCY_V3_RAW, MCBPC_V1_RAW, MCBPC_V2_RAW,
+    MB_TYPE_V1_INFO, MCBPCY_V3_INTRA_ALPHABET, MCBPCY_V3_PARTITION, MCBPCY_V3_RAW, MCBPC_V1_RAW,
+    MCBPC_V2_RAW,
 };
 use crate::vlc::{self, VlcEntry};
 
@@ -51,6 +52,75 @@ fn build_table() -> Vec<VlcEntry<u8>> {
 
 fn table() -> &'static [VlcEntry<u8>] {
     MCBPCY_V3_TABLE.get_or_init(build_table)
+}
+
+/// v3 **I-frame intra CBPCY** VLC table (round 420), built from the
+/// re-aligned `region_05eed0` source at VMA `0x1c25fad0` — 64
+/// `(bit_length, wire code)` entries indexed directly by the 6-bit
+/// CBP pattern, byte-identical to the independently staged
+/// `tables-ff/msmp4-mb-i-table.csv` ("intra picture macroblock coded
+/// block pattern"). Kraft = 1.0.
+///
+/// I-frames do **not** use the 128-entry joint MCBPCY table — that
+/// table is the P-frame MB header ("non intra picture macroblock
+/// coded block pattern + mb type" per its staged companion role).
+/// Both pinned real Microsoft DIV3 fixtures parse their first I-frame
+/// coherently only through this 64-entry table.
+static MCBPCY_V3_INTRA_TABLE: std::sync::OnceLock<Vec<VlcEntry<u8>>> = std::sync::OnceLock::new();
+
+fn intra_table() -> &'static [VlcEntry<u8>] {
+    MCBPCY_V3_INTRA_TABLE.get_or_init(|| {
+        crate::tables_data::MCBPCY_V3_INTRA_RAW
+            .iter()
+            .enumerate()
+            .map(|(idx, &(bl, code))| VlcEntry::new(bl as u8, code, idx as u8))
+            .collect()
+    })
+}
+
+/// Decode one raw v3 I-frame intra CBPCY symbol (0..=63).
+///
+/// The symbol's six bits are in **block-decode order**, MSB first:
+/// bit 5 = Y(0,0), bit 4 = Y(1,0), bit 3 = Y(0,1), bit 2 = Y(1,1),
+/// bit 1 = Cb, bit 0 = Cr. The four **luma** bits are XOR-coded
+/// against a spatial prediction (patent US 7,054,494's I-frame
+/// CBPCY-XOR): the per-block predicted bit is the *actual* coded bit
+/// of the DC-gradient-direction neighbour (the same left/top decision
+/// the DC predictor makes; missing neighbours predict 0). The two
+/// chroma bits are raw. The caller resolves the XOR per block while
+/// walking the MB (the prediction is causal — it only consumes
+/// already-decoded DC values and coded bits); see
+/// `picture::decode_iframe`.
+///
+/// Empirical grounding (round 420): with this table + XOR rule the
+/// first I-frames of both pinned Microsoft DIV3 fixtures reconstruct
+/// the reference pixel means of the leading MB rows exactly, on two
+/// independently encoded bitstreams of the same content.
+pub fn decode_intra_cbpcy_sym(br: &mut BitReader<'_>) -> Result<u8> {
+    let sym = vlc::decode_named(br, intra_table(), "v3 intra cbpcy")?;
+    if sym as usize >= MCBPCY_V3_INTRA_ALPHABET {
+        return Err(Error::invalid(format!(
+            "msmpeg4v3 intra cbpcy: decoded symbol {sym} >= alphabet 64"
+        )));
+    }
+    Ok(sym)
+}
+
+/// Encode one raw v3 I-frame intra CBPCY symbol — the bit-level
+/// inverse of [`decode_intra_cbpcy_sym`]. The caller applies the luma
+/// XOR prediction before composing the symbol.
+pub fn encode_intra_cbpcy_sym(bw: &mut BitWriter, sym: u8) -> Result<()> {
+    if sym as usize >= MCBPCY_V3_INTRA_ALPHABET {
+        return Err(Error::invalid(format!(
+            "msmpeg4v3 intra cbpcy: symbol {sym} out of alphabet 0..=63"
+        )));
+    }
+    let entry = intra_table()
+        .iter()
+        .find(|e| e.value == sym)
+        .ok_or_else(|| Error::invalid("msmpeg4v3 intra cbpcy: symbol has no codeword"))?;
+    bw.write_u32(entry.code, entry.bits as u32);
+    Ok(())
 }
 
 /// Decoded MCBPCY packet: joint MB-type + 6-bit CBP pattern.

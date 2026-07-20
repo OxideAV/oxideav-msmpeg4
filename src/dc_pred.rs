@@ -96,24 +96,34 @@ pub fn predict_dc(a_left: Option<i32>, b_top: Option<i32>, d_tl: Option<i32>) ->
     let b = b_top.unwrap_or(NEUTRAL_DC);
     let d = d_tl.unwrap_or(NEUTRAL_DC);
     // MPEG-4 §7.4.3 gradient rule (and `docs/video/msmpeg4/spec/03-corrections.md`
-    // §1.3): compare `|A - D|` (gradient down the left column) with
-    // `|D - B|` (gradient along the top row). The smaller gradient wins
-    // — i.e. a flatter direction means the neighbour on that axis is
-    // more representative.
+    // §1.3): compare `|A - D|` (horizontal gradient along the top-left
+    // pair) with `|D - B|` (vertical gradient along the top pair).
     //
-    //   |A - D| < |D - B| → left-column gradient is smaller → predict
-    //                       from LEFT (horizontal predictor wins).
-    //   else            → top-row gradient is smaller → predict from
-    //                       TOP (vertical predictor wins).
-    if (a - d).abs() < (d - b).abs() {
-        DcPrediction {
-            predictor: a,
-            direction: PredDir::FromLeft,
-        }
-    } else {
+    //   |A - D| <= |D - B| → the horizontal gradient is smaller-or-equal
+    //                        → predict from TOP (vertical predictor
+    //                        wins). Ties predict from TOP.
+    //   else               → predict from LEFT.
+    //
+    // Round 420: the previous reading had the two branches swapped
+    // (and ties going the other way). Both were refuted empirically
+    // against the staged real-content fixtures: with the swapped rule
+    // the very first I-frame row of `div4.avi` mis-predicts block
+    // (1, 0) of MB (0, 0) (+32 differential lands on the wrong
+    // predictor), and the tie case first bites at MB (2, 0) block 2
+    // (|A−D| == |D−B| == 10 must resolve to TOP to reconstruct the
+    // reference pixel means). The corrected rule reconstructs every
+    // luma/chroma DC of the first eight MB columns of both DIV3 AVI
+    // fixtures exactly (see `tests/microsoft_fixtures.rs` ground
+    // truth and CHANGELOG r420).
+    if (a - d).abs() <= (d - b).abs() {
         DcPrediction {
             predictor: b,
             direction: PredDir::FromTop,
+        }
+    } else {
+        DcPrediction {
+            predictor: a,
+            direction: PredDir::FromLeft,
         }
     }
 }
@@ -243,25 +253,36 @@ mod tests {
     }
 
     #[test]
-    fn strong_horizontal_gradient_picks_left() {
-        // D=100, A=200, B=500 → |A-D|=100, |D-B|=400 → left wins.
+    fn small_horizontal_gradient_picks_top() {
+        // D=100, A=200, B=500 → |A-D|=100 <= |D-B|=400 → TOP wins
+        // (round 420 corrected rule; the old reading picked LEFT here
+        // and was refuted on the real-content fixtures).
+        // Per spec/03 §1.1, predict-from-TOP (vertical pred wins) ⇒
+        // alt-horizontal scan (binary VMA 0x1c261140).
+        let p = predict_dc(Some(200), Some(500), Some(100));
+        assert_eq!(p.predictor, 500);
+        assert_eq!(p.direction, PredDir::FromTop);
+        assert_eq!(p.direction.ac_scan(), Scan::AlternateHorizontal);
+    }
+
+    #[test]
+    fn large_horizontal_gradient_picks_left() {
+        // D=100, A=500, B=200 → |A-D|=400 > |D-B|=100 → LEFT wins.
         // Per spec/03 §1.1, predict-from-LEFT (horizontal pred wins) ⇒
         // alt-vertical scan (binary VMA 0x1c261240).
-        let p = predict_dc(Some(200), Some(500), Some(100));
-        assert_eq!(p.predictor, 200);
+        let p = predict_dc(Some(500), Some(200), Some(100));
+        assert_eq!(p.predictor, 500);
         assert_eq!(p.direction, PredDir::FromLeft);
         assert_eq!(p.direction.ac_scan(), Scan::AlternateVertical);
     }
 
     #[test]
-    fn strong_vertical_gradient_picks_top() {
-        // D=100, A=500, B=200 → |A-D|=400, |D-B|=100 → top wins.
-        // Per spec/03 §1.1, predict-from-TOP (vertical pred wins) ⇒
-        // alt-horizontal scan (binary VMA 0x1c261140).
-        let p = predict_dc(Some(500), Some(200), Some(100));
-        assert_eq!(p.predictor, 200);
+    fn tie_gradient_picks_top() {
+        // A=764, B=744, D=754 → |A-D| == |D-B| == 10 → TOP (the tie
+        // case pinned by MB (2, 0) block 2 of the div4.avi I-frame).
+        let p = predict_dc(Some(764), Some(744), Some(754));
+        assert_eq!(p.predictor, 744);
         assert_eq!(p.direction, PredDir::FromTop);
-        assert_eq!(p.direction.ac_scan(), Scan::AlternateHorizontal);
     }
 
     #[test]
@@ -272,9 +293,9 @@ mod tests {
         c.luma_set(0, 1, 512);
         // predict block (1, 1): A = (0,1) = 512, B = (1,0) = 2048, D = (0,0) = 1024.
         let p = c.predict_luma(1, 1);
-        // |A-D| = |512 - 1024| = 512, |D-B| = |1024 - 2048| = 1024. Left wins.
-        assert_eq!(p.predictor, 512);
-        assert_eq!(p.direction, PredDir::FromLeft);
+        // |A-D| = |512 - 1024| = 512 <= |D-B| = |1024 - 2048| = 1024 → TOP.
+        assert_eq!(p.predictor, 2048);
+        assert_eq!(p.direction, PredDir::FromTop);
     }
 
     #[test]

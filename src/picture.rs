@@ -201,11 +201,6 @@ pub enum AcSelection {
     /// decoder falls back to DC-only reconstruction. Retained as an
     /// opt-in for diagnostic / regression-comparison runs.
     Placeholder,
-    /// Candidate VLC built from `region_05eed0.csv` via
-    /// [`AcVlcTable::v3_intra_candidate`]. Pre-round-26 plumbing for
-    /// synthetic-stream pipeline tests; superseded by [`AcSelection::G5`]
-    /// for real-content decode.
-    Candidate,
 }
 
 /// Variant of [`decode_picture`] with explicit control over which
@@ -216,7 +211,32 @@ pub fn decode_picture_with_ac(
     reference: Option<&Picture>,
     ac_selection: AcSelection,
 ) -> Result<Picture> {
+    decode_picture_opts(br, dims, reference, ac_selection, false)
+}
+
+/// Variant of [`decode_picture_with_ac`] with the **first-of-sequence**
+/// flag exposed. Per spec/99 §2.2, the very first I-frame of a
+/// sequence carries a 5-bit per-sequence extension right after the
+/// per-frame selector bits (consumed by `1c21224b`; exact payload
+/// layout is still OPEN — candidate dimensions / aspect / frame-rate
+/// hints). Both pinned real Microsoft DIV3 fixtures carry it on frame
+/// 0, and their first I-frame only parses coherently when these 5
+/// bits are skipped (round 420). Streams produced by this crate's own
+/// registered encoder mirror the same convention (5 zero bits on the
+/// first frame of the encode).
+pub fn decode_picture_opts(
+    br: &mut BitReader<'_>,
+    dims: PictureDims,
+    reference: Option<&Picture>,
+    ac_selection: AcSelection,
+    first_of_sequence: bool,
+) -> Result<Picture> {
     let hdr = MsV3PictureHeader::parse(br)?;
+    if first_of_sequence && hdr.picture_type == PictureType::I {
+        // 5-bit first-of-sequence extension (spec/99 §2.2); payload
+        // semantics OPEN — skipped.
+        let _seq_ext = br.read_u32(5)?;
+    }
     // Diagnostic trace gated on `OXIDEAV_MSMPEG4_AC_TRACE`. Shows the
     // picture-header field values (so the implementer can tell when a
     // fixture is using the alternate intra-DC VLC `dc_size_sel=1` for
@@ -281,7 +301,6 @@ fn luma_ac_table_for(selection: AcSelection, hdr: &MsV3PictureHeader) -> AcVlcTa
         },
         AcSelection::G5 => AcVlcTable::v3_intra_g5(),
         AcSelection::Placeholder => AcVlcTable::V3_INTRA_PLACEHOLDER,
-        AcSelection::Candidate => AcVlcTable::v3_intra_candidate(),
     }
 }
 
@@ -309,7 +328,6 @@ fn chroma_ac_table_for(selection: AcSelection, hdr: &MsV3PictureHeader) -> AcVlc
         },
         AcSelection::G5 => AcVlcTable::g4_inter(),
         AcSelection::Placeholder => AcVlcTable::V3_INTRA_PLACEHOLDER,
-        AcSelection::Candidate => AcVlcTable::v3_intra_candidate(),
     }
 }
 
@@ -348,23 +366,172 @@ fn decode_iframe(
     let luma_ac = luma_ac_table_for(ac_selection, hdr);
     let chroma_ac = chroma_ac_table_for(ac_selection, hdr);
 
+    // Per-luma-block *actual* coded-bit grid for the CBPCY XOR
+    // prediction (patent US 7,054,494; round 420). One bit per 8x8
+    // luma block, raster over the block grid.
+    let mut luma_cbp = vec![false; (mb_w * 2) * (mb_h * 2)];
+
     for my in 0..mb_h {
         for mx in 0..mb_w {
-            decode_intra_mb_to_picture(
+            decode_intra_mb_iframe_v3(
                 br,
                 &mut pic,
                 &mut dc_cache,
+                &mut luma_cbp,
+                mb_w * 2,
                 mx,
                 my,
                 quant,
                 hdr.dc_size_sel,
                 &luma_ac,
                 &chroma_ac,
-            )?;
+            )
+            .map_err(|e| {
+                Error::invalid(format!(
+                    "I-frame MB ({mx},{my}) [#{} of {}]: {e}",
+                    my * mb_w + mx,
+                    mb_w * mb_h
+                ))
+            })?;
         }
     }
 
     Ok(pic)
+}
+
+/// Decode one v3 **I-frame** macroblock (round 420 MB-header syntax).
+///
+/// Wire layout per MB:
+///
+/// 1. One 64-entry intra-CBPCY symbol
+///    ([`crate::mcbpcy::decode_intra_cbpcy_sym`]) whose six bits are in
+///    block-decode order (MSB first: Y(0,0), Y(1,0), Y(0,1), Y(1,1),
+///    Cb, Cr).
+/// 2. One `ac_pred` flag bit.
+/// 3. Per block (decode order): the DC differential, then — if the
+///    block's *resolved* coded bit is set — the intra AC walk.
+///
+/// The four luma symbol bits are XOR-coded against a causal spatial
+/// prediction: for each luma block, the DC-gradient rule
+/// ([`crate::dc_pred::predict_dc`]) picks the left or top neighbour,
+/// and that neighbour's **actual** coded bit (0 outside the picture)
+/// is the predicted bit; `actual = symbol_bit ^ predicted`. The two
+/// chroma bits are raw. Grounding: both pinned real Microsoft DIV3
+/// fixtures decode the leading rows of their first I-frame to the
+/// exact reference pixel means only under this rule (round 420);
+/// no static bit-to-block assignment fits both fixtures.
+#[allow(clippy::too_many_arguments)]
+fn decode_intra_mb_iframe_v3(
+    br: &mut BitReader<'_>,
+    pic: &mut Picture,
+    dc_cache: &mut DcCache,
+    luma_cbp: &mut [bool],
+    luma_grid_w: usize,
+    mb_x: usize,
+    mb_y: usize,
+    quant: u32,
+    dc_size_sel: u8,
+    luma_ac: &AcVlcTable,
+    chroma_ac: &AcVlcTable,
+) -> Result<()> {
+    let trace = std::env::var_os("OXIDEAV_MSMPEG4_AC_TRACE").is_some();
+    let mb_start = br.bit_position();
+    let sym = crate::mcbpcy::decode_intra_cbpcy_sym(br)?;
+    let ac_pred = br.read_bit()?;
+    if trace {
+        eprintln!(
+            "[mb trace] mb=({mb_x},{mb_y}) start_bit={mb_start} intra_cbpcy_sym={sym:06b} ac_pred={ac_pred} after_hdr={}",
+            br.bit_position(),
+        );
+    }
+
+    for block_idx in 0..6usize {
+        let sym_bit = (sym >> (5 - block_idx)) & 1 != 0;
+
+        // DC spatial prediction — per-block (not per-MB).
+        let (bx, by) = block_grid_pos(block_idx, mb_x, mb_y);
+        let pred: DcPrediction = match block_idx {
+            0..=3 => dc_cache.predict_luma(bx, by),
+            4 => dc_cache.predict_chroma(false, bx, by),
+            5 => dc_cache.predict_chroma(true, bx, by),
+            _ => unreachable!(),
+        };
+
+        // Resolve the coded bit: luma bits are XOR-predicted from the
+        // gradient-direction neighbour's actual coded bit; chroma bits
+        // are raw.
+        let cbp_set = if block_idx < 4 {
+            let predicted_bit = match pred.direction {
+                crate::dc_pred::PredDir::FromLeft => {
+                    bx > 0 && luma_cbp[by * luma_grid_w + (bx - 1)]
+                }
+                crate::dc_pred::PredDir::FromTop => by > 0 && luma_cbp[(by - 1) * luma_grid_w + bx],
+            };
+            let actual = sym_bit ^ predicted_bit;
+            luma_cbp[by * luma_grid_w + bx] = actual;
+            actual
+        } else {
+            sym_bit
+        };
+
+        // AC scan selection — spec/04 §4.4.
+        let scan = if ac_pred {
+            pred.direction.ac_scan()
+        } else {
+            Scan::Zigzag
+        };
+
+        let ac_table = if block_idx <= 3 { luma_ac } else { chroma_ac };
+        let bit_before = br.bit_position();
+        // Placeholder AC selection (empty table): DC-only fallback,
+        // mirroring the intra-in-P path's behaviour for diagnostic
+        // runs.
+        let block_result = if cbp_set && ac_table.entries.is_empty() {
+            let dc_diff = crate::mb::decode_intra_dc_diff_v3(br, block_idx, dc_size_sel)?;
+            let dc = crate::mb::reconstruct_intra_dc(dc_diff, pred.predictor, block_idx, quant);
+            crate::mb::DecodedIntraBlock {
+                coeffs: {
+                    let mut a = [0i32; 64];
+                    a[0] = dc;
+                    a
+                },
+                ac_nonzero: 0,
+            }
+        } else {
+            decode_intra_block_full_v3(
+                br,
+                block_idx,
+                pred.predictor,
+                quant,
+                cbp_set,
+                scan,
+                ac_table,
+                dc_size_sel,
+            )?
+        };
+        if trace {
+            eprintln!(
+                "[blk trace] mb=({mb_x},{mb_y}) blk={block_idx} cbp={cbp_set} scan={scan:?} bits=[{bit_before}..{}] dc={} nz={}",
+                br.bit_position(),
+                block_result.coeffs[0],
+                block_result.ac_nonzero,
+            );
+        }
+
+        let reconstructed_dc = block_result.coeffs[0];
+        match block_idx {
+            0..=3 => dc_cache.luma_set(bx, by, reconstructed_dc),
+            4 => dc_cache.chroma_set(false, bx, by, reconstructed_dc),
+            5 => dc_cache.chroma_set(true, bx, by, reconstructed_dc),
+            _ => unreachable!(),
+        }
+
+        let mut pels = [0i32; 64];
+        idct8x8_to_pel(&block_result.coeffs, &mut pels);
+        write_block_to_picture(pic, mb_x, mb_y, block_idx, &pels);
+    }
+
+    Ok(())
 }
 
 /// Decode a full v3 P-frame into a [`Picture`], using the supplied
@@ -1389,123 +1556,6 @@ fn block_grid_pos(block_idx: usize, mb_x: usize, mb_y: usize) -> (usize, usize) 
     }
 }
 
-/// Decode one intra macroblock's 6 blocks into the corresponding slot
-/// of `pic`, using MPEG-4 §7.4.3 spatial DC prediction and per-block
-/// AC-scan dispatch.
-#[allow(clippy::too_many_arguments)]
-fn decode_intra_mb_to_picture(
-    br: &mut BitReader<'_>,
-    pic: &mut Picture,
-    dc_cache: &mut DcCache,
-    mb_x: usize,
-    mb_y: usize,
-    quant: u32,
-    dc_size_sel: u8,
-    luma_ac: &AcVlcTable,
-    chroma_ac: &AcVlcTable,
-) -> Result<()> {
-    let trace = std::env::var_os("OXIDEAV_MSMPEG4_AC_TRACE").is_some();
-    let mb_start = br.bit_position();
-    let header = IntraMbHeader::parse_v3_mcbpcy(br)?;
-    if trace {
-        eprintln!(
-            "[mb trace] mb=({mb_x},{mb_y}) start_bit={mb_start} cbpy=0x{:x} cbp_cb={} cbp_cr={} ac_pred={} after_hdr={}",
-            header.cbpy, header.cbp_cb, header.cbp_cr, header.ac_pred, br.bit_position(),
-        );
-    }
-
-    for block_idx in 0..6usize {
-        let cbp_set = match block_idx {
-            0..=3 => header.cbpy & (1 << (3 - block_idx)) != 0,
-            4 => header.cbp_cb,
-            5 => header.cbp_cr,
-            _ => unreachable!(),
-        };
-
-        // DC spatial prediction — per-block (not per-MB).
-        let (bx, by) = block_grid_pos(block_idx, mb_x, mb_y);
-        let pred: DcPrediction = match block_idx {
-            0..=3 => dc_cache.predict_luma(bx, by),
-            4 => dc_cache.predict_chroma(false, bx, by),
-            5 => dc_cache.predict_chroma(true, bx, by),
-            _ => unreachable!(),
-        };
-
-        // AC scan selection — spec/04 §4.4:
-        //   ac_pred disabled → zigzag;
-        //   otherwise from-left → alt-horizontal, from-top → alt-vertical.
-        let scan = if header.ac_pred {
-            pred.direction.ac_scan()
-        } else {
-            Scan::Zigzag
-        };
-
-        // Per-block AC VLC routing: luma blocks (0..=3) use the
-        // intra-luma table (G5 by default); chroma blocks (4, 5) use
-        // the chroma + all-inter table (G4 by default), per spec/99
-        // §5.2.
-        let ac_table = if block_idx <= 3 { luma_ac } else { chroma_ac };
-
-        // AC path: when the placeholder table is in use (entries empty)
-        // fall back to DC-only — the bitstream's AC bits are skipped,
-        // which means subsequent block reads will misalign on real
-        // content but the decoder continues for synthetic DC-only
-        // streams. When a real (or candidate) AC VLC table is plugged
-        // in, the regular `decode_intra_block_full` path runs.
-        let bit_before = br.bit_position();
-        let block_result = if cbp_set && ac_table.entries.is_empty() {
-            let dc_diff = crate::mb::decode_intra_dc_diff_v3(br, block_idx, dc_size_sel)?;
-            let dc = crate::mb::reconstruct_intra_dc(dc_diff, pred.predictor, block_idx, quant);
-            crate::mb::DecodedIntraBlock {
-                coeffs: {
-                    let mut a = [0i32; 64];
-                    a[0] = dc;
-                    a
-                },
-                ac_nonzero: 0,
-            }
-        } else {
-            decode_intra_block_full_v3(
-                br,
-                block_idx,
-                pred.predictor,
-                quant,
-                cbp_set,
-                scan,
-                ac_table,
-                dc_size_sel,
-            )?
-        };
-        if trace {
-            eprintln!(
-                "[blk trace] mb=({mb_x},{mb_y}) blk={block_idx} cbp={cbp_set} scan={:?} bits=[{bit_before}..{}] dc={} nz={}",
-                scan,
-                br.bit_position(),
-                block_result.coeffs[0],
-                block_result.ac_nonzero,
-            );
-        }
-
-        // Update the DC cache with the reconstructed DC for this block.
-        let reconstructed_dc = block_result.coeffs[0];
-        match block_idx {
-            0..=3 => dc_cache.luma_set(bx, by, reconstructed_dc),
-            4 => dc_cache.chroma_set(false, bx, by, reconstructed_dc),
-            5 => dc_cache.chroma_set(true, bx, by, reconstructed_dc),
-            _ => unreachable!(),
-        }
-
-        // IDCT in float, clip to [-256, 255], then offset by +128 to
-        // get unsigned pel values and clamp to [0, 255].
-        let mut pels = [0i32; 64];
-        idct8x8_to_pel(&block_result.coeffs, &mut pels);
-
-        write_block_to_picture(pic, mb_x, mb_y, block_idx, &pels);
-    }
-
-    Ok(())
-}
-
 /// Copy one 8×8 decoded block into the picture's YUV planes.
 ///
 /// For MSMPEG4v3 intra blocks, the decoded DC coefficient is in the
@@ -1646,21 +1696,23 @@ mod tests {
             (0, 1), // ac_luma_sel = 0
             (0, 1), // dc_size_sel = 0
         ];
-        // For each of 2x2 MBs: MCBPCY sym 0 (intra half, CBP=0) wire
-        // code, ac_pred=0, then 6 zero DC differentials through the v3
-        // direct-value DC VLC (dc_size_sel=0): luma symbol 0 = `1`
-        // (region_05f0d8, bl=1), chroma symbol 0 = `10` (region_05f868,
-        // bl=2); symbol 0 carries no sign bit (spec/07 §5.2).
-        let (mc_bl, mc_code) = mcbpcy_wire(0);
+        // For each of 2x2 MBs: the round-420 I-frame MB header — the
+        // 64-entry intra-CBPCY symbol 0 (wire code `1`, CBP=0 after
+        // the XOR resolution since every predicted bit is 0 in an
+        // all-uncoded picture), ac_pred=0, then 6 zero DC
+        // differentials through the v3 direct-value DC VLC
+        // (dc_size_sel=0): luma symbol 0 = `1` (region_05f0d8, bl=1),
+        // chroma symbol 0 = `00` (region_05f4a0, bl=2 — the round-420
+        // sel0 pairing); symbol 0 carries no sign bit.
         for _ in 0..4 {
-            fields.push((mc_code, mc_bl)); // MCBPCY sym 0 (intra, CBP=0)
+            fields.push((0b1, 1)); // intra-CBPCY sym 0 (CBP=0)
             fields.push((0, 1)); // ac_pred = 0
             fields.push((0b1, 1)); // luma DC diff 0 (Y0)
             fields.push((0b1, 1)); // Y1
             fields.push((0b1, 1)); // Y2
             fields.push((0b1, 1)); // Y3
-            fields.push((0b10, 2)); // chroma DC diff 0 (Cb)
-            fields.push((0b10, 2)); // Cr
+            fields.push((0b00, 2)); // chroma DC diff 0 (Cb)
+            fields.push((0b00, 2)); // Cr
         }
         // Tail padding.
         fields.push((0, 32));
@@ -1724,21 +1776,22 @@ mod tests {
 
         // Picture header: I-frame q=8.
         let mut fields: Vec<(u32, u32)> = vec![(0, 2), (8, 5), (0, 1), (0, 1), (0, 1)];
-        // 16×16 → one MB. MCBPCY sym 0 (intra half) → CBP=0. ac_pred=0.
-        // Then for each of 6 blocks a +1 DC differential through the v3
-        // direct-value DC VLC (dc_size_sel=0): luma symbol 1 = `01`
-        // (region_05f0d8), chroma symbol 1 = `11` (region_05f868), each
-        // followed by sign bit 1 (set ⇒ positive per spec/07 §5.2).
-        let (mc_bl, mc_code) = mcbpcy_wire(0);
-        fields.push((mc_code, mc_bl));
+        // 16×16 → one MB. Round-420 header: intra-CBPCY sym 0 (wire
+        // `1`, CBP=0), ac_pred=0. Then for each of 6 blocks a +1 DC
+        // differential through the v3 direct-value DC VLC
+        // (dc_size_sel=0): luma symbol 1 = `01` (region_05f0d8),
+        // chroma symbol 1 = `01` (region_05f4a0, round-420 sel0
+        // pairing), each followed by sign bit 0 (clear ⇒ positive —
+        // the standard convention pinned in round 420).
+        fields.push((0b1, 1));
         fields.push((0, 1));
         for _ in 0..4 {
             fields.push((0b01, 2)); // luma DC diff magnitude 1
-            fields.push((1, 1)); // sign: +
+            fields.push((0, 1)); // sign: +
         }
         for _ in 0..2 {
-            fields.push((0b11, 2)); // chroma DC diff magnitude 1
-            fields.push((1, 1)); // sign: +
+            fields.push((0b01, 2)); // chroma DC diff magnitude 1
+            fields.push((0, 1)); // sign: +
         }
         fields.push((0, 32));
         let bytes = pack(&fields);
@@ -1772,132 +1825,6 @@ mod tests {
         );
     }
 
-    /// Hand-crafted 16×16 I-frame whose single MB has CBP=0xF
-    /// (every luma block has coded AC). Decodes through
-    /// [`decode_picture_with_ac`] with [`AcSelection::Candidate`] —
-    /// the candidate VLC built from `region_05eed0.csv` actually
-    /// consumes the AC bits per block. The synthetic stream uses the
-    /// candidate's `(last=true, run=0, level=1)` symbol as the
-    /// terminator for every coded block, so each block gets exactly
-    /// one AC coefficient placed at zigzag position 1 (after DC).
-    ///
-    /// The point is to demonstrate end-to-end that the picture
-    /// decoder routes the candidate AC table through the per-MB,
-    /// per-block path correctly — DC predict, AC walk, dequant,
-    /// IDCT, and pel write all compose. The numeric output is not
-    /// expected to match a real DIV3 stream because the candidate's
-    /// `(last, run, level)` mapping is a hypothesis; this test
-    /// verifies the *plumbing*.
-    #[test]
-    fn handcrafted_iframe_with_candidate_ac_decodes() {
-        use oxideav_core::bits::BitReader;
-
-        fn pack(fields: &[(u32, u32)]) -> Vec<u8> {
-            let mut out: Vec<u8> = Vec::new();
-            let mut acc: u64 = 0;
-            let mut bits: u32 = 0;
-            for (v, w) in fields {
-                let mask = if *w == 32 { u32::MAX } else { (1u32 << w) - 1 };
-                acc = (acc << w) | ((*v & mask) as u64);
-                bits += w;
-                while bits >= 8 {
-                    let shift = bits - 8;
-                    out.push(((acc >> shift) & 0xff) as u8);
-                    acc &= (1u64 << shift) - 1;
-                    bits -= 8;
-                }
-            }
-            if bits > 0 {
-                out.push(((acc << (8 - bits)) & 0xff) as u8);
-            }
-            out
-        }
-
-        // Find the candidate AC VLC entry whose decoded triple is
-        // `(last=true, run=0, level=1)` — under the candidate's
-        // hypothesis this is the symbol at idx == count_B + 1 == 2.
-        let ac_table = AcVlcTable::v3_intra_candidate();
-        let term = ac_table
-            .entries
-            .iter()
-            .find(|e| {
-                matches!(
-                    e.value,
-                    crate::ac::Symbol::RunLevel {
-                        last: true,
-                        run: 0,
-                        level: 1
-                    }
-                )
-            })
-            .expect("candidate table contains the (last=1, run=0, level=1) terminator");
-
-        // We need the joint MCBPCY symbol whose CBP pattern is 0b111111
-        // (all luma + chroma blocks coded) and whose MB-type is intra.
-        // Per `decode_mcbpcy`, intra is the LOW half (idx < 64, patent
-        // Table 1 I-type entries — audit/02 §1.4) and CBP = idx & 0x3f.
-        // We want CBP = 0x3f in the intra (low) half, so target idx =
-        // 0x3f = 63. Its wire code comes straight from the extracted
-        // table. (This is an I-frame, so the intra/inter partition only
-        // governs the CBP value here; the I-frame path treats every MB
-        // as intra.)
-        let (mc_bl, mc_code) = mcbpcy_wire(63);
-
-        // Picture header: I-frame, q=8, all selectors default (0).
-        let mut fields: Vec<(u32, u32)> = vec![(0, 2), (8, 5), (0, 1), (0, 1), (0, 1)];
-
-        // 16x16 = 1 MB. MCBPCY = idx 63 (all-coded intra), ac_pred = 0.
-        fields.push((mc_code, mc_bl));
-        fields.push((0, 1));
-
-        // Per block (6 blocks in MS-MPEG4v3 raster order): DC size = 1
-        // (luma `11` for blocks 0..3; chroma `10` for blocks 4..5),
-        // DC mag bit = 1 (positive +1 differential), then ONE AC token
-        // (the candidate terminator) + sign bit = 0 (positive).
-        for block_idx in 0..6 {
-            let dc_size_code = if block_idx < 4 {
-                (0b11u32, 2u32)
-            } else {
-                (0b10, 2)
-            };
-            fields.push(dc_size_code);
-            fields.push((1, 1)); // DC mag = +1
-            fields.push((term.code, term.bits as u32));
-            fields.push((0, 1)); // AC sign +
-        }
-
-        // Tail padding so the bit-reader never starves.
-        fields.push((0, 32));
-        fields.push((0, 32));
-
-        let bytes = pack(&fields);
-        let mut br = BitReader::new(&bytes);
-        let dims = PictureDims::new(16, 16).unwrap();
-        let pic = decode_picture_with_ac(&mut br, dims, None, AcSelection::Candidate)
-            .expect("candidate-AC I-frame decode");
-
-        assert_eq!(pic.picture_type, PictureType::I);
-        assert_eq!(pic.width, 16);
-        assert_eq!(pic.height, 16);
-        // Output is non-trivial: at least some pels deviate from the
-        // pure DC reconstruction because the AC contribution shifts
-        // the per-block IDCT response. We don't assert exact values
-        // (the candidate's symbol mapping is a hypothesis), only that
-        // the decode reached the end without erroring and produced
-        // YUV planes whose luma is non-uniform across the picture.
-        let y_max = *pic.y.iter().max().unwrap();
-        let y_min = *pic.y.iter().min().unwrap();
-        assert!(
-            y_max != y_min,
-            "luma plane is uniform — AC contribution didn't reach the IDCT \
-             (decoder may have skipped the AC walk)"
-        );
-    }
-
-    /// Hand-crafted P-frame that is entirely skipped MBs. Validates
-    /// end-to-end P-frame decode, reference-threading, MC copy path.
-    /// After decode the output should equal the reference picture
-    /// because every MB is "skip → MC with MV=(0,0)".
     #[test]
     fn handcrafted_all_skip_pframe_copies_reference() {
         use oxideav_core::bits::BitReader;

@@ -9,6 +9,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Round 420 — v3 I-frame real-content overhaul.** Seven independent
+  corrections, each pinned empirically against the staged real
+  Microsoft DIV3 fixtures (`tests/microsoft_fixtures.rs` ground truth)
+  and cross-corroborated by the staged numeric tables under
+  `docs/video/msmpeg4/tables-ff/`:
+  1. **I-frames use a dedicated 64-entry intra-CBPCY VLC** (the
+     re-aligned `region_05eed0` source at VMA `0x1c25fad0` — its
+     Extractor-03 dump was a count-header mis-parse of the same class
+     provenance/22 fixed for `region_05eac8`; re-aligned it is
+     byte-identical to the staged `tables-ff/msmp4-mb-i-table.csv`
+     and Kraft = 1.0). The 128-entry joint MCBPCY table is the
+     **P-frame** MB header only. This closes spec/99 §0.1 row 8's
+     OPEN role for `0x1c25fad0` and retires both the "candidate
+     intra-AC primary" and "candidate v2 MCBPCY" hypotheses (the
+     `AcSelection::Candidate` selector and
+     `AcVlcTable::v3_intra_candidate` plumbing are removed).
+  2. **The intra-CBPCY luma bits are XOR-predicted** (patent US
+     7,054,494's I-frame CBPCY-XOR): per luma block, the predicted
+     bit is the actual coded bit of the DC-gradient-direction
+     neighbour; chroma bits are raw. Symbol bits are in block-decode
+     order (MSB first: Y(0,0), Y(1,0), Y(0,1), Y(1,1), Cb, Cr). No
+     static bit-to-block mapping fits both fixtures; the XOR rule
+     fits both exactly.
+  3. **DC gradient rule fixed**: predict from TOP iff
+     `|A−D| <= |D−B|`, else LEFT (branches were swapped, and ties now
+     go TOP — pinned by flat-content blocks whose reference means
+     admit exactly one predictor).
+  4. **v3 intra-DC sign convention fixed**: sign bit 1 ⇒ negative
+     (standard, same as the AC walk) on both the direct and the
+     8-bit ESC tiers. The earlier "inverted" reading of the spec/07
+     §5.2 trace is refuted by the fixtures.
+  5. **v3 intra-DC table pairing fixed**: the four `dc_size_sel`
+     regions pair as sel0 = {`05f0d8` luma, `05f4a0` chroma} and
+     sel1 = {`05f868` luma, `05fc30` chroma} (spec/99 §4.5 grouping,
+     corroborated by `tables-ff/msmp4-dc-tables`); the previous
+     grouping assigned `05f4a0`/`05f868` to the wrong roles.
+  6. **Intra AC escape dispatch is a one-bit selector after the ESC
+     marker** — selector 1 ⇒ level-extension tier
+     (`level += LMAX[last][run]`), 0 ⇒ run-extension tier
+     (`run += RMAX[last][|level|] + 1`) — replacing the earlier
+     "successive ESC re-fires" chaining, which spec/13 §3 refutes
+     (a nested ESC inside either extension body is the traced
+     kernel's hard −100 error). A nested ESC after selector 1 is
+     kept as this crate's encoder-compat verbatim-FLC arm (real
+     streams never emit it). The tier polarity (which selector value
+     maps to which tier) is provisional pending a docs trace.
+  7. **First-of-sequence 5-bit extension**: the first I-frame of a
+     sequence carries 5 extra bits after the selector fields
+     (spec/99 §2.2; payload semantics OPEN). New
+     `picture::decode_picture_opts` / `enc::encode_iframe_v3_opts`
+     expose the flag; the registered decoder/encoder apply it on the
+     first packet/frame of a stream.
+  Measured on the pinned fixtures: before, the I-frame walk desynced
+  at the very first MB (the old MB-progress counts were parse noise);
+  after, div4.avi's first I-frame decodes pixel-exactly (reference
+  block means matched to <1 grey level) through the leading MB rows
+  and parses 162 of 330 MBs before the first remaining divergence
+  (div3.avi: 83 of 330). The remaining opens — escape selector
+  polarity, chroma-CBP prediction beyond the raw-bits model, and a
+  residual mid-frame drift — are documented in the README.
+- I-frame decode errors now carry the failing MB coordinates and
+  index.
+
 - **v3 joint-MCBPCY VLC now decodes against the extracted wire codes**
   (`region_05eac8_mcbpcy.csv`, Extractor 08 / provenance/22, Kraft sum
   exactly 1.0). The re-extraction resolved the long-standing

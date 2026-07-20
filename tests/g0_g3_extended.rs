@@ -324,9 +324,11 @@ fn g0_synthetic_esc_tier1_level_extension() {
 
     // Pick a (last=0, run=0, level=1) base — that's idx 0 in the
     // enumeration. After tier-1 promotion the level becomes
-    // 1 + LMAX[0][0] = 1 + 23 = 24.
+    // 1 + LMAX[0][0] = 1 + 23 = 24. Wire form (round 420): ESC marker,
+    // selector bit `1` (level-extension tier), base symbol, sign.
     let bytes = pack(&[
         (count_a as u32, bl), // ESC trigger
+        (1, 1),               // selector: level-extension tier
         (0u32, bl),           // base symbol (idx 0: last=0, run=0, level=1)
         (0, 1),               // sign = positive
     ]);
@@ -339,20 +341,21 @@ fn g0_synthetic_esc_tier1_level_extension() {
 
 #[test]
 fn g1_synthetic_esc_tier2_run_extension() {
-    // Tier 1 ESC then tier 1 ESC again ⇒ tier 2: the next decoded
-    // (last, run_base, |level|) becomes (last, run_base + RMAX[last][level] + 1, level).
+    // ESC marker + selector bit `0` ⇒ run-extension tier: the next
+    // decoded (last, run_base, |level|) becomes
+    // (last, run_base + RMAX[last][level] + 1, level).
     let g = GExtended::G1;
     let count_a = g.count_a();
     let bl = synthetic_bl(count_a);
     let table = AcVlcTable::v3_intra_g1_synthetic();
 
-    // Pick base idx 0 = (last=0, run=0, level=1). After tier-1 ESC,
-    // tier-2 promotion gives run_actual = 0 + RMAX[0][1] + 1.
+    // Pick base idx 0 = (last=0, run=0, level=1). The run-extension
+    // tier gives run_actual = 0 + RMAX[0][1] + 1.
     let rmax_0_1 = table.rmax.unwrap()[0][1];
     let expected_run = rmax_0_1 + 1;
     let bytes = pack(&[
-        (count_a as u32, bl), // first ESC (tier 1)
-        (count_a as u32, bl), // second ESC (tier 2)
+        (count_a as u32, bl), // ESC marker
+        (0, 1),               // selector: run-extension tier
         (0u32, bl),           // base symbol (idx 0)
         (0, 1),               // sign = positive
     ]);
@@ -365,16 +368,17 @@ fn g1_synthetic_esc_tier2_run_extension() {
 
 #[test]
 fn g2_synthetic_esc_tier3_verbatim_flc() {
-    // Triple ESC ⇒ tier 3: verbatim 1+6+8 FLC triple (per spec/04 §2.3 +
-    // MPEG-4 Part 2 §7.4.1.3 fallback).
+    // ESC + selector `1` + nested ESC ⇒ the encoder-compat verbatim
+    // 1+6+8 FLC triple (round 420; real streams never emit nested
+    // ESC — the traced kernel errors there per spec/13 §3).
     let g = GExtended::G2;
     let count_a = g.count_a();
     let bl = synthetic_bl(count_a);
     let table = AcVlcTable::v3_intra_g2_synthetic();
     let bytes = pack(&[
-        (count_a as u32, bl), // ESC tier 1
-        (count_a as u32, bl), // ESC tier 2
-        (count_a as u32, bl), // ESC tier 3
+        (count_a as u32, bl), // ESC marker
+        (1, 1),               // selector: level-extension tier
+        (count_a as u32, bl), // nested ESC → verbatim FLC
         (1, 1),               // last = 1
         (5, 6),               // run = 5
         // signed 8-bit level = -10. read_i32 sign-extends, but the bit

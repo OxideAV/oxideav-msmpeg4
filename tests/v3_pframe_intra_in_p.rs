@@ -424,10 +424,14 @@ fn build_v3_iframe_dc_only() -> Vec<u8> {
         (0, 1), // ac_luma_sel = 0 (→ G3) — I-frame only
         (0, 1), // dc_size_sel = 0
     ];
-    // One intra MB: no skip bit (I-frame), MCBPCY idx 0 (CBP=0), ac_pred,
+    // Round 420: the registered decoder treats its very first packet
+    // as first-of-sequence, so the I-frame header carries the 5-bit
+    // per-sequence extension (spec/99 §2.2).
+    fields.push((0, 5));
+    // One intra MB: no skip bit (I-frame), the 64-entry intra-CBPCY
+    // symbol 0 (wire code `1`; CBP=0 after XOR resolution), ac_pred,
     // six DC-only blocks.
-    let (mc_code, mc_bl) = mcbpcy_code_for(0);
-    fields.push((mc_code, mc_bl));
+    fields.push((0b1, 1));
     fields.push((0, 1)); // ac_pred = 0
     for _ in 0..4 {
         let (bl, code) = INTRA_DC_LUMA_SEL0_RAW[0];

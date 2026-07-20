@@ -679,11 +679,7 @@ fn real_fixture_psnr_diagnostic() {
 
     use oxideav_msmpeg4::picture::{decode_picture_with_ac, AcSelection, PictureDims};
 
-    for selection in [
-        AcSelection::Placeholder,
-        AcSelection::Candidate,
-        AcSelection::G5,
-    ] {
+    for selection in [AcSelection::Placeholder, AcSelection::G5] {
         let mut br = BitReader::new(chunk);
         let dims = PictureDims::new(176, 144).expect("dims");
         eprintln!(

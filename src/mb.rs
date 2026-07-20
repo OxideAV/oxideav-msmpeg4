@@ -368,24 +368,27 @@ pub fn decode_intra_dc_diff_v3(
         return Ok(0);
     }
     if idx == esc {
-        // ESC tier: read an 8-bit raw value then a sign bit, mapping
-        // 0xff → -255 / 0x00 → +0 etc. Per spec/07 §5.2:
-        //   `push 0x8; call 0x1c211e39` reads 8 raw bits → al
-        //   `bl = al; call 0x1c215c9b` reads sign → al
-        //   `eax = movzx bl; if sign==0 neg eax`.
-        // So sign==0 means level is NEGATIVE (`neg eax`), sign==1 means
-        // level is positive — opposite of the typical sign-bit
-        // convention. The raw byte itself is unsigned magnitude.
+        // ESC tier: read an 8-bit raw unsigned magnitude then a sign
+        // bit (`push 0x8; call 0x1c211e39` then `0x1c215c9b` per
+        // spec/07 §5.2).
+        //
+        // Round 420 sign-convention correction: the earlier reading of
+        // the trace (`if sign==0 neg eax` ⇒ "0 means negative") is
+        // refuted by the staged real-content fixtures — the first
+        // I-frame of div4.avi opens with a −58 luma DC differential
+        // whose sign bit is `1`, and every DC of the first eight MB
+        // columns of both DIV3 AVI fixtures reconstructs the reference
+        // pixels exactly only under the standard convention:
+        // **sign bit 1 ⇒ negative** (same as the AC walk).
         let raw = br.read_u32(8)? as i32;
         let sign = br.read_bit()?;
-        return Ok(if sign { raw } else { -raw });
+        return Ok(if sign { -raw } else { raw });
     }
-    // Normal path: idx is the differential magnitude; sign bit follows.
+    // Normal path: idx is the differential magnitude; sign bit follows
+    // (1 ⇒ negative, same convention as the ESC tier).
     let mag = idx as i32;
     let sign = br.read_bit()?;
-    // Same MS-MPEG4 sign convention as ESC tier per spec/07 §5.2:
-    // sign bit unset ⇒ negate the magnitude.
-    Ok(if sign { mag } else { -mag })
+    Ok(if sign { -mag } else { mag })
 }
 
 /// Encode one v3 intra-DC differential — the bit-level inverse of
@@ -395,11 +398,13 @@ pub fn decode_intra_dc_diff_v3(
 ///   `test al, al; je` short-circuit at `1c216d2a`).
 /// * `1 <= |diff| <= 118` with a present codeword (some magnitudes are
 ///   bit-length-0 holes in the extracted tables) → the magnitude's
-///   codeword followed by the MS-MPEG4 DC sign bit. Per spec/07 §5.2
-///   the DC sign convention is **inverted** relative to the AC walk:
-///   sign bit `1` ⇒ positive, `0` ⇒ negative (`if sign==0 neg eax`).
+///   codeword followed by the DC sign bit. Round 420: the sign
+///   convention is the **standard** one (`1` ⇒ negative), the same as
+///   the AC walk — the earlier "inverted" reading of the spec/07 §5.2
+///   trace was refuted against the staged real-content fixtures (see
+///   [`decode_intra_dc_diff_v3`]).
 /// * otherwise → the ESC codeword (idx 119), an 8-bit raw magnitude,
-///   then the same inverted sign bit. Magnitudes above 255 are not
+///   then the same sign bit. Magnitudes above 255 are not
 ///   representable and error out (the intra DC differential of any
 ///   realisable 8-bit pel block stays well inside ±255 at the minimum
 ///   DC scaler of 8).
@@ -427,10 +432,10 @@ pub fn encode_intra_dc_diff_v3(
         return write_idx(bw, 0);
     }
     let mag = diff.unsigned_abs() as usize;
-    let positive = diff > 0;
+    let negative = diff < 0;
     if mag < esc && write_idx(bw, mag).is_ok() {
-        // Direct-magnitude codeword + inverted sign bit.
-        bw.write_bit(positive);
+        // Direct-magnitude codeword + sign bit (1 => negative).
+        bw.write_bit(negative);
         return Ok(());
     }
     if mag > 255 {
@@ -440,7 +445,7 @@ pub fn encode_intra_dc_diff_v3(
     }
     write_idx(bw, esc)?;
     bw.write_u32(mag as u32, 8);
-    bw.write_bit(positive);
+    bw.write_bit(negative);
     Ok(())
 }
 
@@ -890,9 +895,10 @@ mod tests {
     /// The first three luma sel=0 entries are `(bl=1, code=1)`,
     /// `(bl=2, code=1)`, `(bl=4, code=1)` for symbols 0, 1, 2 (from
     /// `region_05f0d8`). Symbol 0 ⇒ DC=0 (no sign read); symbol 1 with
-    /// sign bit "1" ⇒ DC=+1; symbol 2 with sign bit "0" ⇒ DC=-2.
+    /// sign bit "1" ⇒ DC=−1; symbol 2 with sign bit "0" ⇒ DC=+2.
     /// This locks in both the (a=code, b=bl) parser convention from
-    /// spec/11 §4 / §6 AND the spec/07 §5.2 sign convention.
+    /// spec/11 §4 / §6 AND the round-420 standard sign convention
+    /// (1 ⇒ negative — pinned on the real-content fixtures).
     #[test]
     fn decode_intra_dc_diff_v3_luma_sel0_first_symbols() {
         // Symbol 0: bl=1 code=1 → bit `1`, no sign bit follows.
@@ -900,26 +906,45 @@ mod tests {
         let mut br = BitReader::new(&bytes);
         assert_eq!(decode_intra_dc_diff_v3(&mut br, 0, 0).unwrap(), 0);
 
-        // Symbol 1: bl=2 code=1 → bits `01`, then sign=1 ⇒ +1.
+        // Symbol 1: bl=2 code=1 → bits `01`, then sign=1 ⇒ -1.
         let bytes = pack(&[(0b01, 2), (0b1, 1), (0, 8)]);
         let mut br = BitReader::new(&bytes);
-        assert_eq!(decode_intra_dc_diff_v3(&mut br, 0, 0).unwrap(), 1);
+        assert_eq!(decode_intra_dc_diff_v3(&mut br, 0, 0).unwrap(), -1);
 
-        // Symbol 2: bl=4 code=1 → bits `0001`, then sign=0 ⇒ -2.
+        // Symbol 2: bl=4 code=1 → bits `0001`, then sign=0 ⇒ +2.
         let bytes = pack(&[(0b0001, 4), (0b0, 1), (0, 8)]);
         let mut br = BitReader::new(&bytes);
-        assert_eq!(decode_intra_dc_diff_v3(&mut br, 0, 0).unwrap(), -2);
+        assert_eq!(decode_intra_dc_diff_v3(&mut br, 0, 0).unwrap(), 2);
     }
 
-    /// Chroma sel=0 (region_05f868) has `(bl=2, code=2)` for symbol 0.
-    /// With dc_size_sel=0, block_idx=4 (Cb), the bits `10` should
-    /// decode to symbol 0 (DC=0, no sign bit).
+    /// Chroma sel=0 is `region_05f4a0` (round 420 table-pairing fix:
+    /// the four DC regions pair as sel0 = {05f0d8 luma, 05f4a0 chroma}
+    /// and sel1 = {05f868 luma, 05fc30 chroma}, per the spec/99 §4.5
+    /// slot grouping and the staged `tables-ff/msmp4-dc-tables`
+    /// companion — pinned empirically on the real-content fixtures,
+    /// whose dc_size_sel=1 I-frames only reconstruct through the
+    /// {05f868, 05fc30} pair). `region_05f4a0` has `(bl=2, code=0)`
+    /// for symbol 0: bits `00` decode to DC=0 with no sign bit.
     #[test]
     fn decode_intra_dc_diff_v3_chroma_sel0_symbol_zero() {
-        // Symbol 0: bl=2 code=2 → bits `10`. No sign bit.
-        let bytes = pack(&[(0b10, 2), (0, 8)]);
+        // Symbol 0: bl=2 code=0 → bits `00`. No sign bit.
+        let bytes = pack(&[(0b00, 2), (0, 8)]);
         let mut br = BitReader::new(&bytes);
         assert_eq!(decode_intra_dc_diff_v3(&mut br, 4, 0).unwrap(), 0);
+    }
+
+    /// Luma sel=1 is `region_05f868` (round 420 pairing): symbol 0 is
+    /// `(bl=2, code=2)` → bits `10` ⇒ DC=0, no sign bit. Chroma sel=1
+    /// is `region_05fc30`: symbol 0 is `(bl=2, code=0)` → bits `00`.
+    #[test]
+    fn decode_intra_dc_diff_v3_sel1_symbol_zero() {
+        let bytes = pack(&[(0b10, 2), (0, 8)]);
+        let mut br = BitReader::new(&bytes);
+        assert_eq!(decode_intra_dc_diff_v3(&mut br, 0, 1).unwrap(), 0);
+
+        let bytes = pack(&[(0b00, 2), (0, 8)]);
+        let mut br = BitReader::new(&bytes);
+        assert_eq!(decode_intra_dc_diff_v3(&mut br, 4, 1).unwrap(), 0);
     }
 
     // ==== v1/v2 intra DC size-category decode (spec/16 §2) ====

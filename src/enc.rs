@@ -44,7 +44,10 @@ use crate::idct::fdct8x8_from_pels;
 use crate::iq::{dc_scaler, quantise_block_h263};
 use crate::mb::{encode_intra_dc_diff_v1v2, encode_intra_dc_diff_v3};
 use crate::mc::{chroma_mv_from_four_luma, chroma_mv_from_luma, mc_block, RefPlane};
-use crate::mcbpcy::{compose_cbp, encode_mcbpcy, encode_mcbpcy_v1, encode_mcbpcy_v2, V2FrameType};
+use crate::mcbpcy::{
+    compose_cbp, encode_intra_cbpcy_sym, encode_mcbpcy, encode_mcbpcy_v1, encode_mcbpcy_v2,
+    V2FrameType,
+};
 use crate::mv::{
     encode_mv_v1v2, encode_mv_with_table, mv_component_reachable, mv_v1v2_component_reachable, Mv,
     MvTable,
@@ -114,6 +117,21 @@ pub fn encode_iframe_v3(
     dims: PictureDims,
     config: &EncoderConfig,
 ) -> Result<Vec<u8>> {
+    encode_iframe_v3_opts(input, dims, config, false)
+}
+
+/// Variant of [`encode_iframe_v3`] with the **first-of-sequence** flag
+/// exposed: when set, the frame carries the 5-bit per-sequence
+/// extension after the selector bits (spec/99 §2.2; payload semantics
+/// OPEN — zeros are written). The registered [`crate::encoder`] GOP
+/// machine sets this on the very first frame of an encode, matching
+/// [`crate::picture::decode_picture_opts`].
+pub fn encode_iframe_v3_opts(
+    input: &Picture,
+    dims: PictureDims,
+    config: &EncoderConfig,
+    first_of_sequence: bool,
+) -> Result<Vec<u8>> {
     validate_input(input, dims, config)?;
     let (mb_w, mb_h) = dims.mb_dims();
     let quant = config.quant as u32;
@@ -125,13 +143,24 @@ pub fn encode_iframe_v3(
             mbs.push(analyse_intra_mb(input, &mut dc_cache, mx, my, quant));
         }
     }
+    // The intra-CBPCY symbols depend only on the coded flags + DC
+    // gradient directions (selector-independent), so compute them once
+    // for all 18 RD variants.
+    let syms = compute_intra_cbpcy_syms(&mbs, mb_w);
 
     let mut best: Option<Vec<u8>> = None;
     for luma_sel in 0..3u8 {
         for chroma_sel in 0..3u8 {
             for dc_size_sel in 0..2u8 {
-                let bytes =
-                    assemble_iframe_v3(&mbs, config.quant, luma_sel, chroma_sel, dc_size_sel)?;
+                let bytes = assemble_iframe_v3(
+                    &mbs,
+                    &syms,
+                    config.quant,
+                    luma_sel,
+                    chroma_sel,
+                    dc_size_sel,
+                    first_of_sequence,
+                )?;
                 if best.as_ref().map_or(true, |b| bytes.len() < b.len()) {
                     best = Some(bytes);
                 }
@@ -139,6 +168,43 @@ pub fn encode_iframe_v3(
         }
     }
     Ok(best.expect("at least one selector combination was assembled"))
+}
+
+/// Compute the per-MB v3 I-frame intra-CBPCY symbols: the bit-level
+/// inverse of the decoder's XOR resolution (see
+/// `picture::decode_intra_mb_iframe_v3`). For each luma block the
+/// predicted bit is the actual coded bit of the DC-gradient-direction
+/// neighbour; the transmitted bit is `actual ^ predicted`. Chroma bits
+/// are raw. The per-block direction is recovered from the plan's
+/// `alt_scan` (bijective with the gradient direction).
+fn compute_intra_cbpcy_syms(mbs: &[AnalysedMb], mb_w: usize) -> Vec<u8> {
+    let mb_h = mbs.len() / mb_w;
+    let gw = mb_w * 2;
+    let mut luma_cbp = vec![false; gw * mb_h * 2];
+    let mut syms = Vec::with_capacity(mbs.len());
+    for (i, (plans, _cbpy, cbp_cb, cbp_cr)) in mbs.iter().enumerate() {
+        let mx = i % mb_w;
+        let my = i / mb_w;
+        let mut sym = 0u8;
+        for (blk, plan) in plans.iter().take(4).enumerate() {
+            let bx = mx * 2 + (blk & 1);
+            let by = my * 2 + (blk >> 1);
+            // FromLeft ⇒ alt-vertical scan; FromTop ⇒ alt-horizontal
+            // (dc_pred::PredDir::ac_scan).
+            let from_left = plan.alt_scan == Scan::AlternateVertical;
+            let predicted = if from_left {
+                bx > 0 && luma_cbp[by * gw + (bx - 1)]
+            } else {
+                by > 0 && luma_cbp[(by - 1) * gw + bx]
+            };
+            luma_cbp[by * gw + bx] = plan.coded;
+            sym |= ((plan.coded ^ predicted) as u8) << (5 - blk);
+        }
+        sym |= (*cbp_cb as u8) << 1;
+        sym |= *cbp_cr as u8;
+        syms.push(sym);
+    }
+    syms
 }
 
 /// Transform + quantise all 6 blocks of one intra MB, threading the DC
@@ -298,10 +364,12 @@ type AnalysedMb = ([IntraBlockPlan; 6], u8, bool, bool);
 /// the per-MB ac_pred RD run against those tables.
 fn assemble_iframe_v3(
     mbs: &[AnalysedMb],
+    syms: &[u8],
     quant: u8,
     luma_sel: u8,
     chroma_sel: u8,
     dc_size_sel: u8,
+    first_of_sequence: bool,
 ) -> Result<Vec<u8>> {
     let mut bw = BitWriter::new();
     let hdr = MsV3PictureHeader {
@@ -313,23 +381,21 @@ fn assemble_iframe_v3(
         mv_table_sel: 0,
     };
     hdr.write(&mut bw)?;
+    if first_of_sequence {
+        // 5-bit per-sequence extension (spec/99 §2.2). Payload
+        // semantics OPEN — write zeros; the decoder skips it.
+        bw.write_u32(0, 5);
+    }
     let luma_ac = v3_luma_table_for_sel(luma_sel);
     let chroma_ac = v3_chroma_table_for_sel(chroma_sel);
     let scheme = DcScheme::V3(dc_size_sel);
-    for (plans, cbpy, cbp_cb, cbp_cr) in mbs {
-        let cbp = compose_cbp(*cbpy, *cbp_cb, *cbp_cr);
-        // I-frame joint symbol = 64 + CBP (the high half of the joint
-        // alphabet). Empirically pinned against real MS-encoded v3
-        // streams: every synced MCBPCY decode on the I-frames of both
-        // pinned Microsoft fixtures (`tests/microsoft_fixtures.rs`,
-        // div3.avi 1999-lineage + mp43.wmv WMFSDK-7.00 2001) lands in
-        // the 64..127 half, with `idx - 64` = the MB's CBP pattern. The
-        // decoder side is half-agnostic on I-frames (every I-frame MB
-        // is intra by definition and CBP = idx & 0x3f), so this only
-        // affects the bits we emit — matching what the original
-        // encoder emits. The low half stays in use for intra-in-P
-        // (spec/05 §3.2 `test bl, 0x40; je` polarity).
-        encode_mcbpcy(&mut bw, MCBPCY_V3_PARTITION as u8 + cbp)?;
+    for ((plans, _cbpy, _cbp_cb, _cbp_cr), &sym) in mbs.iter().zip(syms) {
+        // Round 420 I-frame MB header: the 64-entry intra-CBPCY symbol
+        // (luma bits XOR-predicted, computed once in
+        // `compute_intra_cbpcy_syms`) followed by the ac_pred bit. The
+        // 128-entry joint MCBPCY table is the **P-frame** MB header
+        // and is no longer used on I-frames.
+        encode_intra_cbpcy_sym(&mut bw, sym)?;
         let ac_pred = choose_ac_pred(plans, scheme, &luma_ac, &chroma_ac)?;
         bw.write_bit(ac_pred);
         write_intra_blocks(&mut bw, plans, scheme, &luma_ac, &chroma_ac, ac_pred)?;
@@ -1785,7 +1851,8 @@ mod tests {
                     ));
                 }
             }
-            let forced = assemble_iframe_v3(&mbs, quant, 2, 2, 0).unwrap();
+            let syms = compute_intra_cbpcy_syms(&mbs, mb_w);
+            let forced = assemble_iframe_v3(&mbs, &syms, quant, 2, 2, 0, false).unwrap();
             assert!(
                 rd.len() <= forced.len(),
                 "selector RD lost to the fixed default: {} > {} (q={quant})",
