@@ -88,15 +88,14 @@ pub enum Symbol {
 /// MS-MPEG4 intra-AC variants; only the primary VLC (the `entries`
 /// slice) differs.
 ///
-/// The optional `lmax` / `rmax` tables drive the v3 intra 3-tier
-/// escape body (per `docs/video/msmpeg4/spec/04-decoder-kernels.md`
-/// §2.3). When both are present, [`decode_escape_body`] walks
-/// tier 1 (level-extension at `0x1c216e7b`) → tier 2 (run-extension
-/// at `0x1c216f02`) → tier 3 (verbatim FLC at `0x1c216f5f`) by
-/// re-invoking the primary VLC after the ESC marker; each successive
-/// ESC re-fire promotes the decoder to the next tier. A `None`
-/// `lmax` / `rmax` collapses the walk to the verbatim tier
-/// (the inter kernel's reduced 1-tier ESC per spec/04 §1.3 step 10).
+/// The optional `lmax` / `rmax` tables drive the v3 intra escape body
+/// (tier bodies traced at `0x1c216e7b` / `0x1c216f02` / `0x1c216f5f`,
+/// spec/04 §2.3). When both are present, [`decode_escape_body`] reads
+/// **one selector bit** after the ESC marker and dispatches to the
+/// level-extension or run-extension tier (round 420 — see that
+/// function for the evidence). A `None` `lmax` / `rmax` collapses the
+/// walk to the verbatim tier (the inter kernel's reduced 1-tier ESC
+/// per spec/04 §1.3 step 10).
 #[derive(Clone, Copy)]
 pub struct AcVlcTable {
     pub entries: &'static [VlcEntry<Symbol>],
@@ -855,35 +854,28 @@ pub fn decode_token(br: &mut BitReader<'_>, table: &AcVlcTable) -> Result<Token>
     }
 }
 
-/// Decode the escape-mode body using the v3 intra 3-tier walk per
-/// `docs/video/msmpeg4/spec/04-decoder-kernels.md` §2.3.
+/// Decode the escape-mode body of the v3 intra kernel: **one selector
+/// bit after the ESC marker** dispatches between the level-extension
+/// tier (`0x1c216e7b`: re-VLC a base symbol, emit
+/// `(last, run, sign·(|level|_base + LMAX[last][run]))`) and the
+/// run-extension tier (`0x1c216f02`: re-VLC a base symbol, emit
+/// `(last, run_base + RMAX[last][|level|] + 1, sign·|level|)`).
 ///
-/// MS-MPEG4v3's binary structure (different from MPEG-4 Part 2's
-/// §7.4.1.3 selector bits) chains the escape tiers via **successive
-/// ESC re-fires of the primary VLC**: there is no separate selector.
-/// Per spec/04 §2.3:
+/// The earlier "successive ESC re-fires promote the tier" reading of
+/// spec/04 §2.3 is refuted: spec/13 §3 traces a nested ESC inside
+/// either extension body straight to the kernel's −100 error exit
+/// (`je 0x1c21700c` at `1c216e96` / `1c216f1d`), so ESC-ESC chaining
+/// can never reach the second tier, and the ESC-path dispatch bytes at
+/// `1c216e5e..1c216e7b` leave exactly room for a bit read + branch.
+/// The one-selector-bit shape is pinned empirically on the escape
+/// population of the staged real Microsoft DIV3 fixtures (round 420).
+/// The **polarity** (selector 1 ⇒ level extension) is provisional
+/// pending a docs trace of that branch.
 ///
-/// * **First escape (`0x1c216e7b`) — level extension**: after the
-///   primary VLC fires ESC, re-decode the primary VLC. If it returns
-///   a normal `(last, run, |level|_base)`, emit
-///   `(last, run, sign·(|level|_base + LMAX[last][run]))`. The LMAX
-///   table is derived from the descriptor's pri_A/pri_B alphabet
-///   (G5-only — see `g5_lmax`). If the re-VLC also returns ESC →
-///   tier 2.
-/// * **Second escape (`0x1c216f02`) — run extension**: re-decode the
-///   primary VLC again. If it returns a normal `(last, run_base,
-///   |level|)`, emit `(last, run_base + RMAX[last][|level|] + 1,
-///   sign·|level|)`. If ESC re-fires again → tier 3.
-/// * **Third escape (`0x1c216f5f`) — verbatim**: a flat fixed-length
-///   triple (`esc_last_bits` + `esc_run_bits` + `esc_level_bits`-bit
-///   signed level). This is also the only tier the inter kernel uses
-///   (spec/04 §1.3 step 10) and is the fallback when LMAX/RMAX are
-///   not provided (`lmax = None` / `rmax = None`).
-///
-/// Note that this differs from MPEG-4 Part 2 §7.4.1.3, which uses a
-/// 1-or-2-bit selector after each ESC marker. The MS-MPEG4 binary
-/// chains the tiers via the much-simpler successive-ESC mechanism per
-/// the addresses called out in spec/04 §2.3.
+/// The verbatim FLC triple (`0x1c216f5f`; `esc_last_bits` +
+/// `esc_run_bits` + `esc_level_bits` signed level) is the inter
+/// kernel's only tier (spec/04 §1.3 step 10, `lmax`/`rmax` = None)
+/// and this crate's encoder-compat arm behind a nested ESC.
 fn decode_escape_body(br: &mut BitReader<'_>, table: &AcVlcTable) -> Result<Token> {
     let trace = std::env::var_os("OXIDEAV_MSMPEG4_AC_TRACE").is_some();
     if trace {
