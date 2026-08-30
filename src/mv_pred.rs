@@ -1245,9 +1245,7 @@ impl MvGrid {
     /// reports `NeighbourSet::ABSENT` for every position until the
     /// caller starts writing per-MB cells back in.
     pub fn clear_all(&mut self) {
-        for cell in &mut self.cells {
-            *cell = MvGridCell::Absent;
-        }
+        self.cells.fill(MvGridCell::Absent);
     }
 
     /// Raster-order iterator over `(mb_x, mb_y, MvGridCell)` triples.
