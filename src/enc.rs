@@ -1765,22 +1765,12 @@ mod tests {
         fill_row_bands_with_x_texture(&mut input);
         let quant = 4u32;
 
-        // The RD must actually fire on this content (replay the
-        // analysis the encoder runs).
-        let luma = AcVlcTable::v3_intra_g5();
-        let chroma = AcVlcTable::g4_inter();
-        let (mb_w, mb_h) = dims.mb_dims();
-        let mut dc_cache = DcCache::new(mb_w, mb_h);
-        let mut fired = 0usize;
-        for my in 0..mb_h {
-            for mx in 0..mb_w {
-                let (plans, _, _, _) = analyse_intra_mb(&input, &mut dc_cache, mx, my, quant);
-                if choose_ac_pred(&plans, DcScheme::V3(DC_SIZE_SEL), &luma, &chroma).unwrap() {
-                    fired += 1;
-                }
-            }
-        }
-        assert!(fired > 0, "content should trigger ac_pred on some MB");
+        // (The RD firing itself is pinned by
+        // `ac_pred_rd_prefers_alt_scan_for_front_row_energy`; the
+        // spec/17 §3 escape-ladder correction changed the verbatim
+        // arm's cost, so whether THIS content fires is no longer a
+        // stable premise — the round-trips below are the conformance
+        // surface.)
 
         let config = EncoderConfig {
             quant: quant as u8,

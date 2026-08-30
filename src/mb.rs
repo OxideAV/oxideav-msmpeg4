@@ -22,6 +22,7 @@ use oxideav_core::bits::{BitReader, BitWriter};
 use oxideav_core::{Error, Result};
 
 use crate::ac::{decode_intra_ac, AcVlcTable, Scan};
+use crate::dc_pred::PredDir;
 use crate::iq::{dc_scaler, dequantise_h263};
 use crate::tables::{CBPY_INTRA_TABLE, DC_SIZE_CHROMA_TABLE, DC_SIZE_LUMA_TABLE};
 use crate::tables_data::{
@@ -457,6 +458,19 @@ pub fn reconstruct_intra_dc(dc_diff: i32, pred_dc: i32, block_idx: usize, quant:
     pred_dc + dc_diff * scaler
 }
 
+/// The predicted DC in the **quantised** domain: the neighbour's
+/// reconstructed DC divided by the DC scaler, rounded to nearest
+/// (MPEG-4 Part 2 §7.4.3.2 `//`). The prediction is added to the
+/// decoded differential *before* rescaling, so a neutral predictor
+/// (1024) that is not a multiple of the scaler snaps to the grid —
+/// e.g. `1024 // 12 = 85` → 1020 at PQUANT 6. Round 452: the MP43
+/// fixture's first macroblock only reconstructs its three predicted
+/// luma blocks (each exactly one grey level off under the pel-domain
+/// `pred + diff * scaler`) with the prediction in this domain.
+pub fn predicted_dc_level(pred_dc: i32, scaler: i32) -> i32 {
+    (pred_dc + scaler / 2).div_euclid(scaler)
+}
+
 /// Fully-decoded 8×8 intra block in the coefficient domain (post
 /// dequantisation, pre-IDCT).
 #[derive(Clone, Copy, Debug)]
@@ -516,6 +530,59 @@ pub fn decode_intra_block_full(
     }
 
     Ok(out)
+}
+
+/// [`decode_intra_block_full_v3`] with **AC prediction**: when
+/// `ac_pred` is `Some((dir, pred))`, the seven predicted quantised
+/// levels `pred[1..8]` are added to the block's first row (`dir` =
+/// [`PredDir::FromTop`]) or first column ([`PredDir::FromLeft`])
+/// before dequantisation — the MPEG-4 Part 2 §7.4.3.3 intra AC
+/// predictor, which the binary implements in its scan-dispatch helper
+/// (spec/03 §1.1: the alt-horizontal arm copies 7 dwords of the
+/// neighbour row, the alt-vertical arm 7 dwords with stride 0x20 =
+/// the neighbour column) and which the Microsoft fixtures require
+/// (round 452: MB (0,0) of div3.avi reconstructs its bottom-left
+/// luma block only with the top block's first row added).
+///
+/// Returns the reconstructed block and its **quantised levels**
+/// after prediction (raster order, DC slot unused), which the caller
+/// records as the AC-prediction source for later blocks.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_intra_block_full_v3_ac_pred(
+    br: &mut BitReader<'_>,
+    block_idx: usize,
+    pred_dc: i32,
+    quant: u32,
+    cbp_set: bool,
+    scan: Scan,
+    ac_table: &AcVlcTable,
+    dc_size_sel: u8,
+    ac_pred: Option<(PredDir, [i32; 8])>,
+) -> Result<(DecodedIntraBlock, [i32; 64])> {
+    let dc_diff = decode_intra_dc_diff_v3(br, block_idx, dc_size_sel)?;
+    let dc = reconstruct_intra_dc(dc_diff, pred_dc, block_idx, quant);
+
+    let mut out = DecodedIntraBlock::default();
+    out.coeffs[0] = dc;
+
+    if cbp_set {
+        out.ac_nonzero = decode_intra_ac(br, &mut out.coeffs, scan, ac_table, 1)?;
+    }
+    if let Some((dir, pred)) = ac_pred {
+        for (k, &p) in pred.iter().enumerate().skip(1) {
+            let pos = match dir {
+                PredDir::FromTop => k,
+                PredDir::FromLeft => 8 * k,
+            };
+            out.coeffs[pos] += p;
+        }
+    }
+    let mut levels = out.coeffs;
+    levels[0] = 0;
+    if cbp_set || ac_pred.is_some() {
+        dequantise_h263(&mut out.coeffs, quant, 1)?;
+    }
+    Ok((out, levels))
 }
 
 /// Variant of [`decode_intra_block_full`] that takes the picture-level

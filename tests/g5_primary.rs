@@ -119,12 +119,11 @@ fn g5_every_non_esc_entry_round_trips() {
 
 #[test]
 fn g5_esc_codeword_decodes_via_3_tier_escape_body() {
-    // Round 420 escape dispatch: after the ESC marker, one selector
-    // bit picks the tier (`1` = level extension, `0` = run
-    // extension); a nested ESC inside the level-extension arm is the
-    // encoder-compat verbatim fixed-length triple (1 bit last +
-    // 6 bits run + 8 bits signed level). This test exercises the
-    // verbatim arm.
+    // spec/17 §3 escape ladder: after the ESC marker, selector-1 `1`
+    // is the level-extension re-VLC arm; selector-1 `0` leads to
+    // selector-2 (`0` = the verbatim fixed-length triple: 1 bit last +
+    // 6 bits run + 8 bits signed level, no separate sign bit). This
+    // test exercises the verbatim arm.
     let table = AcVlcTable::v3_intra_g5();
     let esc_entry = table
         .entries
@@ -133,11 +132,11 @@ fn g5_esc_codeword_decodes_via_3_tier_escape_body() {
         .expect("G5 must have a Symbol::Escape entry");
     let bytes = pack(&[
         (esc_entry.code, esc_entry.bits as u32),
-        (1, 1),                                  // selector: level-extension tier
-        (esc_entry.code, esc_entry.bits as u32), // nested ESC → verbatim
-        (1, 1),                                  // last = 1
-        (5, 6),                                  // run = 5
-        (0xfd, 8),                               // level = -3 as 8-bit signed
+        (0, 1),    // selector 1 = 0
+        (0, 1),    // selector 2 = 0 → verbatim FLC
+        (1, 1),    // last = 1
+        (5, 6),    // run = 5
+        (0xfd, 8), // level = -3 as 8-bit signed
     ]);
     let mut br = BitReader::new(&bytes);
     let tok = decode_token(&mut br, &table).expect("decode ESC verbatim tier");

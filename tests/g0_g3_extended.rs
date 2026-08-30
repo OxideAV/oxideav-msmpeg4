@@ -341,9 +341,9 @@ fn g0_synthetic_esc_tier1_level_extension() {
 
 #[test]
 fn g1_synthetic_esc_tier2_run_extension() {
-    // ESC marker + selector bit `0` ⇒ run-extension tier: the next
-    // decoded (last, run_base, |level|) becomes
-    // (last, run_base + RMAX[last][level] + 1, level).
+    // spec/17 §3 ladder: ESC marker + selector-1 `0` + selector-2 `1`
+    // ⇒ run-extension arm: the next decoded (last, run_base, |level|)
+    // becomes (last, run_base + RMAX[last][level] + 1, level).
     let g = GExtended::G1;
     let count_a = g.count_a();
     let bl = synthetic_bl(count_a);
@@ -355,7 +355,8 @@ fn g1_synthetic_esc_tier2_run_extension() {
     let expected_run = rmax_0_1 + 1;
     let bytes = pack(&[
         (count_a as u32, bl), // ESC marker
-        (0, 1),               // selector: run-extension tier
+        (0, 1),               // selector 1 = 0
+        (1, 1),               // selector 2 = 1 → run-extension arm
         (0u32, bl),           // base symbol (idx 0)
         (0, 1),               // sign = positive
     ]);
@@ -368,17 +369,17 @@ fn g1_synthetic_esc_tier2_run_extension() {
 
 #[test]
 fn g2_synthetic_esc_tier3_verbatim_flc() {
-    // ESC + selector `1` + nested ESC ⇒ the encoder-compat verbatim
-    // 1+6+8 FLC triple (round 420; real streams never emit nested
-    // ESC — the traced kernel errors there per spec/13 §3).
+    // spec/17 §3 ladder: ESC + selector-1 `0` + selector-2 `0` ⇒ the
+    // verbatim 1+6+8 FLC triple (the level field carries its own
+    // sign; no sign bit follows).
     let g = GExtended::G2;
     let count_a = g.count_a();
     let bl = synthetic_bl(count_a);
     let table = AcVlcTable::v3_intra_g2_synthetic();
     let bytes = pack(&[
         (count_a as u32, bl), // ESC marker
-        (1, 1),               // selector: level-extension tier
-        (count_a as u32, bl), // nested ESC → verbatim FLC
+        (0, 1),               // selector 1 = 0
+        (0, 1),               // selector 2 = 0 → verbatim FLC
         (1, 1),               // last = 1
         (5, 6),               // run = 5
         // signed 8-bit level = -10. read_i32 sign-extends, but the bit

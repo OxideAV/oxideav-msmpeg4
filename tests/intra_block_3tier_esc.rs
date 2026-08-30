@@ -312,8 +312,8 @@ fn intra_block_tier_1_esc_level_extension() {
 // Test 4 — Tier 2 ESC body (run extension) reached after DC decode.
 // =====================================================================
 
-/// Run-extension tier (round 420): ESC → selector `0` → primary VLC →
-/// sign. The emitted run is `run_base + RMAX[last][|level|] + 1`. Use
+/// Run-extension arm (spec/17 §3 ladder): ESC → selector-1 `0` →
+/// selector-2 `1` → primary VLC → sign. The emitted run is `run_base + RMAX[last][|level|] + 1`. Use
 /// inner = idx 0 (run=0, level=1, last=false): RMAX[0][1] = 14 per
 /// audit/01 §4.1, so the emitted run is 0 + 14 + 1 = 15.
 #[test]
@@ -328,7 +328,8 @@ fn intra_block_tier_2_esc_run_extension() {
         (dc_code, dc_bl),
         // (no DC sign — diff is 0)
         (esc_code, esc_bits as u32),     // ESC marker
-        (0, 1),                          // selector: run-extension tier
+        (0, 1),                          // selector 1 = 0
+        (1, 1),                          // selector 2 = 1 → run-extension arm
         (inner_code, inner_bits as u32), // re-VLC payload for tier 2
         (0, 1),                          // tier-2 sign bit (positive)
         (term_code, term_bits as u32),
@@ -372,8 +373,8 @@ fn intra_block_tier_2_esc_run_extension() {
 // Test 5 — Tier 3 ESC body (verbatim FLC triple) reached after DC.
 // =====================================================================
 
-/// Verbatim arm (round 420 encoder-compat): ESC → selector `1` →
-/// nested ESC → 1+6+8-bit verbatim FLC triple. The terminator is
+/// Verbatim arm (spec/17 §3 ladder): ESC → selector-1 `0` →
+/// selector-2 `0` → 1+6+8-bit verbatim FLC triple. The terminator is
 /// encoded inline (last=1 set inside the FLC), so no separate
 /// terminator entry is needed.
 #[test]
@@ -385,8 +386,8 @@ fn intra_block_tier_3_esc_verbatim() {
     let bytes = pack(&[
         (dc_code, dc_bl),
         (esc_code, esc_bits as u32),
-        (1, 1),                      // selector: level-extension tier
-        (esc_code, esc_bits as u32), // nested ESC → verbatim FLC
+        (0, 1), // selector 1 = 0
+        (0, 1), // selector 2 = 0 → verbatim FLC
         // Verbatim triple: last=1, run=7, level=-5 (0xfb as signed 8-bit).
         (1, 1),
         (7, 6),

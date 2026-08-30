@@ -145,6 +145,45 @@ pub struct DcCache {
     luma: Vec<Option<i32>>,
     cb: Vec<Option<i32>>,
     cr: Vec<Option<i32>>,
+    luma_ac: Vec<AcEdges>,
+    cb_ac: Vec<AcEdges>,
+    cr_ac: Vec<AcEdges>,
+}
+
+/// The AC-prediction edges of one decoded intra block — its first
+/// row (`row[k]` = quantised level at raster position `k`, `k` in
+/// 1..8) and first column (`col[k]` = level at raster position
+/// `8k`). Index 0 of both is unused. The values are the block's
+/// **reconstructed quantised levels** (after its own AC prediction
+/// was applied), which is what the next block predicts from.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AcEdges {
+    pub row: [i32; 8],
+    pub col: [i32; 8],
+}
+
+impl AcEdges {
+    /// Extract the edges from a block of quantised levels in raster
+    /// order.
+    pub fn from_levels(levels: &[i32; 64]) -> Self {
+        let mut e = AcEdges::default();
+        for k in 1..8 {
+            e.row[k] = levels[k];
+            e.col[k] = levels[8 * k];
+        }
+        e
+    }
+
+    /// The seven predicted AC levels for a block that predicts from
+    /// this one in direction `dir`: the first row when predicting
+    /// from the top neighbour, the first column when predicting from
+    /// the left neighbour. Index 0 is zero.
+    pub fn predicted(&self, dir: PredDir) -> [i32; 8] {
+        match dir {
+            PredDir::FromTop => self.row,
+            PredDir::FromLeft => self.col,
+        }
+    }
 }
 
 impl DcCache {
@@ -161,7 +200,69 @@ impl DcCache {
             luma: vec![None; luma_w * luma_h],
             cb: vec![None; chroma_w * chroma_h],
             cr: vec![None; chroma_w * chroma_h],
+            luma_ac: vec![AcEdges::default(); luma_w * luma_h],
+            cb_ac: vec![AcEdges::default(); chroma_w * chroma_h],
+            cr_ac: vec![AcEdges::default(); chroma_w * chroma_h],
         }
+    }
+
+    /// Record the AC edges of a decoded luma block.
+    pub fn luma_ac_set(&mut self, x: usize, y: usize, edges: AcEdges) {
+        if x < self.luma_w && y < self.luma_h {
+            self.luma_ac[y * self.luma_w + x] = edges;
+        }
+    }
+
+    /// Record the AC edges of a decoded chroma block.
+    pub fn chroma_ac_set(&mut self, plane_is_cr: bool, x: usize, y: usize, edges: AcEdges) {
+        if x < self.chroma_w && y < self.chroma_h {
+            let plane = if plane_is_cr {
+                &mut self.cr_ac
+            } else {
+                &mut self.cb_ac
+            };
+            plane[y * self.chroma_w + x] = edges;
+        }
+    }
+
+    /// The AC prediction for luma block `(bx, by)` in direction
+    /// `dir`: the neighbour's first row (from top) or first column
+    /// (from left). All zero when the neighbour is outside the
+    /// picture or holds no intra DC (an inter MB in a P-frame).
+    pub fn ac_predict_luma(&self, bx: usize, by: usize, dir: PredDir) -> [i32; 8] {
+        let (nx, ny) = match dir {
+            PredDir::FromTop if by > 0 => (bx, by - 1),
+            PredDir::FromLeft if bx > 0 => (bx - 1, by),
+            _ => return [0; 8],
+        };
+        if self.luma_get(nx, ny).is_none() {
+            return [0; 8];
+        }
+        self.luma_ac[ny * self.luma_w + nx].predicted(dir)
+    }
+
+    /// Chroma analogue of [`DcCache::ac_predict_luma`].
+    pub fn ac_predict_chroma(
+        &self,
+        plane_is_cr: bool,
+        bx: usize,
+        by: usize,
+        dir: PredDir,
+    ) -> [i32; 8] {
+        let (nx, ny) = match dir {
+            PredDir::FromTop if by > 0 => (bx, by - 1),
+            PredDir::FromLeft if bx > 0 => (bx - 1, by),
+            _ => return [0; 8],
+        };
+        if self.chroma_get(plane_is_cr, nx, ny).is_none() {
+            return [0; 8];
+        }
+        let plane = if plane_is_cr {
+            &self.cr_ac
+        } else {
+            &self.cb_ac
+        };
+        plane[ny * self.chroma_w + nx].predicted(dir)
     }
 
     fn luma_get(&self, x: usize, y: usize) -> Option<i32> {

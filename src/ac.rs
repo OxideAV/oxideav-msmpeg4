@@ -219,6 +219,46 @@ impl AcVlcTable {
         }
     }
 
+    /// **G4 as an intra chroma table** (`ac_chroma_sel = 2`, spec/14
+    /// §3.1): the same packed-Huffman primary as [`Self::g4_inter`]
+    /// but with the LMAX / RMAX tables the intra kernel's escape
+    /// ladder needs (spec/17 §3). An intra chroma block dispatched to
+    /// G4 runs the **intra** kernel `0x1c216d97`, whose escape body is
+    /// the three-arm ladder regardless of which table is bound — the
+    /// pinned MP43 fixture (chroma selector 2) mis-decodes its first
+    /// escaped chroma token under the 1-tier reading (round 452).
+    pub fn v3_intra_g4() -> AcVlcTable {
+        AcVlcTable {
+            entries: g4_primary_entries(),
+            esc_last_bits: Self::MPEG4_ESC_LAST_BITS,
+            esc_run_bits: Self::MPEG4_ESC_RUN_BITS,
+            esc_level_bits: Self::MPEG4_ESC_LEVEL_BITS,
+            lmax: Some(g4_lmax()),
+            rmax: Some(g4_rmax()),
+        }
+    }
+
+    /// The **inter-block** AC table for a v2/v3 P-frame, selected by
+    /// the picture-header `ac_chroma_sel` (`[esi+0xad0]`, "chroma +
+    /// all-inter" role, spec/99 §5 / spec/14 §3.1: 0 → G2, 1 → G0,
+    /// 2 → G4). The v2/v3 inter kernel (`0x1c215e6f`, spec/99 §4.2)
+    /// reads the same descriptor for all six blocks of an inter MB and
+    /// consults the descriptor's level-/run-extension arrays on its
+    /// escape paths (spec/08 §1.1 / §1.3), i.e. it walks the same
+    /// escape ladder as the intra kernel — so the table carries LMAX /
+    /// RMAX. Only the v1 kernel (`0x1c215d2c`) has the single
+    /// fixed-length escape ([`Self::g4_inter`]). Round 452: every
+    /// Microsoft MP43 P-frame parses to its last macroblock under the
+    /// ladder and desynchronises at the first escaped inter block
+    /// under the 1-tier reading.
+    pub fn inter_for_chroma_sel(sel: u8) -> AcVlcTable {
+        match sel {
+            0 => Self::v3_intra_g2(),
+            1 => Self::v3_intra_g0(),
+            _ => Self::v3_intra_g4(),
+        }
+    }
+
     /// Build the **G0 (chroma + all-inter, class 1) DCT AC TCOEF
     /// primary VLC** table.
     ///
@@ -658,6 +698,44 @@ fn build_g5_rmax() -> RunLimitTable {
 // the spec/09 §8 consolidated table.
 // ====================================================================
 
+static G4_LMAX: std::sync::OnceLock<LevelLimitTable> = std::sync::OnceLock::new();
+static G4_RMAX: std::sync::OnceLock<RunLimitTable> = std::sync::OnceLock::new();
+
+/// LMAX over the G4 alphabet ([`crate::g_descriptor::g4_iter`]); same
+/// construction as [`build_g5_lmax`].
+fn g4_lmax() -> &'static LevelLimitTable {
+    use crate::g_descriptor::{g4_iter, GSymbol};
+    G4_LMAX.get_or_init(|| {
+        let mut lmax: LevelLimitTable = [[0u8; 64]; 2];
+        for (_idx, sym) in g4_iter() {
+            if let GSymbol::Token(t) = sym {
+                let last_idx = if t.last { 1 } else { 0 };
+                if (t.run as usize) < 64 && t.level_mag > lmax[last_idx][t.run as usize] {
+                    lmax[last_idx][t.run as usize] = t.level_mag;
+                }
+            }
+        }
+        lmax
+    })
+}
+
+/// RMAX over the G4 alphabet; same construction as [`build_g5_rmax`].
+fn g4_rmax() -> &'static RunLimitTable {
+    use crate::g_descriptor::{g4_iter, GSymbol};
+    G4_RMAX.get_or_init(|| {
+        let mut rmax: RunLimitTable = [[0u8; 32]; 2];
+        for (_idx, sym) in g4_iter() {
+            if let GSymbol::Token(t) = sym {
+                let last_idx = if t.last { 1 } else { 0 };
+                if (t.level_mag as usize) < 32 && t.run > rmax[last_idx][t.level_mag as usize] {
+                    rmax[last_idx][t.level_mag as usize] = t.run;
+                }
+            }
+        }
+        rmax
+    })
+}
+
 static G0_LMAX: std::sync::OnceLock<LevelLimitTable> = std::sync::OnceLock::new();
 static G0_RMAX: std::sync::OnceLock<RunLimitTable> = std::sync::OnceLock::new();
 static G1_LMAX: std::sync::OnceLock<LevelLimitTable> = std::sync::OnceLock::new();
@@ -854,28 +932,37 @@ pub fn decode_token(br: &mut BitReader<'_>, table: &AcVlcTable) -> Result<Token>
     }
 }
 
-/// Decode the escape-mode body of the v3 intra kernel: **one selector
-/// bit after the ESC marker** dispatches between the level-extension
-/// tier (`0x1c216e7b`: re-VLC a base symbol, emit
-/// `(last, run, sign·(|level|_base + LMAX[last][run]))`) and the
-/// run-extension tier (`0x1c216f02`: re-VLC a base symbol, emit
-/// `(last, run_base + RMAX[last][|level|] + 1, sign·|level|)`).
+/// Decode the escape-mode body of the v3 intra kernel — the TCOEF
+/// escape ladder of spec/17 §3 (`tables/tcoef-escape-ladder.csv`):
 ///
-/// The earlier "successive ESC re-fires promote the tier" reading of
-/// spec/04 §2.3 is refuted: spec/13 §3 traces a nested ESC inside
-/// either extension body straight to the kernel's −100 error exit
-/// (`je 0x1c21700c` at `1c216e96` / `1c216f1d`), so ESC-ESC chaining
-/// can never reach the second tier, and the ESC-path dispatch bytes at
-/// `1c216e5e..1c216e7b` leave exactly room for a bit read + branch.
-/// The one-selector-bit shape is pinned empirically on the escape
-/// population of the staged real Microsoft DIV3 fixtures (round 420).
-/// The **polarity** (selector 1 ⇒ level extension) is provisional
-/// pending a docs trace of that branch.
+/// ```text
+/// ESC marker (the table's count_A symbol)
+/// └── selector 1  (1 bit, 0x1c216e63)
+///     ├── 1 → one more codeword from the SAME table (0x1c216e80)
+///     │       then one sign bit (0x1c216ec4)            — level extension
+///     └── 0 → selector 2 (1 bit, 0x1c216eea)
+///             ├── 0 → last(1) + run(6) + level(8, signed) — verbatim FLC
+///             └── 1 → not exercised by the Microsoft encoder
+/// ```
 ///
-/// The verbatim FLC triple (`0x1c216f5f`; `esc_last_bits` +
-/// `esc_run_bits` + `esc_level_bits` signed level) is the inter
-/// kernel's only tier (spec/04 §1.3 step 10, `lmax`/`rmax` = None)
-/// and this crate's encoder-compat arm behind a nested ESC.
+/// The selector-1 = `1` arm re-VLCs a base symbol whose level is
+/// extended by `LMAX[last][run]` (spec/04 §2.3 first escape body at
+/// `0x1c216e7b`, whose `pri_A`/`pri_B` re-bind shifts the level
+/// bias). The selector-2 = `0` arm is the verbatim fixed-length triple
+/// at `0x1c216f5f` — its 1-bit `last` is the block terminator and its
+/// 8-bit level carries its own sign (spec/17 §3: no sign bit follows).
+///
+/// Selector-2 = `1` was never emitted across 7472 traced escapes; the
+/// only body left in the kernel for it is spec/04 §2.3's second
+/// escape at `0x1c216f02` (re-VLC + symbol-indexed run offset), so
+/// this decoder routes it to the run-extension re-VLC
+/// (`run = base + RMAX[last][|level|] + 1`). That arm is an
+/// inference from the kernel layout, not a traced observation; no
+/// Microsoft-produced stream exercises it and this crate's encoder
+/// never emits it.
+///
+/// The inter kernel (`lmax`/`rmax` = None) has a single verbatim FLC
+/// tier directly after the marker (spec/04 §1.3 step 10).
 fn decode_escape_body(br: &mut BitReader<'_>, table: &AcVlcTable) -> Result<Token> {
     let trace = std::env::var_os("OXIDEAV_MSMPEG4_AC_TRACE").is_some();
     if trace {
@@ -884,105 +971,84 @@ fn decode_escape_body(br: &mut BitReader<'_>, table: &AcVlcTable) -> Result<Toke
             br.bit_position()
         );
     }
-    // Round 420: the tier dispatch for the intra 3-tier kernel is a
-    // **one-bit selector read immediately after the ESC marker**, not
-    // the earlier "successive ESC re-fires" reading of spec/04 §2.3.
-    // Evidence:
-    //   * spec/13 §3 items (`je 0x1c21700c` at `1c216e96` / `1c216f1d`)
-    //     shows a nested ESC inside either extension body is the
-    //     kernel's hard -100 error — so ESC-ESC chaining can never
-    //     reach tier 2, refuting the chain model.
-    //   * The staged real-content fixtures (`tests/microsoft_fixtures.rs`
-    //     ground truth) only parse coherently when each ESC marker is
-    //     followed by one selector bit and then a single re-VLC:
-    //     selector `1` → the level-extension tier, `0` → the
-    //     run-extension tier (validated on the first-I-frame escape
-    //     population of both DIV3 AVI fixtures; see CHANGELOG r420).
-    //
-    // The selector dispatch applies to the intra kernel (LMAX/RMAX
-    // present). The inter kernel (`lmax`/`rmax` = None) keeps its
-    // single verbatim FLC tier per spec/04 §1.3 step 10.
-    if let (Some(lmax), Some(rmax)) = (table.lmax, table.rmax) {
-        let level_ext = br.read_bit()?;
-        if level_ext {
-            // Tier 1 — level extension: re-VLC a (last, run, base)
-            // symbol and add LMAX[last][run].
-            match vlc::decode_named(br, table.entries, "ac esc tier-1 re-vlc")? {
-                Symbol::RunLevel { last, run, level } => {
-                    let last_idx = if last { 1 } else { 0 };
-                    let lmax_value = if (run as usize) < 64 {
-                        lmax[last_idx][run as usize] as u16
-                    } else {
-                        0
-                    };
-                    let level_actual = level.saturating_add(lmax_value);
-                    let sign = br.read_bit()?;
-                    let signed = if sign {
-                        -(level_actual as i32)
-                    } else {
-                        level_actual as i32
-                    };
-                    if trace {
-                        eprintln!(
-                            "[esc trace] tier-1 level-ext: last={last} run={run} lvl={signed}"
-                        );
-                    }
-                    return Ok(Token {
-                        last,
-                        run,
-                        level: signed.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
-                    });
-                }
-                Symbol::Escape => {
-                    // Nested ESC inside the level-extension body: the
-                    // traced kernel returns -100 here (spec/13 §3).
-                    // Our own encoder uses this otherwise-dead pattern
-                    // as the verbatim-FLC fallback for tokens the two
-                    // extension tiers cannot represent, so decode it
-                    // as the FLC triple instead of erroring; real
-                    // MS-encoded streams never reach this arm.
-                    return decode_escape_flc(br, table, trace);
-                }
-            }
-        }
-        // Tier 2 — run extension: re-VLC a (last, base, |level|)
-        // symbol and add RMAX[last][|level|] + 1 to the run.
-        match vlc::decode_named(br, table.entries, "ac esc tier-2 re-vlc")? {
+    let (lmax, rmax) = match (table.lmax, table.rmax) {
+        (Some(l), Some(r)) => (l, r),
+        _ => return decode_escape_flc(br, table, trace),
+    };
+    let selector_1 = br.read_bit()?;
+    if selector_1 {
+        // Level extension: re-VLC a (last, run, base) symbol and add
+        // LMAX[last][run]; then the sign bit.
+        return match vlc::decode_named(br, table.entries, "ac esc level-ext re-vlc")? {
             Symbol::RunLevel { last, run, level } => {
                 let last_idx = if last { 1 } else { 0 };
-                let rmax_value = if (level as usize) < 32 {
-                    rmax[last_idx][level as usize] as u16
+                let lmax_value = if (run as usize) < 64 {
+                    lmax[last_idx][run as usize] as u16
                 } else {
                     0
                 };
-                let run_actual = ((run as u16).saturating_add(rmax_value).saturating_add(1))
-                    .min(u8::MAX as u16) as u8;
+                let level_actual = level.saturating_add(lmax_value);
                 let sign = br.read_bit()?;
-                let signed = if sign { -(level as i32) } else { level as i32 };
+                let signed = if sign {
+                    -(level_actual as i32)
+                } else {
+                    level_actual as i32
+                };
                 if trace {
-                    eprintln!(
-                        "[esc trace] tier-2 run-ext: last={last} run={run_actual} lvl={signed}"
-                    );
+                    eprintln!("[esc trace] level-ext: last={last} run={run} lvl={signed}");
                 }
-                return Ok(Token {
+                Ok(Token {
                     last,
-                    run: run_actual,
+                    run,
                     level: signed.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
-                });
+                })
             }
-            Symbol::Escape => {
-                // Same encoder-compat fallback as the tier-1 arm.
-                return decode_escape_flc(br, table, trace);
-            }
-        }
+            // Nested ESC inside the extension body is the kernel's
+            // -100 error exit (spec/13 §3).
+            Symbol::Escape => Err(Error::invalid(
+                "msmpeg4 ac: nested ESC inside the level-extension escape body; \
+                 kernel `0x1c216e96` returns -100 (spec/13 §3)",
+            )),
+        };
     }
-    decode_escape_flc(br, table, trace)
+    let selector_2 = br.read_bit()?;
+    if !selector_2 {
+        return decode_escape_flc(br, table, trace);
+    }
+    // Selector-2 = 1: run-extension re-VLC (inferred arm, see above).
+    match vlc::decode_named(br, table.entries, "ac esc run-ext re-vlc")? {
+        Symbol::RunLevel { last, run, level } => {
+            let last_idx = if last { 1 } else { 0 };
+            let rmax_value = if (level as usize) < 32 {
+                rmax[last_idx][level as usize] as u16
+            } else {
+                0
+            };
+            let run_actual = ((run as u16).saturating_add(rmax_value).saturating_add(1))
+                .min(u8::MAX as u16) as u8;
+            let sign = br.read_bit()?;
+            let signed = if sign { -(level as i32) } else { level as i32 };
+            if trace {
+                eprintln!("[esc trace] run-ext: last={last} run={run_actual} lvl={signed}");
+            }
+            Ok(Token {
+                last,
+                run: run_actual,
+                level: signed.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+            })
+        }
+        Symbol::Escape => Err(Error::invalid(
+            "msmpeg4 ac: nested ESC inside the run-extension escape body; \
+             kernel `0x1c216f1d` returns -100 (spec/13 §3)",
+        )),
+    }
 }
 
 /// Verbatim fixed-length escape triple: `last(1) + run(6) + level(8,
 /// two's-complement)`. This is the inter kernel's only ESC body
-/// (spec/04 §1.3 step 10) and the intra kernel's encoder-compat
-/// fallback tier.
+/// (spec/04 §1.3 step 10) and the intra kernel's selector `0`,`0` arm
+/// (spec/17 §3: the `last` bit terminates the block, the level field
+/// is signed and no sign bit follows).
 fn decode_escape_flc(br: &mut BitReader<'_>, table: &AcVlcTable, trace: bool) -> Result<Token> {
     let last = br.read_u32(table.esc_last_bits as u32)? != 0;
     let run = br.read_u32(table.esc_run_bits as u32)? as u8;
@@ -1024,23 +1090,24 @@ fn escape_entry(table: &AcVlcTable) -> Option<&'static VlcEntry<Symbol>> {
 }
 
 /// Encode one `(last, run, level)` token — the bit-level inverse of
-/// [`decode_token`]. Tier preference mirrors the selector-bit escape
-/// dispatch the decoder implements (round 420; see
-/// [`decode_escape_body`] for the evidence):
+/// [`decode_token`]. Tier preference follows the spec/17 §3 escape
+/// ladder (see [`decode_escape_body`]), emitting only the arms the
+/// Microsoft encoder itself exercises:
 ///
 /// 1. **Primary**: the triple has its own codeword → codeword + AC
 ///    sign bit (standard MPEG-4 convention, bit `1` ⇒ negative).
-/// 2. **Tier-1 level extension** (tables with LMAX/RMAX, i.e. the
-///    intra kernel): `ESC` + selector bit `1` + the codeword of
+/// 2. **Level extension** (tables with LMAX/RMAX, i.e. the intra
+///    kernel): `ESC` + selector-1 `1` + the codeword of
 ///    `(last, run, |level| − LMAX[last][run])` + sign.
-/// 3. **Tier-2 run extension**: `ESC` + selector bit `0` + the
-///    codeword of `(last, run − RMAX[last][|level|] − 1, |level|)`
-///    + sign.
-/// 4. **Verbatim FLC tier**: for the intra tables `ESC` + selector
-///    `1` + `ESC` (the nested-ESC encoder-compat arm), for 1-tier
-///    tables (`lmax`/`rmax` absent — the inter kernel, spec/04 §1.3
-///    step 10) a single `ESC`; then the fixed-length
+/// 3. **Verbatim FLC**: for the intra tables `ESC` then selector-1
+///    `0` then selector-2 `0`; for 1-tier tables (`lmax`/`rmax`
+///    absent — the v1 inter kernel, spec/04 §1.3 step 10) a single
+///    `ESC`; then the fixed-length
 ///    `last(1) + run(6) + level(8, two's-complement)` triple.
+///
+/// The selector-2 `1` run-extension arm is never written (it is
+/// unobserved on Microsoft streams; the decoder's reading of it is an
+/// inference).
 ///
 /// `level` must be non-zero, `run <= 63`, and `|level| <= 127` (every
 /// quantiser output from [`crate::iq::quantise_h263`] satisfies the
@@ -1073,9 +1140,9 @@ pub fn encode_token(bw: &mut BitWriter, table: &AcVlcTable, tok: Token) -> Resul
     })?;
     let three_tier = table.lmax.is_some() && table.rmax.is_some();
 
-    if let (Some(lmax), Some(rmax)) = (table.lmax, table.rmax) {
-        // Tier 1 — level extension: |level| = base + LMAX[last][run].
-        // Wire form: ESC + selector `1` + base codeword + sign.
+    if let Some(lmax) = table.lmax {
+        // Level extension: |level| = base + LMAX[last][run].
+        // Wire form: ESC + selector-1 `1` + base codeword + sign.
         let last_idx = tok.last as usize;
         let lmax_v = lmax[last_idx][tok.run as usize] as u16;
         if lmax_v > 0 && level_mag > lmax_v {
@@ -1088,21 +1155,6 @@ pub fn encode_token(bw: &mut BitWriter, table: &AcVlcTable, tok: Token) -> Resul
                 return Ok(());
             }
         }
-        // Tier 2 — run extension: run = base + RMAX[last][|level|] + 1.
-        // Wire form: ESC + selector `0` + base codeword + sign.
-        if (level_mag as usize) < 32 {
-            let rmax_v = rmax[last_idx][level_mag as usize];
-            if tok.run > rmax_v {
-                let run_base = tok.run - rmax_v - 1;
-                if let Some(e) = find_run_level_entry(table, tok.last, run_base, level_mag) {
-                    bw.write_u32(esc.code, esc.bits as u32);
-                    bw.write_bit(false);
-                    bw.write_u32(e.code, e.bits as u32);
-                    bw.write_bit(negative);
-                    return Ok(());
-                }
-            }
-        }
     }
 
     // Verbatim FLC tier.
@@ -1113,11 +1165,11 @@ pub fn encode_token(bw: &mut BitWriter, table: &AcVlcTable, tok: Token) -> Resul
         )));
     }
     if three_tier {
-        // Intra tables: ESC + selector `1` + nested ESC (the
-        // encoder-compat verbatim arm in `decode_escape_body`).
+        // Intra tables: ESC + selector-1 `0` + selector-2 `0`
+        // (spec/17 §3 fixed-length arm).
         bw.write_u32(esc.code, esc.bits as u32);
-        bw.write_bit(true);
-        bw.write_u32(esc.code, esc.bits as u32);
+        bw.write_bit(false);
+        bw.write_bit(false);
     } else {
         bw.write_u32(esc.code, esc.bits as u32);
     }
@@ -1805,7 +1857,8 @@ mod tests {
             .expect("G5 ESC entry");
         let bytes = pack(&[
             (esc_entry.code, esc_entry.bits as u32),
-            (0, 1),    // selector: run-extension tier
+            (0, 1),    // selector 1 = 0
+            (1, 1),    // selector 2 = 1 → run-extension arm
             (0b10, 2), // (run=0, level=1, last=0)
             (0, 1),    // sign = 0 → positive
         ]);
@@ -1820,13 +1873,10 @@ mod tests {
     }
 
     #[test]
-    fn esc_verbatim_arm_via_nested_esc() {
-        // Encoder-compat verbatim arm: ESC marker → selector `1` →
-        // nested ESC → the verbatim (last, run, level) FLC triple.
-        // (Real MS-encoded streams never emit nested ESC — the traced
-        // kernel treats it as a hard error per spec/13 §3; this arm
-        // exists so our own encoder has a lossless fallback for
-        // tokens the two extension tiers cannot represent.)
+    fn esc_verbatim_arm_selector_00() {
+        // Verbatim FLC arm per spec/17 §3: ESC marker → selector 1 =
+        // `0` → selector 2 = `0` → last(1) + run(6) + level(8, signed,
+        // no separate sign bit).
         let t = AcVlcTable::v3_intra_g5();
         let esc_entry = t
             .entries
@@ -1835,17 +1885,36 @@ mod tests {
             .expect("G5 ESC entry");
         let bytes = pack(&[
             (esc_entry.code, esc_entry.bits as u32),
-            (1, 1),                                  // selector: level-extension tier
-            (esc_entry.code, esc_entry.bits as u32), // nested ESC → verbatim
-            (1, 1),                                  // last = 1
-            (5, 6),                                  // run = 5
-            (0xfd, 8),                               // level = -3 as 8-bit signed (0xfd = -3)
+            (0, 1),    // selector 1 = 0
+            (0, 1),    // selector 2 = 0 → verbatim FLC
+            (1, 1),    // last = 1
+            (5, 6),    // run = 5
+            (0xfd, 8), // level = -3 as 8-bit signed (0xfd = -3)
         ]);
         let mut br = BitReader::new(&bytes);
         let tok = decode_token(&mut br, &t).expect("decode verbatim ESC body");
         assert!(tok.last);
         assert_eq!(tok.run, 5);
         assert_eq!(tok.level, -3);
+    }
+
+    #[test]
+    fn esc_nested_esc_inside_extension_body_is_hard_error() {
+        // spec/13 §3: a nested ESC inside either extension body is the
+        // kernel's -100 error exit.
+        let t = AcVlcTable::v3_intra_g5();
+        let esc_entry = t
+            .entries
+            .iter()
+            .find(|e| matches!(e.value, Symbol::Escape))
+            .expect("G5 ESC entry");
+        let bytes = pack(&[
+            (esc_entry.code, esc_entry.bits as u32),
+            (1, 1),                                  // selector 1 = 1 → level-extension arm
+            (esc_entry.code, esc_entry.bits as u32), // nested ESC
+        ]);
+        let mut br = BitReader::new(&bytes);
+        assert!(decode_token(&mut br, &t).is_err());
     }
 
     #[test]
