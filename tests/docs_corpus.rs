@@ -56,9 +56,8 @@
 //! Per the docs/video/msmpeg4-fixtures/README.md "clean-room boundary"
 //! warning, the *cleanroom docs workspace* (`docs/video/msmpeg4/`) must
 //! NOT consume this corpus. We are the **implementer crate**, NOT the
-//! cleanroom workspace, so consumption here is explicitly blessed. We
-//! still don't read libavcodec source — the corpus is treated as a
-//! black-box reference.
+//! cleanroom workspace, so consumption here is explicitly blessed.
+//! The corpus files are consumed as opaque black-box reference data.
 
 use std::fs;
 use std::path::PathBuf;

@@ -59,11 +59,9 @@
 //!
 //! # Workspace policy
 //!
-//! Per `.../memory/feedback_no_external_libs.md`, we don't read
-//! libavcodec source. The fixtures themselves are data (MS-encoded
-//! bitstreams) and the `ffmpeg` CLI is used only as a black-box
-//! container muxer + reference decoder. No code from FFmpeg is
-//! consulted.
+//! Per the workspace external-source policy, the fixtures are data
+//! (MS-encoded bitstreams) and the `ffmpeg` CLI is used only as a
+//! black-box container muxer + reference decoder.
 
 use std::fs;
 use std::io::Read;
