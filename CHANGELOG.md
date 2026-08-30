@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.10](https://github.com/OxideAV/oxideav-msmpeg4/compare/v0.0.9...v0.0.10) - 2026-08-30
+
+### Other
+
+- reword two fixture-provenance comments to cite the staged policy without naming external implementations
+- pin predict_cbp_bit truth table and iframe_ext slice geometry
+- satisfy clippy 1.98 manual_slice_fill on the MvGrid reset
+- README + CHANGELOG: round 452 — Microsoft fixtures decode end-to-end
+- promote the Microsoft-stream harness to asserted minimums
+- v3 picture layer per spec/17+18, arbitrated on the Microsoft fixtures
+- v3 TCOEF escape ladder per spec/17 §3: selector-1/selector-2 dispatch, signed FLC arm
+- align escape-body doc comments with the round-420 selector-bit dispatch
+- v3 I-frame real-content overhaul: intra CBPCY table + XOR prediction, DC pred/sign/table fixes, selector-bit escapes, seq-start extension
+- MCBPCY docs gap closed; real-content frontier is now the intra AC walk
+- v3 AC: cover the reserved G4/G5 ESC-marker codeword; name VLCs in decode errors
+- v3 I-frame encoder: emit high-half joint-MCBPCY symbols (idx = 64 + cbp)
+- v3 joint-MCBPCY: decode against re-extracted wire codes (region_05eac8_mcbpcy, Kraft=1.0)
+- scrub external-impl name from test-fixture provenance comment
+- v3 FourCC alias coverage (DVX3/COL1) + header-parse conformance + docs-gap triage
+- add CI / crates.io / docs.rs / MIT-license badges
+
 ### Changed
 
 - **Round 452 — spec/17 + spec/18 applied; Microsoft fixtures decode
