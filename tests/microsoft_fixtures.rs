@@ -24,13 +24,16 @@
 //!
 //! # Tier
 //!
-//! All three are **report-only** for the same reason as the
-//! `docs_corpus.rs` tests: the cleanroom workspace's `desc+0x1c /
-//! +0x20` runtime binding is still OPEN (rounds 31-32 both refuted
-//! candidate hypotheses, see `audit/04` §2.5 / `spec/13` §8). Until
-//! that lands, our v3 decoder cannot bit-exact match real Microsoft
-//! streams either — but the per-frame failure pattern against these
-//! fixtures may itself point at the right binding for the next round.
+//! Round 452 (spec/17 + spec/18 landed) promoted the Microsoft-encoded
+//! fixtures to **asserted** minimums when the fixture data + `ffmpeg`
+//! reference are available (see `Expectations`): mp43.wmv — the
+//! definitive Microsoft WMFSDK 7 stream — must decode 49 of its 50
+//! frames (the 50th packet is truncated at the container level) with
+//! an aggregate luma exact-match well above 95%; the DIV3-tagged AVI
+//! fixtures must decode their I-frames end-to-end at > 97% luma match.
+//! Their P-frames still drift (first divergence at an intra-in-P MB;
+//! see the crate README "What's still open"), so only frame-count
+//! floors are asserted there. Offline runs still skip gracefully.
 //!
 //! # Workflow
 //!
@@ -586,7 +589,40 @@ fn decode_and_compare(fix: &Fixture, avi_bytes: &[u8], yuv_ref: &[u8]) -> Vec<Fr
     outcomes
 }
 
-fn evaluate_outcomes(fix: &Fixture, outcomes: &[FrameOutcome]) {
+/// Asserted per-fixture minimums (only checked when the fixture and
+/// the `ffmpeg` reference decode are actually available).
+struct Expectations {
+    /// Minimum number of frames that must decode without error.
+    min_decoded: usize,
+    /// Minimum aggregate luma exact-match percentage.
+    min_y_match_pct: f64,
+    /// Minimum luma exact-match percentage on frame 0 (the I-frame).
+    min_frame0_y_pct: f64,
+}
+
+const EXPECTATIONS: &[Expectations] = &[
+    // div3.avi: I-frames fully parse; P-frames drift (round 452).
+    Expectations {
+        min_decoded: 45,
+        min_y_match_pct: 5.0,
+        min_frame0_y_pct: 97.0,
+    },
+    // div4.avi: same tier as div3.
+    Expectations {
+        min_decoded: 45,
+        min_y_match_pct: 5.0,
+        min_frame0_y_pct: 97.0,
+    },
+    // mp43.wmv: full-clip decode; frame 49's packet is truncated in
+    // the container, so 49 of 50.
+    Expectations {
+        min_decoded: 49,
+        min_y_match_pct: 95.0,
+        min_frame0_y_pct: 99.0,
+    },
+];
+
+fn evaluate_outcomes(fix: &Fixture, expect: &Expectations, outcomes: &[FrameOutcome]) {
     let mut agg_y = PlaneDiff::default();
     let mut agg_u = PlaneDiff::default();
     let mut agg_v = PlaneDiff::default();
@@ -645,14 +681,41 @@ fn evaluate_outcomes(fix: &Fixture, outcomes: &[FrameOutcome]) {
         first_diverge,
     );
 
-    // Report-only: don't fail on PSNR mismatch. The eprintln! above is
-    // the human-readable diagnostic that the next-cleanroom-round
-    // Implementer uses to triangulate the `pri_A` / `pri_B` runtime
-    // binding (see crate-level doc-comment).
+    // Round 452 assertions: the Microsoft-arbitrated decoder must not
+    // regress below the levels the spec/17 + spec/18 rebuild reached.
+    assert!(
+        decoded_frames >= expect.min_decoded,
+        "{}: decoded {} frames, expected at least {}",
+        fix.name,
+        decoded_frames,
+        expect.min_decoded,
+    );
+    assert!(
+        agg_y.match_pct() >= expect.min_y_match_pct,
+        "{}: aggregate Y match {:.2}% below floor {:.2}%",
+        fix.name,
+        agg_y.match_pct(),
+        expect.min_y_match_pct,
+    );
+    if let Some(FrameOutcome {
+        diff: Some((dy, _, _)),
+        ..
+    }) = outcomes.first()
+    {
+        assert!(
+            dy.match_pct() >= expect.min_frame0_y_pct,
+            "{}: I-frame 0 Y match {:.2}% below floor {:.2}%",
+            fix.name,
+            dy.match_pct(),
+            expect.min_frame0_y_pct,
+        );
+    } else {
+        panic!("{}: frame 0 (the I-frame) failed to decode", fix.name);
+    }
 }
 
 /// Run one fixture end-to-end, fetching + remuxing as needed.
-fn run_fixture(fix: &Fixture) {
+fn run_fixture(fix: &Fixture, expect: &Expectations) {
     eprintln!(
         "=== {} ({}x{}, {} frames) ===",
         fix.name, fix.width, fix.height, fix.n_frames
@@ -695,7 +758,7 @@ fn run_fixture(fix: &Fixture) {
 
     // 4. Decode + diff.
     let outcomes = decode_and_compare(fix, &avi_bytes, &yuv_ref);
-    evaluate_outcomes(fix, &outcomes);
+    evaluate_outcomes(fix, expect, &outcomes);
 }
 
 // ---------------------------------------------------------------------------
@@ -705,17 +768,17 @@ fn run_fixture(fix: &Fixture) {
 
 #[test]
 fn microsoft_fixture_div3_avi() {
-    run_fixture(&FIXTURES[0]);
+    run_fixture(&FIXTURES[0], &EXPECTATIONS[0]);
 }
 
 #[test]
 fn microsoft_fixture_div4_avi() {
-    run_fixture(&FIXTURES[1]);
+    run_fixture(&FIXTURES[1], &EXPECTATIONS[1]);
 }
 
 #[test]
 fn microsoft_fixture_mp43_wmv() {
-    run_fixture(&FIXTURES[2]);
+    run_fixture(&FIXTURES[2], &EXPECTATIONS[2]);
 }
 
 // ---------------------------------------------------------------------------
