@@ -1836,6 +1836,35 @@ mod tests {
     }
 
     #[test]
+    fn predict_cbp_bit_full_truth_table() {
+        // Agreeing direct neighbours win regardless of the diagonal;
+        // disagreeing neighbours predict the complement of the
+        // diagonal (round 452, fixture-selected — see the fn doc).
+        for tl in [false, true] {
+            assert!(!predict_cbp_bit(false, false, tl), "l=t=0 → 0 (tl={tl})");
+            assert!(predict_cbp_bit(true, true, tl), "l=t=1 → 1 (tl={tl})");
+        }
+        for (l, t) in [(false, true), (true, false)] {
+            assert!(predict_cbp_bit(l, t, false), "disagree, tl=0 → 1");
+            assert!(!predict_cbp_bit(l, t, true), "disagree, tl=1 → 0");
+        }
+    }
+
+    #[test]
+    fn slice_rows_for_matches_fixture_geometry() {
+        // 352x240 (15 MB rows) at iframe_ext = 23 → one slice.
+        assert_eq!(slice_rows_for(23, 15), 15);
+        // 400x250 (16 MB rows) at iframe_ext = 24 → two 8-row slices
+        // (the MP43 fixture's rows 8..15 restart their DC/AC
+        // prediction at row 8).
+        assert_eq!(slice_rows_for(24, 16), 8);
+        // Degenerate / out-of-range values fall back to a single slice.
+        assert_eq!(slice_rows_for(0, 15), 15);
+        assert_eq!(slice_rows_for(22, 15), 15);
+        assert_eq!(slice_rows_for(31, 4), 4);
+    }
+
+    #[test]
     fn dims_validate_range() {
         assert!(PictureDims::new(0, 480).is_err());
         assert!(PictureDims::new(640, 0).is_err());
