@@ -9,6 +9,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Round 452 — spec/17 + spec/18 applied; Microsoft fixtures decode
+  end-to-end.** The three docs stagings that landed after round 420
+  (`spec/17-intra-mb-layer-and-escape-ladder.md`,
+  `spec/18-inter-mb-header-and-cbp-bit-order.md`, the `spec/99`
+  refresh) answered the round-420 asks and re-arbitrated the v3
+  real-content frontier on the pinned Microsoft fixtures:
+  1. **TCOEF escape ladder** (spec/17 §3): ESC → selector-1 (`1` =
+     level-extension re-VLC + sign) → selector-2 (`0` = verbatim
+     `last(1) + run(6) + level(8, signed)` — the arm the Microsoft
+     encoder takes 3691/7472 times and the round-420 shape mis-parsed;
+     `1` = unobserved, decoded as the run-extension re-VLC and marked
+     an inference). Nested ESC inside an extension body is the traced
+     hard error. The v2/v3 **inter** kernel walks the same ladder
+     (spec/08 §1.1/§1.3 — its descriptor's extension arrays are
+     consulted on ESC); only the v1 inter kernel keeps the 1-tier FLC.
+  2. **Header layout**: the 5-bit field after PQUANT is a
+     **per-I-frame** element (`MsV3PictureHeader::iframe_ext`; 23 on
+     both 352x240 fixtures and every spec/17-traced frame, 24 on the
+     400x250 MP43 stream), and it sizes the I-frame **predictor
+     slices** (`slices = iframe_ext - 22`): DC/AC prediction restarts
+     at each slice boundary while the CBP-prediction grid and the
+     bitstream run through. P-frames carry a leading 1-bit
+     `mb_skip_enable` (`[esi+0x88]`) that gates the per-MB skip
+     prefix.
+  3. **Intra AC prediction**: with the MB `ac_pred` flag set, each
+     block adds the gradient-direction neighbour's first row/column of
+     quantised levels before dequantisation (spec/03 §1.1's 7-dword
+     copies), and the scan switches as before. The encoder transmits
+     predicted differences and RD-decides the flag on real cost.
+  4. **Luma CBP spatial prediction** is a coded-bit rule
+     (`predict_cbp_bit`: agree → that value; disagree → `!top_left`),
+     replacing the round-420 DC-gradient neighbour, which desyncs
+     div3.avi at MB (3,0). Chroma stays raw (spec/17 §2.1).
+  5. **DC prediction moves to the quantised domain**
+     (`predicted_dc_level`) and the IDCT rounds half-toward-negative —
+     both pinned by MP43 macroblock deltas.
+  6. **P-frame MB header** (spec/18 §3): only the intra (bit-6-clear)
+     arm reads the `ac_pred` element; inter MBs carry none. The inter
+     residual binds the `ac_chroma_sel` descriptor (G2/G0/G4);
+     `ac_luma_sel` persists from the most recent I-frame via the
+     reference `Picture`, fixing intra-in-P luma table binding.
+  7. **`decode_picture_partial`** — diagnostic entry point returning
+     the partially reconstructed picture, MB count, and the stopping
+     error.
+  Result against the black-box reference decode: `mp43.wmv` (the
+  definitive Microsoft WMFSDK-7 stream) decodes 49 of 50 frames (the
+  50th packet is truncated in the container) with every I-frame
+  parsing 400/400 MBs — frame 0 at 99.7% exact luma, frame 44 and the
+  P-frames 45..48 fully pixel-exact, ~334-339/400 MBs pixel-exact per
+  P-frame elsewhere (residual: float-vs-integer IDCT rounding);
+  div3.avi / div4.avi I-frames parse 330/330 (was 83 / 162 MBs) at
+  ~99% exact luma; their P-frames decode structurally but drift from
+  the first intra-in-P macroblock (see README). The
+  `microsoft_fixtures` harness now asserts these floors when the
+  fixture data is present.
+
 - **Round 420 — v3 I-frame real-content overhaul.** Seven independent
   corrections, each pinned empirically against the staged real
   Microsoft DIV3 fixtures (`tests/microsoft_fixtures.rs` ground truth)

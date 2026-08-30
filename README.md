@@ -65,15 +65,22 @@ MCBPCY) was retired when the `region_05eac8_mcbpcy` re-extraction
 landed (Kraft = 1.0; the old canonical assignment matched the real
 codes for 0 of 128 symbols).
 
-Round 420 rebuilt the **v3 I-frame MB layer** against the pinned real
-Microsoft fixtures: I-frames use a dedicated 64-entry intra-CBPCY VLC
-with XOR-predicted luma bits (the 128-entry joint table is
-P-frame-only), the DC gradient/tie rule and DC sign convention were
-corrected, the four `dc_size_sel` DC tables were re-paired, the intra
-AC escape became a selector-bit dispatch, and the first-of-sequence
-5-bit header extension is consumed/emitted. The first I-frame of
-div4.avi now decodes pixel-exactly through its leading MB rows (see
-"What's still open" for the remaining frontier).
+Round 452 applied the spec/17 + spec/18 docs stagings (intra MB layer +
+escape ladder; inter MB header) and re-arbitrated every open semantic
+on the pinned Microsoft fixtures: the TCOEF escape ladder's two
+selector bits and signed fixed-length arm, the per-I-frame 5-bit header
+field and the predictor slices it sizes, intra AC **coefficient**
+prediction, the coded-bit luma-CBP spatial predictor, quantised-domain
+DC prediction, half-down IDCT rounding, the P-frame `mb_skip_enable`
+header bit, the intra-only `ac_pred` element of the joint MB header,
+the selector-bound inter AC descriptor (with the same escape ladder on
+v2/v3 inter blocks), and `ac_luma_sel` persistence into P-frames. The
+definitive Microsoft stream (`mp43.wmv`, WMFSDK 7) now decodes
+end-to-end: every I-frame parses 400/400 MBs, frames 44..48 are fully
+pixel-exact, and the other P-frames hold ~84% pixel-exact MBs (the
+residual is float-vs-integer IDCT rounding, not parse); the DIV3 AVI
+fixtures' I-frames parse 330/330 at ~99% exact luma (see "What's still
+open" for their P-frame drift).
 
 | Piece                                          | Status     |
 | ---------------------------------------------- | ---------- |
@@ -89,8 +96,8 @@ div4.avi now decodes pixel-exactly through its leading MB rows (see
 | DC spatial predictor + AC scan dispatcher      | complete   |
 | Intra MB pipeline (DC pred + IDCT + store)     | complete   |
 | G0..G5 canonical-Huffman primary AC VLC        | complete   |
-| MS-MPEG4v3 intra 3-tier ESC body               | complete (LMAX/RMAX ground-truth-validated for all 6 G-families) |
-| Inter AC residual (G4 VLC → IDCT → add to MC)  | complete   |
+| MS-MPEG4v3 intra/inter TCOEF escape ladder     | complete (spec/17 §3 selector-1/selector-2 dispatch; LMAX/RMAX for all 6 G-families; run-extension arm is an inference — unobserved on Microsoft streams) |
+| Inter AC residual (`ac_chroma_sel`-bound G2/G0/G4 VLC → IDCT → add to MC) | complete (round 452: per-frame descriptor binding + intra-kernel escape ladder on v2/v3 inter blocks) |
 | P-frame MV VLC + half-pel MC (default + alt)   | complete (decodes against extracted wire codes, spec/16 §1; alt-table byte-LUT selection picture-level-pinned, round 362) |
 | P-frame 1-MV predictor (Figure 7-34)           | complete (picture-level median-propagation pin, round 359) |
 | 4-MV-per-MB predictor surface + neighbour resolver | complete (per-block bordering-cell pick; INTER4V→1-MV-neighbour propagation picture-level-pinned, round 366) |
@@ -109,32 +116,46 @@ div4.avi now decodes pixel-exactly through its leading MB rows (see
 
 ## What's still open for real-content decode
 
-- **V3 real-content I-frame decode (round 420 frontier)**: the round
-  405 "intra AC desync" is resolved — it was never the AC tables. Round
-  420 found and fixed seven compounding I-frame semantics errors (see
-  CHANGELOG): the I-frame MB header uses a dedicated 64-entry intra
-  CBPCY VLC (re-aligned `region_05eed0`, VMA `0x1c25fad0` — closing
-  that region's OPEN role) with patent-7,054,494 XOR-predicted luma
-  bits; the DC gradient rule was inverted (TOP iff `|A−D| <= |D−B|`,
-  ties TOP); the v3 DC sign convention is standard (1 ⇒ negative); the
-  four `dc_size_sel` DC tables pair per spec/99 §4.5 (sel0 =
-  {`05f0d8`, `05f4a0`}, sel1 = {`05f868`, `05fc30`}); the intra escape
-  is marker + one selector bit + re-VLC (spec/13 §3 refutes ESC-ESC
-  chaining); and the first I-frame of a sequence carries a 5-bit
-  extension. Result on the pinned fixtures: div4.avi's first I-frame
-  decodes **pixel-exactly** (block means < 1 grey off the reference)
-  through the leading MB rows and parses 162/330 MBs; div3.avi
-  83/330; mp43.wmv 9/400. Remaining opens for full-frame: (a) the
-  escape selector polarity (1 ⇒ level-ext vs run-ext is provisional —
-  both parse identically; only coefficient values differ), (b)
-  whether the chroma CBP bits also carry a prediction, (c) a residual
-  mid-frame drift starting around MB row 8 on div4 whose first
-  symptom is a chroma DC a few steps off. **Docs asks:** trace the
-  ESC-body selector-bit branch at `1c216e5e..1c216e7b` (which
-  selector value routes to the level-extension body at `1c216e7b` vs
-  the run-extension body at `1c216f02`, and what — if anything —
-  reaches the verbatim body at `1c216f5f`); and trace the chroma-CBP
-  bit handling in the I-frame MB header decoder (raw vs predicted).
+- **V3 real-content decode (round 452 frontier)**: spec/17 + spec/18
+  closed the round-420 asks — the escape-body selector routing
+  (selector-1 `1` = level extension; `0`,`0` = the signed verbatim FLC
+  arm), the raw chroma CBP bits, and the inter MB header's
+  intra-only `ac_pred` element are all pinned by the docs and
+  validated on the fixtures. The mid-frame drift is resolved: it was
+  the compound of the mis-shaped escape ladder, missing intra AC
+  coefficient prediction, the DC-gradient CBP predictor, pel-domain DC
+  prediction, and (on MP43) the un-modelled predictor slices.
+  Remaining opens, in Microsoft-fixture priority order:
+  1. **Exact IDCT**: the crate's float IDCT with half-down rounding
+     leaves scattered ±1-pel diffs against the reference decode
+     (~60/400 MBs per busy MP43 frame; they accumulate slowly across a
+     GOP but re-zero at each I-frame). **Docs ask**: transcribe the
+     DLL's non-MMX integer IDCT (`1c20d426..1c20e4be` + constant
+     tables `0x1c2610f0` / `0x1c261138` / `0x1c261360`) so the kernel
+     can be integer-exact.
+  2. **DIV3/DIV4 P-frame drift**: both third-party-encoded AVI
+     fixtures decode structurally (skip-disable header bit `0` → no
+     skip prefixes, alternate MV table, G0 inter) but drift from the
+     first **intra-in-P** macroblock; the reference reconstructs
+     those MBs with DC values our neutral-predictor intra-in-P path
+     does not reach. No Microsoft-produced fixture exercises
+     intra-in-P at all (mp43.wmv codes zero intra MBs in 49
+     P-frames), so the Microsoft-ground-truth rule can't arbitrate.
+     **Docs ask**: trace the v3 intra-in-P DC/AC prediction context —
+     what the DLL uses as the DC predictor when the causal neighbours
+     are inter MBs (neutral 1024, or a value derived from the
+     reconstructed neighbour pels), and whether the CBP/AC prediction
+     state survives inter MBs.
+  3. **`iframe_ext` semantics**: the 5-bit per-I-frame field (23 on
+     both 352x240 fixtures and every spec/17-traced 176x144 frame; 24
+     on the 400x250 MP43 stream) is modelled as `slices = value − 22`
+     with DC/AC prediction restarting per slice — it fits all three
+     fixtures but is an inference from two observed values. **Docs
+     ask**: trace the `1c21224b` consumer.
+  4. **Selector-2 = 1 escape arm**: unobserved in 7472 traced escapes
+     (spec/17 §3); decoded as the run-extension re-VLC per the
+     kernel-layout inference. Any stream that actually exercises it
+     would firm this up.
 - **V3 4-MV-per-MB picture decode (hard docs gap #1895)**: the
   predictor / neighbour-resolver surface is complete and is exercised
   end-to-end on the v1 P-frame INTER4V path (`spec/16` §3.1, the real
