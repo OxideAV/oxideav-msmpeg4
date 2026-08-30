@@ -50,6 +50,26 @@ pub struct MsV3PictureHeader {
     pub picture_type: PictureType,
     /// Frame-wide quantiser, 1..=31.
     pub quant: u8,
+    /// 5-bit **I-frame** header field read right after PQUANT and
+    /// before the per-frame selectors (spec/17 §1 field 3, reader
+    /// site `0x1c211fbe` / `push 5` at `1c211fb7`, consumed by
+    /// `1c21224b`). Present on **every** I-frame, not only the first
+    /// of a sequence: all three pinned Microsoft fixtures carry it on
+    /// each of their I-frames (value 23 on both 352x240 DIV3 streams,
+    /// 24 on the 400x250 MP43 stream; spec/17 traced 23 on every
+    /// 176x144 frame). Semantics are not established — the decoder
+    /// stores the raw value and does not act on it. Zero on P-frames
+    /// (the field is not on the P-frame wire).
+    pub iframe_ext: u8,
+    /// **P-frame** 1-bit field read right after PQUANT, before the
+    /// selectors: the per-MB skip-bit enable (`[esi+0x88]`, read at
+    /// `1c21204e` per spec/99 §2.4; it gates the v3 MB-header
+    /// decoder's 1-bit skip prefix per spec/99 §3.1 step 1). When 0,
+    /// no macroblock of the frame carries a skip bit. Pinned on the
+    /// Microsoft MP43 fixture (round 452): its P-frames only parse
+    /// with this bit in front of the selector cluster. `true` on
+    /// I-frames (not on the wire).
+    pub mb_skip_enable: bool,
     /// DCT AC chroma-VLC class selector (`[esi+0xad0]`): 0 = G2,
     /// 1 = G0, 2 = G4. Read on both I- and P-frames (spec §2.3).
     pub ac_chroma_sel: u8,
@@ -127,21 +147,26 @@ impl MsV3PictureHeader {
             )));
         }
 
-        // Per spec §2.3. I-frame selectors: ad0 (1–2 unary) →
-        // ad4 (1–2 unary) → 0x8bc (1 bit). P-frame selectors:
-        // ad0 (1–2 unary) → 0x8bc (1 bit) → 0x834 (1 bit, MV alt).
+        // Per spec §2.3 / spec/17 §1. I-frame: 5-bit `iframe_ext`
+        // (field 3) → ad0 (1–2 unary) → ad4 (1–2 unary) → 0x8bc
+        // (1 bit). P-frame selectors: ad0 (1–2 unary) → 0x8bc (1 bit)
+        // → 0x834 (1 bit, MV alt).
         let mut ac_luma_sel = 0u8;
         let mut mv_table_sel = 0u8;
+        let mut iframe_ext = 0u8;
+        let mut mb_skip_enable = true;
         let ac_chroma_sel;
         let dc_size_sel;
 
         match picture_type {
             PictureType::I => {
+                iframe_ext = br.read_u32(5)? as u8;
                 ac_chroma_sel = read_unary_cap2(br)?;
                 ac_luma_sel = read_unary_cap2(br)?;
                 dc_size_sel = br.read_u32(1)? as u8;
             }
             PictureType::P => {
+                mb_skip_enable = br.read_bit()?;
                 ac_chroma_sel = read_unary_cap2(br)?;
                 dc_size_sel = br.read_u32(1)? as u8;
                 mv_table_sel = br.read_u32(1)? as u8;
@@ -151,6 +176,8 @@ impl MsV3PictureHeader {
         Ok(Self {
             picture_type,
             quant,
+            iframe_ext,
+            mb_skip_enable,
             ac_chroma_sel,
             ac_luma_sel,
             dc_size_sel,
@@ -160,10 +187,10 @@ impl MsV3PictureHeader {
 
     /// Serialise this picture header — the exact bit-level inverse of
     /// [`MsV3PictureHeader::parse`] (per-frame parser
-    /// `0x1c211f0c..0x1c2120a4`, spec/99 §2.2 / §2.3): 2-bit
-    /// picture_type (0 = I, 1 = P), 5-bit PQUANT, then the per-frame
-    /// selector cluster in frame-type order — I-frames write
-    /// `ac_chroma_sel` (unary-cap2), `ac_luma_sel` (unary-cap2),
+    /// `0x1c211f0c..0x1c2120a4`, spec/99 §2.2 / §2.3, spec/17 §1):
+    /// 2-bit picture_type (0 = I, 1 = P), 5-bit PQUANT, then the
+    /// per-frame selector cluster in frame-type order — I-frames write
+    /// the 5-bit `iframe_ext`, `ac_chroma_sel` (unary-cap2), `ac_luma_sel` (unary-cap2),
     /// `dc_size_sel` (1 bit); P-frames write `ac_chroma_sel`
     /// (unary-cap2), `dc_size_sel` (1 bit), `mv_table_sel` (1 bit).
     /// Fields a frame type does not carry on the wire (`ac_luma_sel`
@@ -181,6 +208,9 @@ impl MsV3PictureHeader {
                 "msmpeg4v3: dc_size_sel / mv_table_sel must be 0 or 1",
             ));
         }
+        if self.iframe_ext > 31 {
+            return Err(Error::invalid("msmpeg4v3: iframe_ext must fit 5 bits"));
+        }
         match self.picture_type {
             PictureType::I => bw.write_u32(0, 2),
             PictureType::P => bw.write_u32(1, 2),
@@ -188,11 +218,13 @@ impl MsV3PictureHeader {
         bw.write_u32(self.quant as u32, 5);
         match self.picture_type {
             PictureType::I => {
+                bw.write_u32(self.iframe_ext as u32, 5);
                 write_unary_cap2(bw, self.ac_chroma_sel)?;
                 write_unary_cap2(bw, self.ac_luma_sel)?;
                 bw.write_u32(self.dc_size_sel as u32, 1);
             }
             PictureType::P => {
+                bw.write_bit(self.mb_skip_enable);
                 write_unary_cap2(bw, self.ac_chroma_sel)?;
                 bw.write_u32(self.dc_size_sel as u32, 1);
                 bw.write_u32(self.mv_table_sel as u32, 1);
@@ -270,9 +302,12 @@ impl MsV3PictureHeader {
 //   v1 I-frame: [37-bit preamble] picture_type(2) PQUANT(5)
 //   v2 frames:  picture_type(2) PQUANT(5)         (no per-frame selectors)
 //
-// (The optional 5-bit "first-of-sequence" extension at I-frames §2.2 is
-// for the per-sequence init payload — not part of the per-frame loop —
-// and is OPEN per spec/99. We do not consume it here.)
+// (The 5-bit I-frame field after PQUANT — `MsV3PictureHeader::iframe_ext`,
+// spec/17 §1 field 3 — is read by the shared header parser for every
+// version per spec/99 §2.4 ("the v1 path reads the same ... optional
+// 5-bit first-I extension"); v1/v2 real-content streams have not been
+// checked for it here, so the v1/v2 parser leaves it unconsumed as
+// before.)
 
 /// MSMPEG4 v1 / v2 picture header.
 ///
@@ -606,11 +641,12 @@ mod tests {
     fn parse_i_frame_header_all_zero_selectors() {
         // picture_type = 0 (I), quant = 7, ad0 sel = 0 (unary bit `0`),
         // ad4 sel = 0 (unary bit `0`), 0x8bc = 0.
-        let bytes = pack(&[(0, 2), (7, 5), (0, 1), (0, 1), (0, 1)]);
+        let bytes = pack(&[(0, 2), (7, 5), (23, 5), (0, 1), (0, 1), (0, 1)]);
         let mut br = BitReader::new(&bytes);
         let h = MsV3PictureHeader::parse(&mut br).unwrap();
         assert_eq!(h.picture_type, PictureType::I);
         assert_eq!(h.quant, 7);
+        assert_eq!(h.iframe_ext, 23);
         assert_eq!(h.ac_chroma_sel, 0);
         assert_eq!(h.ac_luma_sel, 0);
         assert_eq!(h.dc_size_sel, 0);
@@ -622,6 +658,7 @@ mod tests {
         let bytes = pack(&[
             (0, 2),    // picture_type = I
             (5, 5),    // quant = 5
+            (24, 5),   // iframe_ext (spec/17 §1 field 3)
             (0b11, 2), // ad0 = 2
             (0b10, 2), // ad4 = 1
             (1, 1),    // dc_size_sel = 1
@@ -630,6 +667,7 @@ mod tests {
         let h = MsV3PictureHeader::parse(&mut br).unwrap();
         assert_eq!(h.picture_type, PictureType::I);
         assert_eq!(h.quant, 5);
+        assert_eq!(h.iframe_ext, 24);
         assert_eq!(h.ac_chroma_sel, 2);
         assert_eq!(h.ac_luma_sel, 1);
         assert_eq!(h.dc_size_sel, 1);
@@ -642,6 +680,7 @@ mod tests {
         let bytes = pack(&[
             (1, 2),    // P
             (12, 5),   // quant
+            (1, 1),    // mb_skip_enable
             (0b10, 2), // ad0 = 1
             (0, 1),    // dc_size_sel = 0
             (1, 1),    // mv_table_sel = 1
@@ -650,6 +689,7 @@ mod tests {
         let h = MsV3PictureHeader::parse(&mut br).unwrap();
         assert_eq!(h.picture_type, PictureType::P);
         assert_eq!(h.quant, 12);
+        assert!(h.mb_skip_enable);
         assert_eq!(h.ac_chroma_sel, 1);
         assert_eq!(h.dc_size_sel, 0);
         assert_eq!(h.mv_table_sel, 1);
@@ -983,6 +1023,8 @@ mod tests {
     fn header_with_selectors(chroma: u8, luma: u8, mv_sel: u8) -> MsV3PictureHeader {
         MsV3PictureHeader {
             picture_type: PictureType::I,
+            iframe_ext: 0,
+            mb_skip_enable: true,
             quant: 1,
             ac_chroma_sel: chroma,
             ac_luma_sel: luma,
@@ -1082,6 +1124,7 @@ mod tests {
         let bytes = pack(&[
             (1, 2),    // P
             (3, 5),    // quant
+            (1, 1),    // mb_skip_enable
             (0b10, 2), // ac_chroma_sel = 1 → G0
             (1, 1),    // dc_size_sel = 1
             (1, 1),    // mv_table_sel = 1 → Alternate

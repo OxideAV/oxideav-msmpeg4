@@ -113,6 +113,7 @@ fn build_v3_pframe_intra_in_p(ac_pred: u32) -> Vec<u8> {
     let mut fields: Vec<(u32, u32)> = vec![
         (1, 2), // picture_type = P
         (8, 5), // pquant = 8
+        (1, 1), // mb_skip_enable (spec/99 §2.4 `[esi+0x88]`)
         (0, 1), // ac_chroma_sel = 0 (→ G2)
         (0, 1), // dc_size_sel = 0
         (0, 1), // mv_table_sel = 0 (default)
@@ -298,6 +299,7 @@ fn build_v3_pframe_intra_in_p_coded(ac_pred: u32, run: u8, level: u16) -> Vec<u8
     let mut fields: Vec<(u32, u32)> = vec![
         (1, 2), // P
         (8, 5), // pquant = 8
+        (1, 1), // mb_skip_enable
         (0, 1), // ac_chroma_sel = 0 (→ G2)
         (0, 1), // dc_size_sel = 0
         (0, 1), // mv_table_sel = 0
@@ -418,16 +420,13 @@ fn v3_pframe_intra_in_p_coded_block_consults_ac_pred_scan() {
 /// extra `ac_luma_sel` header field (spec/01 §1.4).
 fn build_v3_iframe_dc_only() -> Vec<u8> {
     let mut fields: Vec<(u32, u32)> = vec![
-        (0, 2), // picture_type = I
-        (8, 5), // pquant = 8
-        (0, 1), // ac_chroma_sel = 0 (→ G2)
-        (0, 1), // ac_luma_sel = 0 (→ G3) — I-frame only
-        (0, 1), // dc_size_sel = 0
+        (0, 2),  // picture_type = I
+        (8, 5),  // pquant = 8
+        (23, 5), // iframe_ext (spec/17 §1 field 3 — every I-frame)
+        (0, 1),  // ac_chroma_sel = 0 (→ G2)
+        (0, 1),  // ac_luma_sel = 0 (→ G3) — I-frame only
+        (0, 1),  // dc_size_sel = 0
     ];
-    // Round 420: the registered decoder treats its very first packet
-    // as first-of-sequence, so the I-frame header carries the 5-bit
-    // per-sequence extension (spec/99 §2.2).
-    fields.push((0, 5));
     // One intra MB: no skip bit (I-frame), the 64-entry intra-CBPCY
     // symbol 0 (wire code `1`; CBP=0 after XOR resolution), ac_pred,
     // six DC-only blocks.

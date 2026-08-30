@@ -536,13 +536,10 @@ impl Decoder for MsMpeg4Decoder {
                 let mut br = oxideav_core::bits::BitReader::new(&packet.data);
                 match self.version {
                     MsVersion::V3 => {
-                        // First-of-sequence: the very first frame of
-                        // the stream carries a 5-bit per-sequence
-                        // extension on its I-frame header (spec/99
-                        // §2.2; round 420). `last_picture` is set on
-                        // every successful decode and cleared only by
-                        // flush(), so "no picture yet" == "start of
-                        // sequence".
+                        // The `first_of_sequence` flag is inert since
+                        // round 452 (the 5-bit I-frame field is a
+                        // per-I-frame header element, spec/17 §1);
+                        // it is still threaded for API stability.
                         let first_of_sequence = self.last_picture.is_none();
                         let pic = picture::decode_picture_opts(
                             &mut br,

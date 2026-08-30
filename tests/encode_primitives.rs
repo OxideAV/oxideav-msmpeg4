@@ -32,6 +32,8 @@ fn v3_picture_header_write_parse_round_trips() {
                 // I-frame shape: ac_luma_sel carried, mv_table_sel not.
                 for ac_luma_sel in 0..=2u8 {
                     let hdr = MsV3PictureHeader {
+                        iframe_ext: 0,
+                        mb_skip_enable: true,
                         picture_type: PictureType::I,
                         quant,
                         ac_chroma_sel,
@@ -54,6 +56,8 @@ fn v3_picture_header_write_parse_round_trips() {
                 // P-frame shape: mv_table_sel carried, ac_luma_sel not.
                 for mv_table_sel in 0..=1u8 {
                     let hdr = MsV3PictureHeader {
+                        iframe_ext: 0,
+                        mb_skip_enable: true,
                         picture_type: PictureType::P,
                         quant,
                         ac_chroma_sel,
@@ -80,6 +84,8 @@ fn v3_picture_header_write_parse_round_trips() {
 #[test]
 fn v3_picture_header_write_rejects_invalid_fields() {
     let mut hdr = MsV3PictureHeader {
+        iframe_ext: 0,
+        mb_skip_enable: true,
         picture_type: PictureType::I,
         quant: 0,
         ac_chroma_sel: 0,

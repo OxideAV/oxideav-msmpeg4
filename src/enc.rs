@@ -59,6 +59,13 @@ use crate::mv_pred::{
 use crate::picture::{MsV1V2Version, Picture, PictureDims};
 use crate::tables_data::MCBPCY_V3_PARTITION;
 
+/// Value this encoder writes into the 5-bit I-frame header field
+/// (`MsV3PictureHeader::iframe_ext`, spec/17 §1 field 3). 23 is the
+/// value every Microsoft-produced 352x240 fixture and every spec/17
+/// traced frame carries; its semantics are not established, so the
+/// encoder emits the observed constant.
+pub const IFRAME_EXT_DEFAULT: u8 = 23;
+
 /// Per-frame encoder settings.
 #[derive(Clone, Copy, Debug)]
 pub struct EncoderConfig {
@@ -89,7 +96,9 @@ const DC_SIZE_SEL: u8 = 0;
 /// One quantised 8×8 block of an intra MB, ready for serialisation.
 struct IntraBlockPlan {
     dc_diff: i32,
-    /// Bitstream AC levels in natural order (position 0 unused).
+    /// Reconstructed AC levels in natural order (position 0 unused).
+    /// With AC prediction on, the *transmitted* levels are these minus
+    /// the predicted first row / column ([`IntraBlockPlan::ac_pred_src`]).
     levels: [i32; 64],
     coded: bool,
     /// The scan this block walks when the MB's `ac_pred` flag is set:
@@ -97,6 +106,48 @@ struct IntraBlockPlan {
     /// decoder derives it (spec/03 §1.1–§1.3), so encoder and decoder
     /// always agree on the per-block scan.
     alt_scan: Scan,
+    /// The seven predicted AC levels for this block (index 0 unused):
+    /// the causal neighbour's first row (top predictor) or column
+    /// (left predictor), mirroring the decoder's
+    /// [`crate::dc_pred::DcCache::ac_predict_luma`]. Subtracted from
+    /// the block's first row / column when the MB transmits with
+    /// `ac_pred = 1` (MPEG-4 §7.4.3.3; round 452).
+    ac_pred_src: [i32; 8],
+}
+
+/// The positions the AC prediction touches for a block whose alternate
+/// scan is `alt_scan`: the first row (top predictor → alt-horizontal)
+/// or the first column (left predictor → alt-vertical).
+fn ac_pred_positions(alt_scan: Scan) -> [usize; 7] {
+    if alt_scan == Scan::AlternateHorizontal {
+        [1, 2, 3, 4, 5, 6, 7]
+    } else {
+        [8, 16, 24, 32, 40, 48, 56]
+    }
+}
+
+/// The levels actually transmitted for `plan` under the given MB
+/// `ac_pred` polarity (with `apply_prediction` — the v3 path; v1/v2
+/// transmit reconstruction-domain levels either way), plus the
+/// resulting coded flag.
+fn transmitted_levels(
+    plan: &IntraBlockPlan,
+    ac_pred: bool,
+    apply_prediction: bool,
+) -> ([i32; 64], bool) {
+    let mut lv = plan.levels;
+    if ac_pred && apply_prediction {
+        for (k, &pos) in ac_pred_positions(plan.alt_scan).iter().enumerate() {
+            lv[pos] -= plan.ac_pred_src[k + 1];
+        }
+    }
+    let coded = lv.iter().skip(1).any(|&v| v != 0) || lv[0] != 0;
+    (lv, coded)
+}
+
+/// Per-block coded flags of one MB under an `ac_pred` polarity.
+fn coded_flags(plans: &[IntraBlockPlan; 6], ac_pred: bool, apply_prediction: bool) -> [bool; 6] {
+    std::array::from_fn(|i| transmitted_levels(&plans[i], ac_pred, apply_prediction).1)
 }
 
 /// Encode one picture as a v3 **I-frame**. `input` must carry
@@ -120,12 +171,11 @@ pub fn encode_iframe_v3(
     encode_iframe_v3_opts(input, dims, config, false)
 }
 
-/// Variant of [`encode_iframe_v3`] with the **first-of-sequence** flag
-/// exposed: when set, the frame carries the 5-bit per-sequence
-/// extension after the selector bits (spec/99 §2.2; payload semantics
-/// OPEN — zeros are written). The registered [`crate::encoder`] GOP
-/// machine sets this on the very first frame of an encode, matching
-/// [`crate::picture::decode_picture_opts`].
+/// Variant of [`encode_iframe_v3`] with a `first_of_sequence` flag.
+/// The flag is **inert** since round 452: the 5-bit field it used to
+/// gate is the per-I-frame header element `iframe_ext` (spec/17 §1
+/// field 3), written on every I-frame by `MsV3PictureHeader::write`
+/// with [`IFRAME_EXT_DEFAULT`]. Kept so existing callers compile.
 pub fn encode_iframe_v3_opts(
     input: &Picture,
     dims: PictureDims,
@@ -143,24 +193,25 @@ pub fn encode_iframe_v3_opts(
             mbs.push(analyse_intra_mb(input, &mut dc_cache, mx, my, quant));
         }
     }
-    // The intra-CBPCY symbols depend only on the coded flags + DC
-    // gradient directions (selector-independent), so compute them once
-    // for all 18 RD variants.
-    let syms = compute_intra_cbpcy_syms(&mbs, mb_w);
-
     let mut best: Option<Vec<u8>> = None;
     for luma_sel in 0..3u8 {
         for chroma_sel in 0..3u8 {
             for dc_size_sel in 0..2u8 {
                 let bytes = assemble_iframe_v3(
                     &mbs,
-                    &syms,
+                    mb_w,
                     config.quant,
                     luma_sel,
                     chroma_sel,
                     dc_size_sel,
                     first_of_sequence,
                 )?;
+                if std::env::var_os("OXIDEAV_MSMPEG4_ENC_TRACE").is_some() {
+                    eprintln!(
+                        "[enc combo] luma={luma_sel} chroma={chroma_sel} dc={dc_size_sel} len={}",
+                        bytes.len()
+                    );
+                }
                 if best.as_ref().map_or(true, |b| bytes.len() < b.len()) {
                     best = Some(bytes);
                 }
@@ -168,43 +219,6 @@ pub fn encode_iframe_v3_opts(
         }
     }
     Ok(best.expect("at least one selector combination was assembled"))
-}
-
-/// Compute the per-MB v3 I-frame intra-CBPCY symbols: the bit-level
-/// inverse of the decoder's XOR resolution (see
-/// `picture::decode_intra_mb_iframe_v3`). For each luma block the
-/// predicted bit is the actual coded bit of the DC-gradient-direction
-/// neighbour; the transmitted bit is `actual ^ predicted`. Chroma bits
-/// are raw. The per-block direction is recovered from the plan's
-/// `alt_scan` (bijective with the gradient direction).
-fn compute_intra_cbpcy_syms(mbs: &[AnalysedMb], mb_w: usize) -> Vec<u8> {
-    let mb_h = mbs.len() / mb_w;
-    let gw = mb_w * 2;
-    let mut luma_cbp = vec![false; gw * mb_h * 2];
-    let mut syms = Vec::with_capacity(mbs.len());
-    for (i, (plans, _cbpy, cbp_cb, cbp_cr)) in mbs.iter().enumerate() {
-        let mx = i % mb_w;
-        let my = i / mb_w;
-        let mut sym = 0u8;
-        for (blk, plan) in plans.iter().take(4).enumerate() {
-            let bx = mx * 2 + (blk & 1);
-            let by = my * 2 + (blk >> 1);
-            // FromLeft ⇒ alt-vertical scan; FromTop ⇒ alt-horizontal
-            // (dc_pred::PredDir::ac_scan).
-            let from_left = plan.alt_scan == Scan::AlternateVertical;
-            let predicted = if from_left {
-                bx > 0 && luma_cbp[by * gw + (bx - 1)]
-            } else {
-                by > 0 && luma_cbp[(by - 1) * gw + bx]
-            };
-            luma_cbp[by * gw + bx] = plan.coded;
-            sym |= ((plan.coded ^ predicted) as u8) << (5 - blk);
-        }
-        sym |= (*cbp_cb as u8) << 1;
-        sym |= *cbp_cr as u8;
-        syms.push(sym);
-    }
-    syms
 }
 
 /// Transform + quantise all 6 blocks of one intra MB, threading the DC
@@ -225,6 +239,7 @@ fn analyse_intra_mb(
         levels: [0i32; 64],
         coded: false,
         alt_scan: Scan::Zigzag,
+        ac_pred_src: [0i32; 8],
     });
     for (block_idx, plan) in plans.iter_mut().enumerate() {
         let pels = extract_block(input, mb_x, mb_y, block_idx);
@@ -239,10 +254,14 @@ fn analyse_intra_mb(
             _ => unreachable!(),
         };
 
+        // DC prediction happens in the quantised domain (the decoder's
+        // `reconstruct_intra_dc` / `predicted_dc_level`), so quantise
+        // the target DC first and difference the levels.
         let scaler = dc_scaler(block_idx, quant) as i32;
-        let dc_diff =
-            (((f[0] - pred.predictor as f32) / scaler as f32).round() as i32).clamp(-255, 255);
-        let dc_recon = pred.predictor + dc_diff * scaler;
+        let dc_level = (f[0] / scaler as f32).round() as i32;
+        let pred_level = crate::mb::predicted_dc_level(pred.predictor, scaler);
+        let dc_diff = (dc_level - pred_level).clamp(-255, 255);
+        let dc_recon = crate::mb::reconstruct_intra_dc(dc_diff, pred.predictor, block_idx, quant);
         match block_idx {
             0..=3 => dc_cache.luma_set(bx, by, dc_recon),
             4 => dc_cache.chroma_set(false, bx, by, dc_recon),
@@ -254,6 +273,24 @@ fn analyse_intra_mb(
         plan.alt_scan = pred.direction.ac_scan();
         let nz = quantise_block_h263(&f, quant, 1, &mut plan.levels);
         plan.coded = nz > 0;
+        // AC-prediction bookkeeping, mirroring the decoder: this
+        // block's reconstructed levels are the next blocks' prediction
+        // source; its own prediction comes from the gradient-direction
+        // neighbour.
+        let src = match block_idx {
+            0..=3 => dc_cache.ac_predict_luma(bx, by, pred.direction),
+            4 => dc_cache.ac_predict_chroma(false, bx, by, pred.direction),
+            5 => dc_cache.ac_predict_chroma(true, bx, by, pred.direction),
+            _ => unreachable!(),
+        };
+        plan.ac_pred_src = src;
+        let edges = crate::dc_pred::AcEdges::from_levels(&plan.levels);
+        match block_idx {
+            0..=3 => dc_cache.luma_ac_set(bx, by, edges),
+            4 => dc_cache.chroma_ac_set(false, bx, by, edges),
+            5 => dc_cache.chroma_ac_set(true, bx, by, edges),
+            _ => unreachable!(),
+        }
     }
     let cbpy = (plans[0].coded as u8) << 3
         | (plans[1].coded as u8) << 2
@@ -277,15 +314,45 @@ fn write_intra_blocks(
     chroma_ac: &AcVlcTable,
     ac_pred: bool,
 ) -> Result<()> {
+    write_intra_blocks_opts(bw, plans, dc_scheme, luma_ac, chroma_ac, ac_pred, false)
+}
+
+/// [`write_intra_blocks`] with the v3 coefficient-prediction switch:
+/// when `apply_prediction` is set and `ac_pred` is on, each block
+/// transmits its levels minus the predicted first row / column (the
+/// decoder adds them back), and a block whose difference vanishes is
+/// not coded at all. The caller's CBP bits must come from
+/// [`coded_flags`] with the same arguments.
+#[allow(clippy::too_many_arguments)]
+fn write_intra_blocks_opts(
+    bw: &mut BitWriter,
+    plans: &[IntraBlockPlan; 6],
+    dc_scheme: DcScheme,
+    luma_ac: &AcVlcTable,
+    chroma_ac: &AcVlcTable,
+    ac_pred: bool,
+    apply_prediction: bool,
+) -> Result<()> {
     for (block_idx, plan) in plans.iter().enumerate() {
         match dc_scheme {
             DcScheme::V3(sel) => encode_intra_dc_diff_v3(bw, block_idx, sel, plan.dc_diff)?,
             DcScheme::V1V2 => encode_intra_dc_diff_v1v2(bw, block_idx, plan.dc_diff)?,
         }
-        if plan.coded {
+        let (levels, coded) = transmitted_levels(plan, ac_pred, apply_prediction);
+        if std::env::var_os("OXIDEAV_MSMPEG4_ENC_TRACE").is_some() {
+            let nz: Vec<(usize, i32)> = levels
+                .iter()
+                .enumerate()
+                .skip(1)
+                .filter(|(_, &v)| v != 0)
+                .map(|(i, &v)| (i, v))
+                .collect();
+            eprintln!("[enc blk] blk={block_idx} coded={coded} ac_pred={ac_pred} dc_diff={} bit={} nz={nz:?}", plan.dc_diff, bw.bit_position());
+        }
+        if coded {
             let table = if block_idx <= 3 { luma_ac } else { chroma_ac };
             let scan = if ac_pred { plan.alt_scan } else { Scan::Zigzag };
-            encode_intra_ac(bw, &plan.levels, scan, table, 1)?;
+            encode_intra_ac(bw, &levels, scan, table, 1)?;
         }
     }
     Ok(())
@@ -301,9 +368,18 @@ fn intra_blocks_bits(
     luma_ac: &AcVlcTable,
     chroma_ac: &AcVlcTable,
     ac_pred: bool,
+    apply_prediction: bool,
 ) -> Result<u64> {
     let mut bw = BitWriter::new();
-    write_intra_blocks(&mut bw, plans, dc_scheme, luma_ac, chroma_ac, ac_pred)?;
+    write_intra_blocks_opts(
+        &mut bw,
+        plans,
+        dc_scheme,
+        luma_ac,
+        chroma_ac,
+        ac_pred,
+        apply_prediction,
+    )?;
     Ok(bw.bit_position())
 }
 
@@ -318,11 +394,40 @@ fn choose_ac_pred(
     luma_ac: &AcVlcTable,
     chroma_ac: &AcVlcTable,
 ) -> Result<bool> {
-    if !plans.iter().any(|p| p.coded) {
+    choose_ac_pred_opts(plans, dc_scheme, luma_ac, chroma_ac, false)
+}
+
+/// [`choose_ac_pred`] with the v3 coefficient-prediction switch.
+fn choose_ac_pred_opts(
+    plans: &[IntraBlockPlan; 6],
+    dc_scheme: DcScheme,
+    luma_ac: &AcVlcTable,
+    chroma_ac: &AcVlcTable,
+    apply_prediction: bool,
+) -> Result<bool> {
+    if !plans.iter().any(|p| p.coded) && !apply_prediction {
         return Ok(false);
     }
-    let zig = intra_blocks_bits(plans, dc_scheme, luma_ac, chroma_ac, false)?;
-    let alt = intra_blocks_bits(plans, dc_scheme, luma_ac, chroma_ac, true)?;
+    let zig = intra_blocks_bits(
+        plans,
+        dc_scheme,
+        luma_ac,
+        chroma_ac,
+        false,
+        apply_prediction,
+    )?;
+    // The predicted-difference levels can exceed the verbatim escape
+    // tier's 8-bit range; such an MB simply transmits without AC
+    // prediction (the ac_pred=0 arm always encodes: its levels come
+    // straight from the quantiser's ±127 clamp).
+    let alt = match intra_blocks_bits(plans, dc_scheme, luma_ac, chroma_ac, true, apply_prediction)
+    {
+        Ok(bits) => bits,
+        Err(_) => return Ok(false),
+    };
+    if std::env::var_os("OXIDEAV_MSMPEG4_ENC_TRACE").is_some() {
+        eprintln!("[enc rd] zig={zig} alt={alt} apply={apply_prediction}");
+    }
     Ok(alt < zig)
 }
 
@@ -352,7 +457,10 @@ fn v3_chroma_table_for_sel(sel: u8) -> AcVlcTable {
     match sel {
         0 => AcVlcTable::v3_intra_g2(),
         1 => AcVlcTable::v3_intra_g0(),
-        _ => AcVlcTable::g4_inter(),
+        // The intra chroma path runs the intra kernel's escape
+        // ladder, so G4 must carry LMAX/RMAX here (round 452; the
+        // 1-tier `g4_inter` shape is the v1-only inter kernel's).
+        _ => AcVlcTable::v3_intra_g4(),
     }
 }
 
@@ -364,7 +472,7 @@ type AnalysedMb = ([IntraBlockPlan; 6], u8, bool, bool);
 /// the per-MB ac_pred RD run against those tables.
 fn assemble_iframe_v3(
     mbs: &[AnalysedMb],
-    syms: &[u8],
+    mb_w: usize,
     quant: u8,
     luma_sel: u8,
     chroma_sel: u8,
@@ -372,33 +480,59 @@ fn assemble_iframe_v3(
     first_of_sequence: bool,
 ) -> Result<Vec<u8>> {
     let mut bw = BitWriter::new();
+    // `first_of_sequence` is retained for API stability: the 5-bit
+    // I-frame field is a per-I-frame header element (spec/17 §1 field
+    // 3, `MsV3PictureHeader::iframe_ext`), written by `hdr.write` on
+    // every I-frame with the value the Microsoft fixtures carry.
+    let _ = first_of_sequence;
     let hdr = MsV3PictureHeader {
         picture_type: PictureType::I,
         quant,
+        iframe_ext: IFRAME_EXT_DEFAULT,
+        mb_skip_enable: true,
         ac_chroma_sel: chroma_sel,
         ac_luma_sel: luma_sel,
         dc_size_sel,
         mv_table_sel: 0,
     };
     hdr.write(&mut bw)?;
-    if first_of_sequence {
-        // 5-bit per-sequence extension (spec/99 §2.2). Payload
-        // semantics OPEN — write zeros; the decoder skips it.
-        bw.write_u32(0, 5);
-    }
     let luma_ac = v3_luma_table_for_sel(luma_sel);
     let chroma_ac = v3_chroma_table_for_sel(chroma_sel);
     let scheme = DcScheme::V3(dc_size_sel);
-    for ((plans, _cbpy, _cbp_cb, _cbp_cr), &sym) in mbs.iter().zip(syms) {
-        // Round 420 I-frame MB header: the 64-entry intra-CBPCY symbol
-        // (luma bits XOR-predicted, computed once in
-        // `compute_intra_cbpcy_syms`) followed by the ac_pred bit. The
-        // 128-entry joint MCBPCY table is the **P-frame** MB header
-        // and is no longer used on I-frames.
+    // The coded flags depend on the per-MB ac_pred decision (a block
+    // whose levels equal its AC prediction is not coded), so the
+    // intra-CBPCY symbols are composed inline: XOR the luma coded bits
+    // with the [`crate::picture::predict_cbp_bit`] spatial prediction
+    // over the running actual-coded-bit grid; chroma raw (spec/17 §2).
+    let mut luma_cbp = vec![false; (mb_w * 2) * (mbs.len() / mb_w) * 2];
+    let gw = mb_w * 2;
+    for (i, (plans, _cbpy, _cbp_cb, _cbp_cr)) in mbs.iter().enumerate() {
+        let mx = i % mb_w;
+        let my = i / mb_w;
+        let ac_pred = choose_ac_pred_opts(plans, scheme, &luma_ac, &chroma_ac, true)?;
+        let flags = coded_flags(plans, ac_pred, true);
+        let mut sym = 0u8;
+        for (blk, &flag) in flags.iter().take(4).enumerate() {
+            let bx = mx * 2 + (blk & 1);
+            let by = my * 2 + (blk >> 1);
+            let l = bx > 0 && luma_cbp[by * gw + (bx - 1)];
+            let t = by > 0 && luma_cbp[(by - 1) * gw + bx];
+            let tl = bx > 0 && by > 0 && luma_cbp[(by - 1) * gw + (bx - 1)];
+            let predicted = crate::picture::predict_cbp_bit(l, t, tl);
+            luma_cbp[by * gw + bx] = flag;
+            sym |= ((flag ^ predicted) as u8) << (5 - blk);
+        }
+        sym |= (flags[4] as u8) << 1;
+        sym |= flags[5] as u8;
+        if std::env::var_os("OXIDEAV_MSMPEG4_ENC_TRACE").is_some() {
+            eprintln!(
+                "[enc mb] mb=({mx},{my}) sym={sym:06b} ac_pred={ac_pred} bit={}",
+                bw.bit_position()
+            );
+        }
         encode_intra_cbpcy_sym(&mut bw, sym)?;
-        let ac_pred = choose_ac_pred(plans, scheme, &luma_ac, &chroma_ac)?;
         bw.write_bit(ac_pred);
-        write_intra_blocks(&mut bw, plans, scheme, &luma_ac, &chroma_ac, ac_pred)?;
+        write_intra_blocks_opts(&mut bw, plans, scheme, &luma_ac, &chroma_ac, ac_pred, true)?;
     }
     Ok(bw.finish())
 }
@@ -420,8 +554,9 @@ fn assemble_iframe_v3(
 /// quantises the 6-block MC residual, and emits either the 1-bit skip
 /// (MV (0,0), no coded block — the decoder's copy-from-reference
 /// branch) or the coded-MB syntax: joint MCBPCY (P-type half,
-/// `idx = 64 + cbp`), the always-consumed ac_pred bit, the joint-MV
-/// VLC, and a G4 inter AC walk per coded block (spec/04 §1.3).
+/// `idx = 64 + cbp`; the inter arm carries no ac_pred bit, spec/18
+/// §3), the joint-MV VLC, and the selector-bound inter AC walk per
+/// coded block (spec/99 §4.2).
 pub fn encode_pframe_v3(
     input: &Picture,
     reference: &Picture,
@@ -481,6 +616,8 @@ pub fn encode_pframe_v3_with_stats(
     let mut bw = BitWriter::new();
     let hdr = MsV3PictureHeader {
         picture_type: PictureType::P,
+        iframe_ext: 0,
+        mb_skip_enable: true,
         quant: config.quant,
         ac_chroma_sel: AC_CHROMA_SEL,
         ac_luma_sel: 0, // not carried on the P-frame wire (spec/99 §2.3)
@@ -489,14 +626,21 @@ pub fn encode_pframe_v3_with_stats(
     };
     hdr.write(&mut bw)?;
 
-    let inter_ac = AcVlcTable::g4_inter();
+    // Inter blocks use the "chroma + all-inter" descriptor bound by
+    // `ac_chroma_sel` with the single fixed-length escape (spec/99
+    // §4.2); intra-in-P chroma blocks use the same primary through the
+    // intra kernel's escape ladder (spec/17 §3).
+    let inter_ac = AcVlcTable::inter_for_chroma_sel(AC_CHROMA_SEL);
     // Intra-in-P AC tables: `ac_luma_sel` is NOT carried on the v3
     // P-frame wire, so the decoder's dispatch sees the parser's zero
     // → G3 luma (spec/14 §3.1); chroma follows the transmitted
     // `ac_chroma_sel = 2` → G4. The encoder must serialise intra-in-P
     // blocks through the same pair.
-    let intra_luma_ac = AcVlcTable::v3_intra_g3();
-    let intra_chroma_ac = AcVlcTable::g4_inter();
+    // `ac_luma_sel` persists from the most recent I-frame (spec/99
+    // §2.3): use whatever selector the reference picture carries (the
+    // I-frame RD's winner travels on the decoder-side reconstruction).
+    let intra_luma_ac = v3_luma_table_for_sel(reference.ac_luma_sel);
+    let intra_chroma_ac = AcVlcTable::v3_intra_g4();
     let mut mv_grid = MvGrid::new(mb_w, mb_h);
     // DC-prediction cache for intra-in-P MBs, mirroring the decoder's
     // per-P-frame cache: only intra MBs write cells; everything else
@@ -811,24 +955,31 @@ fn encode_pframe_mb_v3(
     // chain sees the same neighbourhood on both sides.
     let inter_sad = mb_sad(input, reference, mb_x, mb_y, (mv.x as i32, mv.y as i32));
     if mb_intra_activity(input, mb_x, mb_y) + INTRA_IN_P_MARGIN < inter_sad {
-        let (plans, cbpy, cbp_cb, cbp_cr) = analyse_intra_mb(input, dc_cache, mb_x, mb_y, quant);
-        let cbp = compose_cbp(cbpy, cbp_cb, cbp_cr);
-        bw.write_bit(false); // not skipped
-        encode_mcbpcy(bw, cbp)?;
-        let ac_pred = choose_ac_pred(
+        let (plans, _cbpy, _cbp_cb, _cbp_cr) = analyse_intra_mb(input, dc_cache, mb_x, mb_y, quant);
+        let ac_pred = choose_ac_pred_opts(
             &plans,
             DcScheme::V3(DC_SIZE_SEL),
             intra_luma_ac,
             intra_chroma_ac,
+            true,
         )?;
+        let flags = coded_flags(&plans, ac_pred, true);
+        let cbpy = (flags[0] as u8) << 3
+            | (flags[1] as u8) << 2
+            | (flags[2] as u8) << 1
+            | (flags[3] as u8);
+        let cbp = compose_cbp(cbpy, flags[4], flags[5]);
+        bw.write_bit(false); // not skipped
+        encode_mcbpcy(bw, cbp)?;
         bw.write_bit(ac_pred);
-        write_intra_blocks(
+        write_intra_blocks_opts(
             bw,
             &plans,
             DcScheme::V3(DC_SIZE_SEL),
             intra_luma_ac,
             intra_chroma_ac,
             ac_pred,
+            true,
         )?;
         return Ok(MbKind::Intra);
     }
@@ -850,9 +1001,7 @@ fn encode_pframe_mb_v3(
     let cbp = compose_cbp(cbpy, coded[4], coded[5]);
     // P-type (inter) half of the joint alphabet: idx = 64 + cbp.
     encode_mcbpcy(bw, MCBPCY_V3_PARTITION as u8 + cbp)?;
-    // The decoder consumes the post-VLC ac_pred bit on every coded MB
-    // (meaningful only for intra-in-P).
-    bw.write_bit(false);
+    // spec/18 §3: the inter (bit-6-set) arm carries no ac_pred bit.
     encode_mv_with_table(bw, predictor, MvTable::Default, mv)?;
     mv_grid.set_cell(mb_x, mb_y, MvGridCell::OneMv(mv));
 
@@ -1717,6 +1866,7 @@ mod tests {
             levels: [0i32; 64],
             coded: false,
             alt_scan: Scan::AlternateHorizontal,
+            ac_pred_src: [0i32; 8],
         });
         for (i, lv) in [(1usize, 6i32), (2, 4), (3, 3), (4, 2), (5, 1)] {
             plans[0].levels[i] = lv;
@@ -1724,10 +1874,24 @@ mod tests {
         plans[0].coded = true;
         let luma = AcVlcTable::v3_intra_g5();
         let chroma = AcVlcTable::g4_inter();
-        let zig =
-            intra_blocks_bits(&plans, DcScheme::V3(DC_SIZE_SEL), &luma, &chroma, false).unwrap();
-        let alt =
-            intra_blocks_bits(&plans, DcScheme::V3(DC_SIZE_SEL), &luma, &chroma, true).unwrap();
+        let zig = intra_blocks_bits(
+            &plans,
+            DcScheme::V3(DC_SIZE_SEL),
+            &luma,
+            &chroma,
+            false,
+            false,
+        )
+        .unwrap();
+        let alt = intra_blocks_bits(
+            &plans,
+            DcScheme::V3(DC_SIZE_SEL),
+            &luma,
+            &chroma,
+            true,
+            false,
+        )
+        .unwrap();
         assert!(alt < zig, "alt scan should be cheaper: alt={alt} zig={zig}");
         assert!(choose_ac_pred(&plans, DcScheme::V3(DC_SIZE_SEL), &luma, &chroma).unwrap());
         // And an uncoded MB never pays for the probe.
@@ -1736,6 +1900,7 @@ mod tests {
             levels: [0i32; 64],
             coded: false,
             alt_scan: Scan::AlternateVertical,
+            ac_pred_src: [0i32; 8],
         });
         assert!(!choose_ac_pred(&empty, DcScheme::V3(DC_SIZE_SEL), &luma, &chroma).unwrap());
     }
@@ -1765,12 +1930,24 @@ mod tests {
         fill_row_bands_with_x_texture(&mut input);
         let quant = 4u32;
 
-        // (The RD firing itself is pinned by
-        // `ac_pred_rd_prefers_alt_scan_for_front_row_energy`; the
-        // spec/17 §3 escape-ladder correction changed the verbatim
-        // arm's cost, so whether THIS content fires is no longer a
-        // stable premise — the round-trips below are the conformance
-        // surface.)
+        // The RD must actually fire on this content (replay the v3
+        // analysis with coefficient prediction, as `assemble_iframe_v3`
+        // runs it — round 452 made ac_pred a coefficient predictor, not
+        // just a scan switch, so the rate balance moved).
+        let luma = v3_luma_table_for_sel(0);
+        let chroma = v3_chroma_table_for_sel(0);
+        let (mb_w, mb_h) = dims.mb_dims();
+        let mut dc_cache = DcCache::new(mb_w, mb_h);
+        let mut fired = 0usize;
+        for my in 0..mb_h {
+            for mx in 0..mb_w {
+                let (plans, _, _, _) = analyse_intra_mb(&input, &mut dc_cache, mx, my, quant);
+                if choose_ac_pred_opts(&plans, DcScheme::V3(0), &luma, &chroma, true).unwrap() {
+                    fired += 1;
+                }
+            }
+        }
+        assert!(fired > 0, "content should trigger ac_pred on some MB");
 
         let config = EncoderConfig {
             quant: quant as u8,
@@ -1841,8 +2018,7 @@ mod tests {
                     ));
                 }
             }
-            let syms = compute_intra_cbpcy_syms(&mbs, mb_w);
-            let forced = assemble_iframe_v3(&mbs, &syms, quant, 2, 2, 0, false).unwrap();
+            let forced = assemble_iframe_v3(&mbs, mb_w, quant, 2, 2, 0, false).unwrap();
             assert!(
                 rd.len() <= forced.len(),
                 "selector RD lost to the fixed default: {} > {} (q={quant})",

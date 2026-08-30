@@ -73,7 +73,7 @@ use crate::ac::{AcVlcTable, Scan};
 use crate::dc_pred::{DcCache, DcPrediction};
 use crate::header::{MsV1V2PictureHeader, MsV3PictureHeader, PictureType};
 use crate::idct::idct8x8_to_pel;
-use crate::mb::{decode_intra_block_full_v3, IntraMbHeader};
+use crate::mb::IntraMbHeader;
 
 /// Dimensions of a picture, derived from the container's
 /// [`oxideav_core::CodecParameters`]. MS-MPEG4v3 does not carry
@@ -118,6 +118,15 @@ pub struct Picture {
     pub y_stride: usize,
     pub c_stride: usize,
     pub picture_type: PictureType,
+    /// The intra-luma AC table selector (`[esi+0xad4]`) in force when
+    /// this picture was decoded. It is transmitted on I-frames only and
+    /// persists into the following P-frames (spec/99 §2.3), so a
+    /// P-frame decode reads it from its reference picture.
+    pub ac_luma_sel: u8,
+    /// The 5-bit I-frame header field (`MsV3PictureHeader::iframe_ext`)
+    /// in force, carried forward through P-frames like `ac_luma_sel`
+    /// (it sizes the predictor slices, see [`slice_rows_for`]).
+    pub iframe_ext: u8,
 }
 
 impl Picture {
@@ -135,6 +144,8 @@ impl Picture {
             y_stride,
             c_stride,
             picture_type,
+            ac_luma_sel: 0,
+            iframe_ext: 0,
         }
     }
 }
@@ -214,16 +225,12 @@ pub fn decode_picture_with_ac(
     decode_picture_opts(br, dims, reference, ac_selection, false)
 }
 
-/// Variant of [`decode_picture_with_ac`] with the **first-of-sequence**
-/// flag exposed. Per spec/99 §2.2, the very first I-frame of a
-/// sequence carries a 5-bit per-sequence extension right after the
-/// per-frame selector bits (consumed by `1c21224b`; exact payload
-/// layout is still OPEN — candidate dimensions / aspect / frame-rate
-/// hints). Both pinned real Microsoft DIV3 fixtures carry it on frame
-/// 0, and their first I-frame only parses coherently when these 5
-/// bits are skipped (round 420). Streams produced by this crate's own
-/// registered encoder mirror the same convention (5 zero bits on the
-/// first frame of the encode).
+/// Variant of [`decode_picture_with_ac`] with a `first_of_sequence`
+/// flag. The flag is **inert** since round 452: the 5-bit field it
+/// used to skip is the per-I-frame header element `iframe_ext`
+/// (spec/17 §1 field 3, read after PQUANT and before the selectors by
+/// [`MsV3PictureHeader::parse`] on every I-frame). It is kept so
+/// existing callers keep compiling.
 pub fn decode_picture_opts(
     br: &mut BitReader<'_>,
     dims: PictureDims,
@@ -232,11 +239,12 @@ pub fn decode_picture_opts(
     first_of_sequence: bool,
 ) -> Result<Picture> {
     let hdr = MsV3PictureHeader::parse(br)?;
-    if first_of_sequence && hdr.picture_type == PictureType::I {
-        // 5-bit first-of-sequence extension (spec/99 §2.2); payload
-        // semantics OPEN — skipped.
-        let _seq_ext = br.read_u32(5)?;
-    }
+    // `first_of_sequence` is retained for API stability only: the 5-bit
+    // field it used to skip is a per-I-frame header element read by
+    // `MsV3PictureHeader::parse` on every I-frame (spec/17 §1 field 3,
+    // `hdr.iframe_ext`) — every I-frame of all three pinned Microsoft
+    // fixtures carries it, not just the first.
+    let _ = first_of_sequence;
     // Diagnostic trace gated on `OXIDEAV_MSMPEG4_AC_TRACE`. Shows the
     // picture-header field values (so the implementer can tell when a
     // fixture is using the alternate intra-DC VLC `dc_size_sel=1` for
@@ -244,13 +252,19 @@ pub fn decode_picture_opts(
     // bit-exactly — see task #113 and `crate::mb::decode_intra_dc_diff`).
     if std::env::var_os("OXIDEAV_MSMPEG4_AC_TRACE").is_some() {
         eprintln!(
-            "[hdr trace] type={:?} q={} ac_chroma_sel={} ac_luma_sel={} dc_size_sel={} mv_table_sel={} bit_pos={}",
-            hdr.picture_type, hdr.quant, hdr.ac_chroma_sel, hdr.ac_luma_sel,
+            "[hdr trace] type={:?} q={} iframe_ext={} ac_chroma_sel={} ac_luma_sel={} dc_size_sel={} mv_table_sel={} bit_pos={}",
+            hdr.picture_type, hdr.quant, hdr.iframe_ext, hdr.ac_chroma_sel, hdr.ac_luma_sel,
             hdr.dc_size_sel, hdr.mv_table_sel, br.bit_position(),
         );
     }
+    let mut pic = Picture::alloc(dims, hdr.picture_type);
+    let mut mbs = 0usize;
     match hdr.picture_type {
-        PictureType::I => decode_iframe(br, dims, &hdr, ac_selection),
+        PictureType::I => {
+            pic.ac_luma_sel = hdr.ac_luma_sel;
+            pic.iframe_ext = hdr.iframe_ext;
+            decode_iframe(br, dims, &hdr, ac_selection, &mut pic, &mut mbs)?
+        }
         PictureType::P => {
             let reference = reference.ok_or_else(|| {
                 Error::invalid(
@@ -268,9 +282,64 @@ pub fn decode_picture_opts(
             // the picture decoder selects the alternate table + byte LUT
             // when the header bit is set (pinned by
             // `pframe_alternate_mv_table_selects_alternate_byte_lut`).
-            decode_pframe(br, dims, &hdr, reference, ac_selection)
+            pic.ac_luma_sel = reference.ac_luma_sel;
+            pic.iframe_ext = reference.iframe_ext;
+            decode_pframe(br, dims, &hdr, reference, ac_selection, &mut pic, &mut mbs)?
         }
     }
+    Ok(pic)
+}
+
+/// Outcome of [`decode_picture_partial`]: the picture as far as it got.
+#[derive(Debug)]
+pub struct PartialDecode {
+    /// The parsed picture header.
+    pub header: MsV3PictureHeader,
+    /// Reconstructed picture. Macroblocks after `mbs_decoded` (raster
+    /// order) hold the neutral grey the allocation started with.
+    pub picture: Picture,
+    /// Number of macroblocks decoded without error.
+    pub mbs_decoded: usize,
+    /// The error that stopped the macroblock walk, if any.
+    pub error: Option<Error>,
+}
+
+/// Diagnostic variant of [`decode_picture`] that returns the
+/// partially reconstructed picture when the macroblock walk fails
+/// instead of discarding it. Header-level failures (reserved picture
+/// type, missing P-frame reference) are still returned as `Err`.
+/// Intended for fixture triage (which macroblock first diverges from
+/// a reference decode); production callers use [`decode_picture`].
+pub fn decode_picture_partial(
+    br: &mut BitReader<'_>,
+    dims: PictureDims,
+    reference: Option<&Picture>,
+) -> Result<PartialDecode> {
+    let hdr = MsV3PictureHeader::parse(br)?;
+    let mut pic = Picture::alloc(dims, hdr.picture_type);
+    let mut mbs = 0usize;
+    let ac_selection = AcSelection::default();
+    let res = match hdr.picture_type {
+        PictureType::I => {
+            pic.ac_luma_sel = hdr.ac_luma_sel;
+            pic.iframe_ext = hdr.iframe_ext;
+            decode_iframe(br, dims, &hdr, ac_selection, &mut pic, &mut mbs)
+        }
+        PictureType::P => {
+            let reference = reference.ok_or_else(|| {
+                Error::invalid("msmpeg4v3: P-frame decode requires a reference picture")
+            })?;
+            pic.ac_luma_sel = reference.ac_luma_sel;
+            pic.iframe_ext = reference.iframe_ext;
+            decode_pframe(br, dims, &hdr, reference, ac_selection, &mut pic, &mut mbs)
+        }
+    };
+    Ok(PartialDecode {
+        header: hdr,
+        picture: pic,
+        mbs_decoded: mbs,
+        error: res.err(),
+    })
 }
 
 /// Resolve the picture decoder's [`AcSelection`] into the **luma**
@@ -285,9 +354,9 @@ pub fn decode_picture_opts(
 /// `0x57f80`, G5 at `0x59178` — spec/11 §5), so a coded luma block
 /// decodes its AC through the spec-correct family for every
 /// `ac_luma_sel` value rather than the DC-only fallback.
-fn luma_ac_table_for(selection: AcSelection, hdr: &MsV3PictureHeader) -> AcVlcTable {
+fn luma_ac_table_for(selection: AcSelection, ac_luma_sel: u8) -> AcVlcTable {
     match selection {
-        AcSelection::FromHeader => match hdr.ac_luma_sel {
+        AcSelection::FromHeader => match ac_luma_sel {
             // Spec/14 §3.1: 0 → G3, 1 → G1, 2 → G5. All three carry
             // their real packed-Huffman primary VLC (round 234), so the
             // AC walk runs end-to-end for each.
@@ -323,12 +392,61 @@ fn chroma_ac_table_for(selection: AcSelection, hdr: &MsV3PictureHeader) -> AcVlc
             // AC walk runs end-to-end for each.
             0 => AcVlcTable::v3_intra_g2(),
             1 => AcVlcTable::v3_intra_g0(),
-            2 => AcVlcTable::g4_inter(),
-            _ => AcVlcTable::g4_inter(),
+            // G4 bound to an *intra* chroma block still runs the
+            // intra kernel's escape ladder (spec/17 §3), so it needs
+            // LMAX / RMAX — `v3_intra_g4`, not the inter shape.
+            _ => AcVlcTable::v3_intra_g4(),
         },
-        AcSelection::G5 => AcVlcTable::g4_inter(),
+        AcSelection::G5 => AcVlcTable::v3_intra_g4(),
         AcSelection::Placeholder => AcVlcTable::V3_INTRA_PLACEHOLDER,
     }
+}
+
+/// Spatial prediction of one luma coded-block bit from its causal
+/// neighbours' **actual** coded bits — `left`, `top`, `top_left`
+/// (false outside the picture): the two direct neighbours agree →
+/// their common value; they disagree → the value of the neighbour that
+/// differs from the diagonal, i.e. `!top_left` (the coded/uncoded edge
+/// runs along the direction whose neighbour changed against the
+/// diagonal, so prediction follows it).
+///
+/// spec/17 §2.2 pins the neighbour set (luma 1 ← luma 0, luma 2 ←
+/// luma 0, luma 3 ← luma 2 / luma 1) but no probe made the two
+/// neighbours disagree. Round 452 selected this rule against the three
+/// pinned Microsoft fixtures: the DC-gradient neighbour (round 420)
+/// desynchronises div3.avi at MB (3,0) (block 2: left uncoded, top
+/// coded, diagonal uncoded — the reference codes the block); of the
+/// candidate rules over `(left, top, top_left)`, only this one carries
+/// every I-frame of all three fixtures through to the last macroblock.
+pub fn predict_cbp_bit(left: bool, top: bool, top_left: bool) -> bool {
+    if top == left {
+        top
+    } else {
+        !top_left
+    }
+}
+
+/// Number of macroblock rows per prediction slice of an I-frame, from
+/// the 5-bit `iframe_ext` header field (spec/17 §1 field 3).
+///
+/// Inferred from the pinned Microsoft fixtures (round 452): the two
+/// 352x240 DIV3 streams carry 23 and predict across all 15 MB rows;
+/// the 400x250 MP43 stream carries 24 and its second half (rows 8..15)
+/// only reconstructs when the DC / AC predictors restart at row 8 (the
+/// first block of row 8 re-codes its DC against the neutral
+/// predictor, exactly like row 0). The reading `slices = iframe_ext -
+/// 22`, `rows_per_slice = mb_h / slices` fits both; values below 23
+/// or exceeding the picture are treated as a single slice. The CBP
+/// prediction (spec/17 §2.2) is **not** restarted: row 8 of the MP43
+/// fixture only parses with the row-7 coded bits still in force. The
+/// bitstream itself is not realigned at the boundary — spec/99 §2.5
+/// (no resync marker) holds; only the predictor context restarts.
+pub fn slice_rows_for(iframe_ext: u8, mb_h: usize) -> usize {
+    let slices = (iframe_ext as usize).saturating_sub(22);
+    if slices <= 1 || slices > mb_h {
+        return mb_h.max(1);
+    }
+    (mb_h / slices).max(1)
 }
 
 /// Decode a full v3 I-frame into a [`Picture`].
@@ -354,16 +472,17 @@ fn decode_iframe(
     dims: PictureDims,
     hdr: &MsV3PictureHeader,
     ac_selection: AcSelection,
-) -> Result<Picture> {
+    pic: &mut Picture,
+    mbs_decoded: &mut usize,
+) -> Result<()> {
     let (mb_w, mb_h) = dims.mb_dims();
-    let mut pic = Picture::alloc(dims, PictureType::I);
 
     // DC prediction cache — one entry per 8×8 block (luma 2×mb per MB,
     // chroma 1×1 per MB per plane). See `dc_pred::DcCache`.
     let mut dc_cache = DcCache::new(mb_w, mb_h);
 
     let quant = hdr.quant as u32;
-    let luma_ac = luma_ac_table_for(ac_selection, hdr);
+    let luma_ac = luma_ac_table_for(ac_selection, hdr.ac_luma_sel);
     let chroma_ac = chroma_ac_table_for(ac_selection, hdr);
 
     // Per-luma-block *actual* coded-bit grid for the CBPCY XOR
@@ -371,11 +490,18 @@ fn decode_iframe(
     // luma block, raster over the block grid.
     let mut luma_cbp = vec![false; (mb_w * 2) * (mb_h * 2)];
 
+    let slice_rows = slice_rows_for(hdr.iframe_ext, mb_h);
     for my in 0..mb_h {
+        if my > 0 && my % slice_rows == 0 {
+            // Predictor restart at a slice boundary (see
+            // `slice_rows_for`): DC and AC prediction start over; the
+            // CBP prediction grid is kept.
+            dc_cache = DcCache::new(mb_w, mb_h);
+        }
         for mx in 0..mb_w {
             decode_intra_mb_iframe_v3(
                 br,
-                &mut pic,
+                pic,
                 &mut dc_cache,
                 &mut luma_cbp,
                 mb_w * 2,
@@ -393,10 +519,11 @@ fn decode_iframe(
                     mb_w * mb_h
                 ))
             })?;
+            *mbs_decoded += 1;
         }
     }
 
-    Ok(pic)
+    Ok(())
 }
 
 /// Decode one v3 **I-frame** macroblock (round 420 MB-header syntax).
@@ -412,14 +539,9 @@ fn decode_iframe(
 ///    block's *resolved* coded bit is set — the intra AC walk.
 ///
 /// The four luma symbol bits are XOR-coded against a causal spatial
-/// prediction: for each luma block, the DC-gradient rule
-/// ([`crate::dc_pred::predict_dc`]) picks the left or top neighbour,
-/// and that neighbour's **actual** coded bit (0 outside the picture)
-/// is the predicted bit; `actual = symbol_bit ^ predicted`. The two
-/// chroma bits are raw. Grounding: both pinned real Microsoft DIV3
-/// fixtures decode the leading rows of their first I-frame to the
-/// exact reference pixel means only under this rule (round 420);
-/// no static bit-to-block assignment fits both fixtures.
+/// prediction over the neighbours' **actual** coded bits
+/// ([`predict_cbp_bit`]); `actual = symbol_bit ^ predicted`. The two
+/// chroma bits are raw (spec/17 §2.1, 1584/1584 macroblocks).
 #[allow(clippy::too_many_arguments)]
 fn decode_intra_mb_iframe_v3(
     br: &mut BitReader<'_>,
@@ -461,12 +583,12 @@ fn decode_intra_mb_iframe_v3(
         // gradient-direction neighbour's actual coded bit; chroma bits
         // are raw.
         let cbp_set = if block_idx < 4 {
-            let predicted_bit = match pred.direction {
-                crate::dc_pred::PredDir::FromLeft => {
-                    bx > 0 && luma_cbp[by * luma_grid_w + (bx - 1)]
-                }
-                crate::dc_pred::PredDir::FromTop => by > 0 && luma_cbp[(by - 1) * luma_grid_w + bx],
-            };
+            // Neighbour coded bits; the grid is *not* restarted at a
+            // slice boundary (see `slice_rows_for`).
+            let l = bx > 0 && luma_cbp[by * luma_grid_w + (bx - 1)];
+            let t = by > 0 && luma_cbp[(by - 1) * luma_grid_w + bx];
+            let tl = bx > 0 && by > 0 && luma_cbp[(by - 1) * luma_grid_w + (bx - 1)];
+            let predicted_bit = predict_cbp_bit(l, t, tl);
             let actual = sym_bit ^ predicted_bit;
             luma_cbp[by * luma_grid_w + bx] = actual;
             actual
@@ -498,7 +620,17 @@ fn decode_intra_mb_iframe_v3(
                 ac_nonzero: 0,
             }
         } else {
-            decode_intra_block_full_v3(
+            let ac_pred_src = if ac_pred {
+                let p = match block_idx {
+                    0..=3 => dc_cache.ac_predict_luma(bx, by, pred.direction),
+                    4 => dc_cache.ac_predict_chroma(false, bx, by, pred.direction),
+                    _ => dc_cache.ac_predict_chroma(true, bx, by, pred.direction),
+                };
+                Some((pred.direction, p))
+            } else {
+                None
+            };
+            let (blk, levels) = crate::mb::decode_intra_block_full_v3_ac_pred(
                 br,
                 block_idx,
                 pred.predictor,
@@ -507,7 +639,15 @@ fn decode_intra_mb_iframe_v3(
                 scan,
                 ac_table,
                 dc_size_sel,
-            )?
+                ac_pred_src,
+            )?;
+            let edges = crate::dc_pred::AcEdges::from_levels(&levels);
+            match block_idx {
+                0..=3 => dc_cache.luma_ac_set(bx, by, edges),
+                4 => dc_cache.chroma_ac_set(false, bx, by, edges),
+                _ => dc_cache.chroma_ac_set(true, bx, by, edges),
+            }
+            blk
         };
         if trace {
             eprintln!(
@@ -561,7 +701,9 @@ fn decode_pframe(
     hdr: &MsV3PictureHeader,
     reference: &Picture,
     ac_selection: AcSelection,
-) -> Result<Picture> {
+    pic: &mut Picture,
+    mbs_decoded: &mut usize,
+) -> Result<()> {
     // Reference dimensions must match; otherwise MC indexing is
     // meaningless.
     if reference.width != dims.width || reference.height != dims.height {
@@ -573,19 +715,24 @@ fn decode_pframe(
     }
 
     let (mb_w, mb_h) = dims.mb_dims();
-    let mut pic = Picture::alloc(dims, PictureType::P);
     let mut dc_cache = DcCache::new(mb_w, mb_h);
     let quant = hdr.quant as u32;
-    let luma_ac = luma_ac_table_for(ac_selection, hdr);
+    // `ac_luma_sel` is not on the P-frame wire; the value transmitted
+    // by the most recent I-frame persists (spec/99 §2.3) and travels
+    // on the reference picture. Round 452: the DIV3 fixtures' intra-in-P
+    // MBs (I-frame selector 2 → G5) desynchronised under the parser's
+    // zero default (G3).
+    let luma_ac = luma_ac_table_for(ac_selection, reference.ac_luma_sel);
     let chroma_ac = chroma_ac_table_for(ac_selection, hdr);
-    // Inter residual VLC: the G4 (chroma + all-inter) table is the
-    // v1/v2/v3 inter-block AC alphabet (spec/04 §1, kernel
-    // `0x1c215d2c`). It has a fully-extracted packed-Huffman primary
-    // VLC, so inter residuals decode end-to-end. The same table covers
-    // luma and chroma inter blocks — the inter kernel does not branch
-    // on plane (spec/04 §2.6 "Magnitude/bias pairs" row: inter uses a
-    // single mag/bias pair for all six blocks).
-    let inter_ac = crate::ac::AcVlcTable::g4_inter();
+    // Inter residual VLC: the "chroma + all-inter" descriptor slot
+    // `[esi+0xab0]` (spec/99 §4.2 caller `1c2147d2` pushes it for all
+    // six blocks of an inter MB), bound per P-frame by the header's
+    // `ac_chroma_sel` (0 → G2, 1 → G0, 2 → G4; spec/14 §3.1). The
+    // inter kernel's escape is the single fixed-length body, so the
+    // table carries no LMAX / RMAX. Round 452: the pinned Microsoft
+    // fixtures select G2 (DIV3/DIV4 P-frames) and G4 (MP43); a fixed
+    // G4 desynchronised every DIV3/DIV4 P-frame within the first row.
+    let inter_ac = crate::ac::AcVlcTable::inter_for_chroma_sel(hdr.ac_chroma_sel);
 
     // MV grid: one [`crate::mv_pred::MvGridCell`] per MB. Round 240
     // (2026-06-06) replaces the previous parallel `Vec<Option<Mv>>`
@@ -614,11 +761,18 @@ fn decode_pframe(
         crate::mv::MvTable::Alternate
     };
 
+    let slice_rows = slice_rows_for(reference.iframe_ext, mb_h);
     for my in 0..mb_h {
+        if my > 0 && my % slice_rows == 0 {
+            // Predictor restart at a slice boundary (see
+            // `slice_rows_for`); intra-in-P MBs predict within the
+            // slice only.
+            dc_cache = DcCache::new(mb_w, mb_h);
+        }
         for mx in 0..mb_w {
             decode_pframe_mb(
                 br,
-                &mut pic,
+                pic,
                 &mut dc_cache,
                 &mut mv_grid,
                 reference,
@@ -630,11 +784,20 @@ fn decode_pframe(
                 &chroma_ac,
                 &inter_ac,
                 mv_table,
-            )?;
+                hdr.mb_skip_enable,
+            )
+            .map_err(|e| {
+                Error::invalid(format!(
+                    "P-frame MB ({mx},{my}) [#{} of {}]: {e}",
+                    my * mb_w + mx,
+                    mb_w * mb_h
+                ))
+            })?;
+            *mbs_decoded += 1;
         }
     }
 
-    Ok(pic)
+    Ok(())
 }
 
 /// Decode one P-frame MB: skip-bit + MCBPCY + (if coded) per-block
@@ -670,15 +833,22 @@ fn decode_pframe_mb(
     chroma_ac: &AcVlcTable,
     inter_ac: &AcVlcTable,
     mv_table: crate::mv::MvTable,
+    mb_skip_enable: bool,
 ) -> Result<()> {
-    use crate::mcbpcy::{decode_mcbpcy_pframe, PFrameMcbpcy};
+    use crate::mcbpcy::{decode_mcbpcy_pframe_opts, PFrameMcbpcy};
 
-    let (skip, mb_info) = match decode_mcbpcy_pframe(br)? {
+    let (skip, mb_info) = match decode_mcbpcy_pframe_opts(br, mb_skip_enable)? {
         PFrameMcbpcy::Skip => (true, None),
         PFrameMcbpcy::Coded { decode, ac_pred } => (false, Some((decode, ac_pred))),
     };
 
     if skip {
+        if std::env::var_os("OXIDEAV_MSMPEG4_AC_TRACE").is_some() {
+            eprintln!(
+                "[pmb trace] mb=({mb_x},{mb_y}) skip bit={}",
+                br.bit_position()
+            );
+        }
         // Skip MB: MV = predictor-based zero (spec/06 §3.4 says
         // missing neighbours are zero-subbed; skipped MBs themselves
         // contribute zero MV too per H.263 convention). Copy the MC
@@ -767,7 +937,20 @@ fn decode_pframe_mb(
     // inter MB after a row of intra MBs at row 0 (`left` is the sole
     // valid neighbour) and the analogous edge cases.
     let predictor = one_mv_predictor(mv_grid, mb_x, mb_y);
+    let mv_bit0 = br.bit_position();
     let mv = crate::mv::decode_mv_with_table(br, predictor, mv_table)?;
+    if std::env::var_os("OXIDEAV_MSMPEG4_AC_TRACE").is_some() {
+        eprintln!(
+            "[pmv trace] mb=({mb_x},{mb_y}) mv bits [{mv_bit0}..{}] table={mv_table:?}",
+            br.bit_position()
+        );
+    }
+    if std::env::var_os("OXIDEAV_MSMPEG4_AC_TRACE").is_some() {
+        eprintln!(
+            "[pmb trace] mb=({mb_x},{mb_y}) inter idx={} cbpy={:04b} cb={} cr={} pred=({},{}) mv=({},{}) bit={}",
+            decode.idx, decode.cbpy, decode.cbp_cb, decode.cbp_cr, predictor.x, predictor.y, mv.x, mv.y, br.bit_position()
+        );
+    }
     mv_grid.set_cell(mb_x, mb_y, crate::mv_pred::MvGridCell::OneMv(mv));
 
     // Lay down the motion-compensated prediction first; the residual
@@ -868,6 +1051,18 @@ fn decode_inter_residual_blocks(
         }
         let mut coeffs = [0i32; 64];
         crate::ac::decode_inter_block(br, &mut coeffs, inter_ac, quant)?;
+        if std::env::var_os("OXIDEAV_MSMPEG4_AC_TRACE").is_some() {
+            let nz: Vec<(usize, i32)> = coeffs
+                .iter()
+                .enumerate()
+                .filter(|(_, &c)| c != 0)
+                .map(|(i, &c)| (i, c))
+                .collect();
+            eprintln!(
+                "[pblk trace] mb=({mb_x},{mb_y}) blk={block_idx} coeffs={nz:?} bit={}",
+                br.bit_position()
+            );
+        }
         let mut residual = [0i32; 64];
         idct8x8_to_pel(&coeffs, &mut residual);
         add_residual_to_picture(pic, mb_x, mb_y, block_idx, &residual);
@@ -1520,7 +1715,17 @@ fn decode_intra_mb_with_header(
                 ac_nonzero: 0,
             }
         } else {
-            decode_intra_block_full_v3(
+            let ac_pred_src = if header.ac_pred {
+                let p = match block_idx {
+                    0..=3 => dc_cache.ac_predict_luma(bx, by, pred.direction),
+                    4 => dc_cache.ac_predict_chroma(false, bx, by, pred.direction),
+                    _ => dc_cache.ac_predict_chroma(true, bx, by, pred.direction),
+                };
+                Some((pred.direction, p))
+            } else {
+                None
+            };
+            let (blk, levels) = crate::mb::decode_intra_block_full_v3_ac_pred(
                 br,
                 block_idx,
                 pred.predictor,
@@ -1529,7 +1734,15 @@ fn decode_intra_mb_with_header(
                 scan,
                 ac_table,
                 dc_size_sel,
-            )?
+                ac_pred_src,
+            )?;
+            let edges = crate::dc_pred::AcEdges::from_levels(&levels);
+            match block_idx {
+                0..=3 => dc_cache.luma_ac_set(bx, by, edges),
+                4 => dc_cache.chroma_ac_set(false, bx, by, edges),
+                _ => dc_cache.chroma_ac_set(true, bx, by, edges),
+            }
+            blk
         };
         let reconstructed_dc = block_result.coeffs[0];
         match block_idx {
@@ -1690,11 +1903,12 @@ mod tests {
 
         // Picture header: I-frame, q=8, ac_chroma=0, ac_luma=0, dc_size_sel=0.
         let mut fields: Vec<(u32, u32)> = vec![
-            (0, 2), // picture_type I
-            (8, 5), // quant 8
-            (0, 1), // ac_chroma_sel = 0 (unary `0`)
-            (0, 1), // ac_luma_sel = 0
-            (0, 1), // dc_size_sel = 0
+            (0, 2),  // picture_type I
+            (8, 5),  // quant 8
+            (23, 5), // iframe_ext (spec/17 §1 field 3)
+            (0, 1),  // ac_chroma_sel = 0 (unary `0`)
+            (0, 1),  // ac_luma_sel = 0
+            (0, 1),  // dc_size_sel = 0
         ];
         // For each of 2x2 MBs: the round-420 I-frame MB header — the
         // 64-entry intra-CBPCY symbol 0 (wire code `1`, CBP=0 after
@@ -1871,6 +2085,7 @@ mod tests {
         let mut fields: Vec<(u32, u32)> = vec![
             (1, 2), // P
             (8, 5), // quant
+            (1, 1), // mb_skip_enable
             (0, 1), // ac_chroma_sel = 0
             (0, 1), // dc_size_sel = 0
             (0, 1), // mv_table_sel = 0 (default)
@@ -1928,6 +2143,7 @@ mod tests {
         let fields: Vec<(u32, u32)> = vec![
             (1, 2), // P
             (8, 5), // quant
+            (1, 1), // mb_skip_enable
             (0, 1), // ac_chroma_sel
             (0, 1), // dc_size_sel
             (1, 1), // mv_table_sel = 1 (alternate)
@@ -2009,12 +2225,12 @@ mod tests {
         let fields: Vec<(u32, u32)> = vec![
             (1, 2),                 // P
             (8, 5),                 // quant
+            (1, 1),                 // mb_skip_enable
             (0, 1),                 // ac_chroma_sel
             (0, 1),                 // dc_size_sel
             (1, 1),                 // mv_table_sel = 1 (alternate)
             (0, 1),                 // skip = 0 (reaches MV decode)
             (code_inter, bl_inter), // MCBPCY inter sym 64 (P-type, CBP=0)
-            (0, 1),                 // ac_pred (ignored for inter)
             (0b00, 2),              // alt MV joint symbol 0 → MV (0, 0)
             (0, 16),                // trailing padding
         ];
@@ -2134,7 +2350,6 @@ mod tests {
         let payload: Vec<(u32, u32)> = vec![
             (0, 1),                 // skip = 0
             (code_inter, bl_inter), // MCBPCY inter sym 64 (P-type, CBP=0)
-            (0, 1),                 // ac_pred (ignored for inter)
             (ALT_MV_CODE, ALT_MV_BL),
             (0, 16), // trailing padding
         ];
@@ -2143,6 +2358,7 @@ mod tests {
             vec![
                 (1, 2),            // P
                 (8, 5),            // quant
+                (1, 1),            // mb_skip_enable
                 (0, 1),            // ac_chroma_sel
                 (0, 1),            // dc_size_sel
                 (mv_table_sel, 1), // mv_table_sel
@@ -2248,6 +2464,7 @@ mod tests {
         let mut fields: Vec<(u32, u32)> = vec![
             (1, 2), // P
             (8, 5), // quant
+            (1, 1), // mb_skip_enable
             (0, 1), // ac_chroma_sel = 0
             (0, 1), // dc_size_sel = 0
             (0, 1), // mv_table_sel = 0 (default)
@@ -2255,7 +2472,6 @@ mod tests {
         // 1 MB: skip-bit=0, MCBPCY inter sym 64, ac_pred bit, MV sym 0.
         fields.push((0, 1)); // skip = 0
         fields.push((code_inter, bl_inter));
-        fields.push((0, 1)); // ac_pred (ignored for inter)
         fields.push((mv0_code, mv0_bl)); // MV sym 0 → MV (0,0)
         fields.push((0, 16));
         let bytes = pack(&fields);
@@ -2356,6 +2572,7 @@ mod tests {
         let mut fields: Vec<(u32, u32)> = vec![
             (1, 2), // P
             (8, 5), // quant
+            (1, 1), // mb_skip_enable
             (0, 1), // ac_chroma_sel = 0
             (0, 1), // dc_size_sel = 0
             (0, 1), // mv_table_sel = 0
@@ -2363,7 +2580,6 @@ mod tests {
         let (mv0_bl, mv0_code) = crate::tables_data::MV_V3_RAW[0];
         fields.push((0, 1)); // skip = 0
         fields.push((code_mb, bl_mb)); // MCBPCY idx 32 (inter, Y0 coded)
-        fields.push((0, 1)); // ac_pred (ignored for inter)
         fields.push((mv0_code, mv0_bl)); // MV sym 0 → MV (0,0)
                                          // Luma block 0 residual: single sub-class-B terminator + sign 0.
         fields.push((term_entry.code, term_entry.bits as u32));
@@ -2443,6 +2659,7 @@ mod tests {
         let fields: Vec<(u32, u32)> = vec![
             (1, 2), // P
             (8, 5), // quant
+            (1, 1), // mb_skip_enable
             (0, 1), // ac_chroma_sel
             (0, 1), // dc_size_sel
             (0, 1), // mv_table_sel
@@ -2790,6 +3007,7 @@ mod tests {
         let mut fields: Vec<(u32, u32)> = vec![
             (1, 2), // P
             (8, 5), // quant
+            (1, 1), // mb_skip_enable
             (0, 1), // ac_chroma_sel
             (0, 1), // dc_size_sel
             (0, 1), // mv_table_sel = 0 (default)
@@ -2797,12 +3015,10 @@ mod tests {
         // MB(0,0): inter, CBP=0, integer-pixel MV symbol (predictor (0,0)).
         fields.push((0, 1)); // skip = 0
         fields.push((code_mcbpcy_inter, bl_mcbpcy_inter));
-        fields.push((0, 1)); // ac_pred (ignored for inter)
         fields.push((mv_nz_code, mv_nz_bl));
         // MB(1,0): inter, CBP=0, MV symbol 0 (residual 0 → final = predictor).
         fields.push((0, 1)); // skip = 0
         fields.push((code_mcbpcy_inter, bl_mcbpcy_inter));
-        fields.push((0, 1)); // ac_pred (ignored for inter)
         fields.push((mv0_code, mv0_bl));
         fields.push((0, 16)); // trailing padding
 
@@ -2929,6 +3145,7 @@ mod tests {
         let mut fields: Vec<(u32, u32)> = vec![
             (1, 2), // P
             (8, 5), // quant
+            (1, 1), // mb_skip_enable
             (0, 1), // ac_chroma_sel
             (0, 1), // dc_size_sel
             (0, 1), // mv_table_sel = 0 (default)
@@ -2948,7 +3165,6 @@ mod tests {
         // (MB(0,0) is intra; row 0 → above/above_right off-picture).
         fields.push((0, 1)); // skip = 0
         fields.push((code_inter, bl_inter));
-        fields.push((0, 1)); // ac_pred (ignored for inter)
         fields.push((mv_nz_code, mv_nz_bl));
         fields.push((0, 16)); // trailing padding
 

@@ -455,7 +455,7 @@ pub fn encode_intra_dc_diff_v3(
 /// caller from the neighbour cache).
 pub fn reconstruct_intra_dc(dc_diff: i32, pred_dc: i32, block_idx: usize, quant: u32) -> i32 {
     let scaler = dc_scaler(block_idx, quant) as i32;
-    pred_dc + dc_diff * scaler
+    (predicted_dc_level(pred_dc, scaler) + dc_diff) * scaler
 }
 
 /// The predicted DC in the **quantised** domain: the neighbour's
@@ -813,10 +813,15 @@ mod tests {
 
     #[test]
     fn reconstruct_intra_dc_applies_scaler() {
-        // q=8 luma -> scaler 16. pred=1024, diff=1 -> 1024 + 16 = 1040.
+        // Quantised-domain prediction (`predicted_dc_level`):
+        // q=8 luma -> scaler 16; 1024 // 16 = 64; (64 + 1) * 16 = 1040.
         assert_eq!(reconstruct_intra_dc(1, 1024, 0, 8), 1040);
-        // Chroma q=8 -> scaler 10. diff=-2 -> 1024 + (-2)*10 = 1004.
-        assert_eq!(reconstruct_intra_dc(-2, 1024, 4, 8), 1004);
+        // Chroma q=8 -> scaler 10; 1024 // 10 = 102 (102.9 rounds via
+        // +scaler/2 = 102); (102 - 2) * 10 = 1000 — the predictor
+        // snaps to the scaler grid before the differential is added.
+        assert_eq!(reconstruct_intra_dc(-2, 1024, 4, 8), 1000);
+        assert_eq!(predicted_dc_level(1024, 16), 64);
+        assert_eq!(predicted_dc_level(1024, 12), 85);
     }
 
     #[test]

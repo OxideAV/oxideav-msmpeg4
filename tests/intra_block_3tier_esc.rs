@@ -183,7 +183,9 @@ fn intra_block_dc_diff_and_terminator() {
         /*dc_size_sel=*/ 0,
     )
     .expect("intra block with DC + terminator decodes");
-    let expected_dc = pred_dc + (dc_magnitude as i32) * dc_scaler(0, quant) as i32;
+    let scaler = dc_scaler(0, quant) as i32;
+    let expected_dc =
+        (oxideav_msmpeg4::mb::predicted_dc_level(pred_dc, scaler) + dc_magnitude as i32) * scaler;
     assert_eq!(block.coeffs[0], expected_dc, "DC reconstructed");
 
     // Terminator: scan position advances from start_pos=1 by `run`
@@ -460,7 +462,9 @@ fn intra_block_cbp_zero_skips_ac_walk() {
         dc_bits_consumed_expected,
         "cbp=0 must stop at end of DC bits — AC bits left untouched"
     );
-    let expected_dc = pred_dc + (dc_magnitude as i32) * dc_scaler(0, quant) as i32;
+    let scaler = dc_scaler(0, quant) as i32;
+    let expected_dc =
+        (oxideav_msmpeg4::mb::predicted_dc_level(pred_dc, scaler) + dc_magnitude as i32) * scaler;
     assert_eq!(block.coeffs[0], expected_dc, "DC reconstructed");
     assert!(
         block.coeffs[1..].iter().all(|&c| c == 0),
@@ -508,7 +512,9 @@ fn intra_block_chroma_uses_chroma_dc_scaler() {
         0,
     )
     .expect("chroma intra block decodes");
-    let expected_dc = pred_dc + (dc_magnitude as i32) * dc_scaler(4, quant) as i32;
+    let scaler = dc_scaler(4, quant) as i32;
+    let expected_dc =
+        (oxideav_msmpeg4::mb::predicted_dc_level(pred_dc, scaler) + dc_magnitude as i32) * scaler;
     assert_eq!(
         block.coeffs[0], expected_dc,
         "chroma DC scaler used for block_idx=4"
@@ -556,8 +562,12 @@ fn intra_block_dc_esc_tier_decodes() {
         0,
     )
     .expect("intra block with DC-ESC decodes");
-    let expected_dc = pred_dc + 128i32 * dc_scaler(0, quant) as i32;
-    assert_eq!(block.coeffs[0], expected_dc, "DC = pred + 128 * scaler");
+    let scaler = dc_scaler(0, quant) as i32;
+    let expected_dc = (oxideav_msmpeg4::mb::predicted_dc_level(pred_dc, scaler) + 128) * scaler;
+    assert_eq!(
+        block.coeffs[0], expected_dc,
+        "DC = (pred_level + 128) * scaler"
+    );
     let pos = 1usize + term_run as usize;
     assert!(
         block.coeffs[ZIGZAG[pos]] != 0,

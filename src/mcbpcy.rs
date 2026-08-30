@@ -280,24 +280,41 @@ pub enum PFrameMcbpcy {
     /// MB is skipped: duplicate the reference MB verbatim, using a
     /// zero MV. This is the "MB-coded=0" branch.
     Skip,
-    /// Non-skipped MB: the decoded joint symbol + post-VLC ac_pred bit
-    /// (the binary reads the bit at `1c2178c4..1c2178cf` regardless of
-    /// bit-6 result; the ac_pred flag is consumed only for intra-in-P).
+    /// Non-skipped MB: the decoded joint symbol + the ac_pred bit that
+    /// follows it on the intra-in-P arm only (spec/18 §3: the bit-6-clear
+    /// arm reads one further element at `0x1c2178bd..0x1c2178dc`; the
+    /// inter arm reads nothing). `ac_pred` is `false` for inter MBs.
     Coded { decode: McbpcyDecode, ac_pred: bool },
 }
 
 /// Read the P-frame MB skip flag, then (if not skipped) decode the
 /// joint MCBPCY + the post-VLC `ac_pred` bit.
 pub fn decode_mcbpcy_pframe(br: &mut BitReader<'_>) -> Result<PFrameMcbpcy> {
-    let skip = br.read_bit()?;
-    if skip {
+    decode_mcbpcy_pframe_opts(br, true)
+}
+
+/// [`decode_mcbpcy_pframe`] with the picture-header `mb_skip_enable`
+/// gate (`[esi+0x88]`, spec/99 §3.1 step 1): when the frame disabled
+/// skip bits, no 1-bit prefix is read and every MB is coded.
+pub fn decode_mcbpcy_pframe_opts(
+    br: &mut BitReader<'_>,
+    mb_skip_enable: bool,
+) -> Result<PFrameMcbpcy> {
+    if mb_skip_enable && br.read_bit()? {
         return Ok(PFrameMcbpcy::Skip);
     }
     let decode = decode_mcbpcy(br)?;
-    // ac_pred bit is read after the joint VLC; it is meaningful only
-    // for intra-in-P MBs, but the decoder always consumes the bit
-    // regardless so subsequent parsing stays aligned.
-    let ac_pred = br.read_bit()?;
+    // spec/18 §3: the joint symbol's bit 6 selects the arm. Bit 6 set
+    // (inter, mode 0) reads nothing further; bit 6 clear (intra-in-P,
+    // mode 3) reads **one further syntax element** — the ac_pred flag
+    // stored at `+0x2c`. An inter MB therefore carries no ac_pred bit;
+    // reading one unconditionally desynchronised every Microsoft
+    // P-frame (round 452).
+    let ac_pred = if decode.is_intra {
+        br.read_bit()?
+    } else {
+        false
+    };
     Ok(PFrameMcbpcy::Coded { decode, ac_pred })
 }
 

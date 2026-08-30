@@ -115,7 +115,12 @@ pub fn idct8x8_to_pel(coeffs: &[i32; 64], out: &mut [i32; 64]) {
     }
     idct8x8(&mut f);
     for i in 0..64 {
-        out[i] = (f[i].round() as i32).clamp(-256, 255);
+        // Round half toward negative infinity: the reference decode of
+        // the Microsoft fixtures resolves exact .5 pel values downward
+        // (a DC-only block with DC 636 at PQUANT 6 reconstructs to 79,
+        // not 80); ties-away rounding costs ~50 macroblocks per frame
+        // against those decodes (round 452).
+        out[i] = ((f[i] - 0.5).ceil() as i32).clamp(-256, 255);
     }
 }
 

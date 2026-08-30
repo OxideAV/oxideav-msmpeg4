@@ -102,11 +102,12 @@ fn build_g3_coded_iframe() -> Vec<u8> {
     // I-frame, pquant=8, ac_chroma_sel=0 (G2), ac_luma_sel=0 (G3),
     // dc_size_sel=0.
     let mut fields: Vec<(u32, u32)> = vec![
-        (0, 2), // picture_type = I
-        (8, 5), // pquant = 8
-        (0, 1), // ac_chroma_sel = 0 (unary single-zero → 0 → G2)
-        (0, 1), // ac_luma_sel = 0 (unary single-zero → 0 → G3)
-        (0, 1), // dc_size_sel = 0
+        (0, 2),  // picture_type = I
+        (8, 5),  // pquant = 8
+        (23, 5), // iframe_ext (spec/17 §1 field 3)
+        (0, 1),  // ac_chroma_sel = 0 (unary single-zero → 0 → G2)
+        (0, 1),  // ac_luma_sel = 0 (unary single-zero → 0 → G3)
+        (0, 1),  // dc_size_sel = 0
     ];
 
     // --- Macroblock header (round 420): 64-entry intra-CBPCY symbol +
