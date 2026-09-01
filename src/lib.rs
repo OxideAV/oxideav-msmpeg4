@@ -140,26 +140,64 @@ use oxideav_core::{
 };
 use oxideav_core::{CodecInfo, CodecRegistry, Decoder};
 
+// internal — exposed for tests/benches; not part of the stable API
+#[doc(hidden)]
 pub mod ac;
+// internal — exposed for tests/benches; not part of the stable API
+#[doc(hidden)]
 pub mod dc_pred;
+// internal — exposed for tests/benches; not part of the stable API
+#[doc(hidden)]
 pub mod enc;
 pub mod encoder;
+// internal — exposed for tests/benches; not part of the stable API
+#[doc(hidden)]
 pub mod g_descriptor;
+// internal — exposed for tests/benches; not part of the stable API
+#[doc(hidden)]
 pub mod g_enum;
+// internal — exposed for tests/benches; not part of the stable API
+#[doc(hidden)]
 pub mod g_family;
+// internal — exposed for tests/benches; not part of the stable API
+#[doc(hidden)]
 pub mod header;
+// internal — exposed for tests/benches; not part of the stable API
+#[doc(hidden)]
 pub mod idct;
+// internal — exposed for tests/benches; not part of the stable API
+#[doc(hidden)]
 pub mod iq;
+// internal — exposed for tests/benches; not part of the stable API
+#[doc(hidden)]
 pub mod mb;
+// internal — exposed for tests/benches; not part of the stable API
+#[doc(hidden)]
 pub mod mc;
+// internal — exposed for tests/benches; not part of the stable API
+#[doc(hidden)]
 pub mod mcbpcy;
+// internal — exposed for tests/benches; not part of the stable API
+#[doc(hidden)]
 pub mod mv;
+// internal — exposed for tests/benches; not part of the stable API
+#[doc(hidden)]
 pub mod mv_pred;
 pub mod picture;
+// internal — exposed for tests/benches; not part of the stable API
+#[doc(hidden)]
 pub mod scan;
+// internal — exposed for tests/benches; not part of the stable API
+#[doc(hidden)]
 pub mod tables;
+// internal — exposed for tests/benches; not part of the stable API
+#[doc(hidden)]
 pub mod tables_data;
+// internal — exposed for tests/benches; not part of the stable API
+#[doc(hidden)]
 pub mod vlc;
+// internal — exposed for tests/benches; not part of the stable API
+#[doc(hidden)]
 pub mod walker;
 
 pub const CODEC_ID_V1: &str = "msmpeg4v1";
