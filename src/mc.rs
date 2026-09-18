@@ -18,7 +18,8 @@
 //!   bitstream signal selects 4-MV (docs gap #1895), so the v3 picture
 //!   decoder is 1-MV-per-MB.
 //! * Chroma 8×8 MC. For a 1-MV MB the chroma component is the luma MV
-//!   halved toward −∞ ([`chroma_mv_from_luma`], `>> 1`). For an INTER4V
+//!   halved with the H.263 §6.1.1 quarter-to-half rounding
+//!   ([`chroma_mv_from_luma`]). For an INTER4V
 //!   MB the chroma MV is the four luma MVs summed, divided by `2*K = 8`,
 //!   and modified to the nearest half-sample position via Table 7-12
 //!   ([`chroma_mv_from_four_luma`] / [`eighth_to_half_component`]).
@@ -111,20 +112,36 @@ pub fn mc_block(
     }
 }
 
-/// Derive the chroma half-pel MV from a single luma half-pel MV, per
-/// MPEG-4 §7.6.3.4 (when every 4×4 luma sub-block shares the same MV):
-/// `mv_chroma_half = mv_luma_half / 2` using the "shift toward zero"
-/// convention (arithmetic shift right by 1 of the half-pel component).
+/// Derive the chroma half-pel MV from a single luma half-pel MV.
+///
+/// The luma component `v` (half-pel units) is halved into chroma
+/// half-pel units with the quarter positions pulled to the half-pel:
+/// `|v| = 4k → 2k`, `4k+1 → 2k+1`, `4k+2 → 2k+1`, `4k+3 → 2k+1`, sign
+/// restored — the H.263 §6.1.1 / MPEG-4 Part 2 §7.6.3.4 single-vector
+/// rule (`0 → 0, 1/4 → 1/2, 1/2 → 1/2, 3/4 → 1/2`). The binary keeps a
+/// byte-indexed chroma-MV LUT at `0x1c23a7d8` (spec/99 §3.3) whose
+/// content is not staged in `tables/`; round 459 arbitrated the rule
+/// on the black-box reference decode of the DIV3/DIV4 fixtures, whose
+/// P-frames carry odd half-pel vectors: the floor-halving `v >> 1`
+/// (previous reading) leaves the first P-frame's U plane 93.8 % exact,
+/// truncation toward zero 94.9 %, round-half-up 94.1 %, and this table
+/// 99.3 % (the residue is the reference's own ±1 IDCT rounding). A docs
+/// ask to stage the LUT is recorded in the README.
 ///
 /// This version handles only the 1-MV-per-MB case (MB-type 0 / 1). The
 /// 4-MV-per-MB (INTER4V, MB-type 2) chroma MV is derived by
 /// [`chroma_mv_from_four_luma`].
 pub fn chroma_mv_from_luma(luma_mv_half: (i32, i32)) -> (i32, i32) {
-    // For 1-MV MBs the averaging is a no-op; halve to map from luma
-    // half-pel to chroma half-pel. Arithmetic shift right rounds toward
-    // negative infinity; integer-halving via `>>1` is the §7.6.3.4
-    // default for the single-MV reduction.
-    (luma_mv_half.0 >> 1, luma_mv_half.1 >> 1)
+    fn half(v: i32) -> i32 {
+        let m = v.unsigned_abs() as i32;
+        let r = (m >> 1) | (m & 1);
+        if v < 0 {
+            -r
+        } else {
+            r
+        }
+    }
+    (half(luma_mv_half.0), half(luma_mv_half.1))
 }
 
 /// Apply the §7.6.3.4 "modification towards the nearest half sample
@@ -576,6 +593,30 @@ mod tests {
         mc_block(&rp, &mut dst, 4, 14, 14, 20, 20, 4);
         for &v in &dst {
             assert_eq!(v, 50);
+        }
+    }
+
+    #[test]
+    fn chroma_mv_from_luma_pulls_quarter_positions_to_the_half_pel() {
+        // |v| = 4k → 2k, 4k+1 → 2k+1, 4k+2 → 2k+1, 4k+3 → 2k+1; sign kept.
+        for (v, want) in [
+            (0, 0),
+            (1, 1),
+            (2, 1),
+            (3, 1),
+            (4, 2),
+            (5, 3),
+            (6, 3),
+            (7, 3),
+            (41, 21),
+            (-1, -1),
+            (-2, -1),
+            (-3, -1),
+            (-4, -2),
+            (-9, -5),
+            (-35, -17),
+        ] {
+            assert_eq!(chroma_mv_from_luma((v, -v)), (want, -want), "v = {v}");
         }
     }
 }
