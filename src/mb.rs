@@ -1120,4 +1120,66 @@ mod tests {
         let mut br = BitReader::new(&bytes);
         assert_eq!(decode_intra_dc_diff(&mut br, 0).unwrap(), 0);
     }
+
+    /// The four hex-derived intra-DC codebooks must equal the
+    /// runtime-walked codebooks of `tables/intra-dcsize-*-runtime.csv`
+    /// (round 27, spec/99 §0.1 row 29): the older `region_*_dcsize.csv`
+    /// code columns are shifted by one record and are deprecated; this
+    /// crate never consumed them (it reads the packed `.hex` sources
+    /// as `count, then count x (code, bit_length)` from `+4`), and this
+    /// test pins that reading record for record.
+    #[test]
+    fn hex_derived_dc_codebooks_equal_the_runtime_walked_tables() {
+        let cases: [(&str, usize, u8); 4] = [
+            (
+                include_str!("../tables/intra-dcsize-luma-var0-runtime.csv"),
+                0,
+                0,
+            ),
+            (
+                include_str!("../tables/intra-dcsize-luma-var1-runtime.csv"),
+                0,
+                1,
+            ),
+            (
+                include_str!("../tables/intra-dcsize-chroma-var0-runtime.csv"),
+                4,
+                0,
+            ),
+            (
+                include_str!("../tables/intra-dcsize-chroma-var1-runtime.csv"),
+                4,
+                1,
+            ),
+        ];
+        for (csv, block_idx, sel) in cases {
+            let table = dc_table(block_idx, sel);
+            let mut rows = 0usize;
+            for line in csv.lines().skip(1).filter(|l| !l.trim().is_empty()) {
+                let mut f = line.split(',');
+                let symbol: u16 = f.next().unwrap().parse().unwrap();
+                let code_bin = f.next().unwrap();
+                let bits: u8 = f.next().unwrap().parse().unwrap();
+                let code = u32::from_str_radix(code_bin, 2).unwrap();
+                assert_eq!(
+                    code_bin.len() as u8,
+                    bits,
+                    "sel{sel} blk{block_idx} sym {symbol}"
+                );
+                let entry = table
+                    .iter()
+                    .find(|e| e.value == symbol)
+                    .unwrap_or_else(|| panic!("sel{sel} blk{block_idx}: symbol {symbol} missing"));
+                assert_eq!(
+                    (entry.bits, entry.code),
+                    (bits, code),
+                    "sel{sel} blk{block_idx} sym {symbol}"
+                );
+                rows += 1;
+            }
+            assert_eq!(rows, 120, "sel{sel} blk{block_idx}: 120 runtime records");
+            assert_eq!(table.len(), 120);
+            assert_eq!(dc_esc_index(block_idx, sel), 119);
+        }
+    }
 }

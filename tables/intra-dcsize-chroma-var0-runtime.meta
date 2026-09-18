@@ -1,0 +1,28 @@
+# intra-dcsize-chroma-var0-runtime.meta
+source_path: video/msmpeg4/reference/binaries/wmpcdcs8-2001/mpg4c32.dll
+source_sha256: aedb4cf3d33c8554ab8acf04afe2d936eaa7c49107c5fefe163bca2e94b3c099
+tool: ud-emulator (univdreams 539f04e4be5ed90519885da7267d483ad6c0dbaf) round27_msmpeg4_watch harness + provenance/sandbox-03/tools/codebook.py
+method: the codec was run in the sandbox (MP43 decode of provenance/sandbox-02/encode-gradient-pq8.bin);
+  after the frame the guest heap (0x60000000..0x600c0000) was read back post-mortem and the
+  decoder's own runtime VLC decode tables (descriptor +0x14 root table, +0x18 (width, table)
+  pair array; walked exactly as the VLC reader 0x1c219351..0x1c2193b9 walks them) were
+  expanded into (code, bit_length) -> symbol. This is the effective codebook the decoder
+  uses; it equals the packed .data source read as: u32 count, then count x (u32 code LE,
+  u32 bit_length LE) starting at source+4 (verified record-for-record, 0 mismatches).
+  NOTE: the earlier region_05f4a0_dcsize.csv/.meta of the same table read the records as
+  (bit_length, code) starting at +8, which pairs each record's length with the NEXT
+  record's code; its bit_length column is correct, its code column is not.
+kind: intra_dc_differential_vlc_runtime
+columns: symbol, code_bin, bit_length
+semantics: symbol == DC differential magnitude (0x1c216d22: movzx al); symbol 119 is the
+  ESC index (8-bit raw magnitude follows, 0x1c216d67); a sign bit follows every non-zero
+  magnitude (0x1c216d34). Bound when [this+0x8bc] == 0 (chroma, header dc-size selector 0).
+vma_start_hex: 0x1c2600a0
+file_offset_start_hex: 0x05f4a0
+record_count: 120
+runtime_descriptor_guest_va: 0x60001b1c
+kraft_sum: 1.000000
+bit_length_min: 2
+bit_length_max: 23
+csv_sha256: 83bd15d0c65f0ed6f1753ffc945e808e2b7b32aea260b08ae7dfe8d118dd2c5b
+verdict: pass (runtime, matches packed source as (code,len)@+4 120/120)
