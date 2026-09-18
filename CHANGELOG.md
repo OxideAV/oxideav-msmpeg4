@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.11](https://github.com/OxideAV/oxideav-msmpeg4/compare/v0.0.10...v0.0.11) - 2026-09-18
+
+### Other
+
+- provenance hygiene: cite the wall-legal tables/ lane (vendor-binary intra CBPCY map + runtime DC codebooks) for the round-420 corroborations instead of the out-of-wall data lane — values unchanged
+- README + CHANGELOG: round 459 — spec/19 applied, exact IDCT, DIV3/DIV4 P-frames decode end-to-end; harness minimums raised
+- cargo-fuzz sub-crate (decode_v3, decode_v1v2, idct, encode_roundtrip) + nightly Fuzz workflow shim
+- pin the hex-derived intra-DC codebooks against the runtime-walked tables (spec/99 §0.1 row 29)
+- iframe_ext slice law per spec/19 §3 — reject value ≤ 22 and value − 22 > mb_rows
+- half-pel rounding alternates per P-frame (reset by I-frames), threaded through decoder and encoder
+- chroma MV from a single luma MV uses the H.263 §6.1.1 quarter-to-half rounding
+- intra-in-P luma binds the P-frame selector's luma class; intra MBs contribute a zero MV; slice-gated MV predictor
+- level-domain DC/AC prediction context with the spec/19 §2.2 default record; v1/v2 DC scaler = 8
+- run-extension escape arm per spec/17 §3 — no +1 on the intra kernel, +1 kept for the inter kernel
+- exact integer kernel per spec/19 §1 (MMX int16/23-bit lane model, scalar reference form)
+- hide internal pub surface from rustdoc/semver (fleet rule 2026-09-01)
+
 ### Changed
 
 - **Round 459 — spec/19 applied: exact IDCT, level-domain prediction
