@@ -441,27 +441,45 @@ pub fn predict_cbp_bit(left: bool, top: bool, top_left: bool) -> bool {
     }
 }
 
-/// Number of macroblock rows per prediction slice of an I-frame, from
-/// the 5-bit `iframe_ext` header field (spec/17 §1 field 3).
+/// Number of macroblock rows per prediction slice of a v2 / v3 picture
+/// from the 5-bit `iframe_ext` header field (spec/17 §1 field 3,
+/// spec/19 §3, `0x1c21224b`): `rows_per_slice = floor(mb_rows /
+/// (value − 22))`. `value ≤ 22` is rejected by the vendor decoder
+/// (`−100`) and `value − 22 > mb_rows` makes it divide by zero, so
+/// both are hard errors here. Vendor streams carry 23 (one slice); the
+/// 400x250 MP43 fixture carries 24 (two 8-row slices).
 ///
-/// Inferred from the pinned Microsoft fixtures (round 452): the two
-/// 352x240 DIV3 streams carry 23 and predict across all 15 MB rows;
-/// the 400x250 MP43 stream carries 24 and its second half (rows 8..15)
-/// only reconstructs when the DC / AC predictors restart at row 8 (the
-/// first block of row 8 re-codes its DC against the neutral
-/// predictor, exactly like row 0). The reading `slices = iframe_ext -
-/// 22`, `rows_per_slice = mb_h / slices` fits both; values below 23
-/// or exceeding the picture are treated as a single slice. The CBP
-/// prediction (spec/17 §2.2) is **not** restarted: row 8 of the MP43
-/// fixture only parses with the row-7 coded bits still in force. The
-/// bitstream itself is not realigned at the boundary — spec/99 §2.5
-/// (no resync marker) holds; only the predictor context restarts.
-pub fn slice_rows_for(iframe_ext: u8, mb_h: usize) -> usize {
-    let slices = (iframe_ext as usize).saturating_sub(22);
-    if slices <= 1 || slices > mb_h {
-        return mb_h.max(1);
+/// A slice boundary (`mb_y mod rows_per_slice == 0`) restarts the DC /
+/// AC prediction context and the MV predictor's top side; the CBP
+/// prediction (spec/17 §2.2) is **not** restarted and the bitstream is
+/// not realigned (spec/99 §2.5: no resync marker).
+pub fn slice_rows_for(iframe_ext: u8, mb_h: usize) -> Result<usize> {
+    let divisor = (iframe_ext as usize).saturating_sub(22);
+    if divisor == 0 {
+        return Err(Error::invalid(format!(
+            "msmpeg4v3: iframe_ext {iframe_ext} <= 22 is rejected (spec/19 §3)"
+        )));
     }
-    (mb_h / slices).max(1)
+    if divisor > mb_h {
+        return Err(Error::invalid(format!(
+            "msmpeg4v3: iframe_ext {iframe_ext} asks for {divisor} slices over {mb_h} \
+             macroblock rows — zero rows per slice (spec/19 §3: the vendor decoder \
+             divides by zero)"
+        )));
+    }
+    Ok(mb_h / divisor)
+}
+
+/// [`slice_rows_for`] for a P-frame, whose slice geometry is the
+/// reference picture's (spec/19 §3: the field is read on I-frames
+/// only). A reference that never carried the field (`iframe_ext == 0`,
+/// e.g. a hand-built reference picture) means one slice.
+fn slice_rows_for_reference(reference: &Picture, mb_h: usize) -> usize {
+    if reference.iframe_ext == 0 {
+        mb_h
+    } else {
+        slice_rows_for(reference.iframe_ext, mb_h).unwrap_or(mb_h)
+    }
 }
 
 /// Decode a full v3 I-frame into a [`Picture`].
@@ -503,7 +521,7 @@ fn decode_iframe(
     // luma block, raster over the block grid.
     let mut luma_cbp = vec![false; (mb_w * 2) * (mb_h * 2)];
 
-    let slice_rows = slice_rows_for(hdr.iframe_ext, mb_h);
+    let slice_rows = slice_rows_for(hdr.iframe_ext, mb_h)?;
     for my in 0..mb_h {
         if my > 0 && my % slice_rows == 0 {
             // Predictor restart at a slice boundary (see
@@ -808,7 +826,7 @@ fn decode_pframe(
         crate::mv::MvTable::Alternate
     };
 
-    let slice_rows = slice_rows_for(reference.iframe_ext, mb_h);
+    let slice_rows = slice_rows_for_reference(reference, mb_h);
     for my in 0..mb_h {
         // spec/19 §3: `top_slice = (mb_y mod rows_per_slice) != 0`
         // gates the top / top-left DC-AC predictors AND is passed to
@@ -1954,15 +1972,20 @@ mod tests {
     #[test]
     fn slice_rows_for_matches_fixture_geometry() {
         // 352x240 (15 MB rows) at iframe_ext = 23 → one slice.
-        assert_eq!(slice_rows_for(23, 15), 15);
+        assert_eq!(slice_rows_for(23, 15).unwrap(), 15);
         // 400x250 (16 MB rows) at iframe_ext = 24 → two 8-row slices
         // (the MP43 fixture's rows 8..15 restart their DC/AC
         // prediction at row 8).
-        assert_eq!(slice_rows_for(24, 16), 8);
-        // Degenerate / out-of-range values fall back to a single slice.
-        assert_eq!(slice_rows_for(0, 15), 15);
-        assert_eq!(slice_rows_for(22, 15), 15);
-        assert_eq!(slice_rows_for(31, 4), 4);
+        assert_eq!(slice_rows_for(24, 16).unwrap(), 8);
+        // spec/19 §3 measured 128x96 (6 MB rows): 24 → 3 rows per
+        // slice, 25 → 2 rows; 29 (divisor 7 > 6) traps the vendor
+        // decoder and is rejected here, as is anything ≤ 22.
+        assert_eq!(slice_rows_for(24, 6).unwrap(), 3);
+        assert_eq!(slice_rows_for(25, 6).unwrap(), 2);
+        assert!(slice_rows_for(29, 6).is_err());
+        assert!(slice_rows_for(0, 15).is_err());
+        assert!(slice_rows_for(22, 15).is_err());
+        assert!(slice_rows_for(31, 4).is_err());
     }
 
     #[test]
@@ -2118,8 +2141,9 @@ mod tests {
             out
         }
 
-        // Picture header: I-frame q=8.
-        let mut fields: Vec<(u32, u32)> = vec![(0, 2), (8, 5), (0, 1), (0, 1), (0, 1)];
+        // Picture header: I-frame q=8, iframe_ext 23 (one slice,
+        // spec/17 §1 field 3), then the three v3 selectors.
+        let mut fields: Vec<(u32, u32)> = vec![(0, 2), (8, 5), (23, 5), (0, 1), (0, 1), (0, 1)];
         // 16×16 → one MB. Round-420 header: intra-CBPCY sym 0 (wire
         // `1`, CBP=0), ac_pred=0. Then for each of 6 blocks a +1 DC
         // differential through the v3 direct-value DC VLC
