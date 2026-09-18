@@ -1,0 +1,49 @@
+[package]
+name = "oxideav-msmpeg4-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+oxideav-core = "0.1"
+
+[dependencies.oxideav-msmpeg4]
+path = ".."
+
+# Detach from the umbrella workspace this crate is checked out into.
+[workspace]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "decode_v3"
+path = "fuzz_targets/decode_v3.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_v1v2"
+path = "fuzz_targets/decode_v1v2.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "idct"
+path = "fuzz_targets/idct.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "encode_roundtrip"
+path = "fuzz_targets/encode_roundtrip.rs"
+test = false
+doc = false
+bench = false

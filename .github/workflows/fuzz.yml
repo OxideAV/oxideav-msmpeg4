@@ -1,0 +1,17 @@
+name: Fuzz
+
+# Thin shim around the OxideAV org-level reusable fuzz workflow. The
+# targets under fuzz/fuzz_targets/ are auto-discovered; the time budget
+# is split evenly across them and the corpus persists between runs.
+
+on:
+  schedule:
+    - cron: "41 4 * * *"
+  workflow_dispatch:
+
+jobs:
+  fuzz:
+    uses: OxideAV/.github/.github/workflows/crate-fuzz.yml@master
+    with:
+      time_budget_seconds: 1800
+    secrets: inherit
