@@ -605,6 +605,7 @@ fn decode_intra_mb_iframe_v3(
 
         let ac_table = if block_idx <= 3 { luma_ac } else { chroma_ac };
         let bit_before = br.bit_position();
+        let mut trace_levels: Option<[i32; 64]> = None;
         // Placeholder AC selection (empty table): DC-only fallback,
         // mirroring the intra-in-P path's behaviour for diagnostic
         // runs.
@@ -647,14 +648,27 @@ fn decode_intra_mb_iframe_v3(
                 4 => dc_cache.chroma_ac_set(false, bx, by, edges),
                 _ => dc_cache.chroma_ac_set(true, bx, by, edges),
             }
+            if trace {
+                trace_levels = Some(levels);
+            }
             blk
         };
         if trace {
+            let lv: Vec<(usize, i32)> = trace_levels
+                .map(|l| {
+                    l.iter()
+                        .enumerate()
+                        .filter(|(i, &v)| *i > 0 && v != 0)
+                        .map(|(i, &v)| (i, v))
+                        .collect()
+                })
+                .unwrap_or_default();
             eprintln!(
-                "[blk trace] mb=({mb_x},{mb_y}) blk={block_idx} cbp={cbp_set} scan={scan:?} bits=[{bit_before}..{}] dc={} nz={}",
+                "[blk trace] mb=({mb_x},{mb_y}) blk={block_idx} cbp={cbp_set} scan={scan:?} bits=[{bit_before}..{}] dc={} nz={} pred={:?} levels={lv:?}",
                 br.bit_position(),
                 block_result.coeffs[0],
                 block_result.ac_nonzero,
+                pred.direction,
             );
         }
 

@@ -1,0 +1,22 @@
+# idct-scalar-arith-constants.meta
+source_path: video/msmpeg4/reference/binaries/wmpcdcs8-2001/mpg4c32.dll
+source_sha256: aedb4cf3d33c8554ab8acf04afe2d936eaa7c49107c5fefe163bca2e94b3c099
+tool: extract-08.sh + python3 + struct.unpack (static; no vendor code executed)
+kind: instruction_immediates
+bodies: 0x1c22abf2..0x1c22afcd (put, ret 0xc) and 0x1c22c0c1..0x1c22c4cd (residual, ret 0xc)
+method: byte-pattern scan for `69 /r imm32` (imul, mod=11), `81 /0 imm32`, `83 /0 imm8`,
+  `05 imm32` (add), `bb imm32` (mov ebx), `c1 /4|/7 imm8` (shl/sar) restricted to the two
+  ranges, filtered to the IDCT constant set; asserts exactly 22 imul per body, which is the
+  count read off the full linear disassembly in provenance/26 (10 distinct constants;
+  181 occurs twice per pass, the other nine once per pass; two passes per body).
+body_put_sha256: 23d3f071b8f691e3104646b0dedb3aa7d312a359a87104311a601c312a4ce603
+body_residual_sha256: 68eba9fe37f990e6adc858ccd4498524723782bffebd060ada3c9534005922c8
+constant_roles: 565=W7 2276=W1-W7 3406=W1+W7 2408=W3 799=W3-W5 4017=W3+W5
+  1108=W6 3784=W2+W6 1568=W2-W6 181=round(128*sqrt2); adds 128 (row DC / 181-stage),
+  4 (column odd-part pre-shift), 8192 (column DC), 32 (residual column DC-only shortcut);
+  shifts 11 (row DC), 8 (row output, 181-stage), 3 (column odd part), 14 (column output),
+  6 (residual column DC-only shortcut). Arithmetic in provenance/26 §1.3.
+excluded_pointer_advance_sites: 0x1c22ad36 0x1c22ad77 0x1c22ae1c 0x1c22c27c (add reg,32 / add esi,4
+  that bump the temp-row / column pointers, not arithmetic)
+row_count: 124
+verdict: pass

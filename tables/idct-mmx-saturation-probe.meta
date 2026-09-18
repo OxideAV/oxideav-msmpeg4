@@ -1,0 +1,30 @@
+# idct-mmx-saturation-probe.meta
+source_path: video/msmpeg4/reference/binaries/wmpcdcs8-2001/mpg4c32.dll
+source_sha256: aedb4cf3d33c8554ab8acf04afe2d936eaa7c49107c5fefe163bca2e94b3c099
+tool: ud-emulator (univdreams 3f43799, x87 RC-field fix) round27_msmpeg4_watch harness; provenance/sandbox-04
+  (first captured in round 27 / sandbox-03 on univdreams 539f04e, regenerated in round 28 — see history below)
+input: provenance/sandbox-03/inputs/iframe-sat.bin (hand-built 32x16 MP43 I-frame, PQUANT 31,
+  coefficients carried by the TCOEF escape fixed-length arm; builder tools/mkiframe.py)
+method: read-watch on the decoder's int32 coefficient buffer (this+0x5a4, 256 bytes) and
+  write-watch on the picture planes while the MMX put IDCT 0x1c22a039 ran; the 64 input
+  coefficients and the 64 output samples of the two coded luma blocks were captured.
+kind: idct_test_vector
+columns: block, kind, c<r>_<k> (dequantised coefficient at natural row r column k, i.e. the
+  transpose of the decoder's memory buffer, which is stored transposed under the MMX build),
+  p<r>_<k> (output sample written to the picture at row r column k)
+semantics: these two blocks are reproduced pixel-exactly by the int16/23-bit MMX model
+  (provenance/27 §1.4; tools/idct_check.py idct_mmx_model) and NOT by the int32 scalar
+  arithmetic of provenance/26 §1.3 (28 and 22 of 64 samples differ). They pin the MMX
+  pair as the arithmetic the sandbox reference decodes use. Coefficient magnitudes of
+  this size are only reachable through the escape fixed-length arm (8-bit level at
+  PQUANT 31); no vendor-encoded frame traced so far reaches them.
+csv_sha256: 4a34c269417c9e3901d8a19d2f3e2e975201fe610bdf7547c7ae0af32bd0dd98
+history: the round-27 capture (csv_sha256 05f30f1040813207560ef277b012813a3e42b4e538a3aa528cd4f9e12c7cfeea)
+  was taken on an emulator whose FISTP ignored the truncate control word, so its block DC
+  (c0_0 = 1058 = 23*46) came from a default DC of 23 instead of the hardware value 22; both
+  blocks now carry c0_0 = 1012 (= 22*46) and the corresponding output samples (block 0 row 0
+  is 44 168 255 255 0 0 85 0; it was 44 174 255 255 0 0 91 0). The MMX model reproduces both
+  versions 0/64 and the scalar arithmetic misses 28/64 and 21/64 in both; only this version
+  is what a real CPU produces from inputs/iframe-sat.bin. Source: provenance/28 §2, sandbox-04
+  traces/esc-sat2.trace.jsonl.
+verdict: pass (behavioural, hardware-grade after the RC fix)

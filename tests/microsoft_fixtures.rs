@@ -331,10 +331,19 @@ fn remux_asf_to_avi(fix: &Fixture) -> Option<PathBuf> {
 /// Decode the cached source via ffmpeg into raw YUV420p ground truth and
 /// return the bytes. Returns `None` if `ffmpeg` is unavailable or fails.
 ///
-/// The reference YUV is cached at `<name>.yuv` next to the source. We
-/// regenerate only when missing or when the size doesn't match the
-/// expected `n_frames * 1.5 * width * height` — that's a cheap proxy
-/// for "the source changed shape" without re-hashing.
+/// The black-box decoder is run with its `-idct int` selection (round
+/// 459): its default IDCT is not the vendor arithmetic that spec/19 §1
+/// transcribes — a DC-only block with DC 636 reconstructs to 79 there
+/// where the vendor kernel lands on 80 — and against it the exact
+/// kernel scored only ~53% luma-exact on the MP43 I-frame. The `int`
+/// selection tracks the spec/19 kernel (≥ 99.6% luma-exact on every
+/// I-frame of the three fixtures); the remaining reference-side rounding
+/// differences are noted in the README scorecard.
+///
+/// The reference YUV is cached at `<name>.idct-int.yuv` next to the
+/// source. We regenerate only when missing or when the size doesn't
+/// match the expected `n_frames * 1.5 * width * height` — that's a
+/// cheap proxy for "the source changed shape" without re-hashing.
 fn ffmpeg_decode_to_yuv(fix: &Fixture) -> Option<Vec<u8>> {
     if !ffmpeg_available() {
         eprintln!(
@@ -344,15 +353,24 @@ fn ffmpeg_decode_to_yuv(fix: &Fixture) -> Option<Vec<u8>> {
         return None;
     }
     let src = cache_path(fix.name);
-    let out = cache_path(&format!("{}.yuv", fix.name));
+    let out = cache_path(&format!("{}.idct-int.yuv", fix.name));
     let expected_yuv_bytes =
         (fix.n_frames as u64) * (fix.width as u64) * (fix.height as u64) * 3 / 2;
     let need = !fs::metadata(&out)
         .map(|m| m.len() == expected_yuv_bytes)
         .unwrap_or(false);
     if need {
+        // `-idct` is an input (decoder) option: it must precede `-i`.
         let ok = Command::new("ffmpeg")
-            .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-idct",
+                "int",
+                "-i",
+            ])
             .arg(&src)
             .args(["-f", "rawvideo", "-pix_fmt", "yuv420p"])
             .arg(&out)
@@ -559,6 +577,24 @@ fn decode_and_compare(fix: &Fixture, avi_bytes: &[u8], yuv_ref: &[u8]) -> Vec<Fr
                         });
                         visible_idx += 1;
                         continue;
+                    }
+                    // Diagnostic dump: `OXIDEAV_MSMPEG4_DUMP_DIR=<dir>` writes
+                    // our planes as `<fixture>.ours.yuv` (tight yuv420p,
+                    // same layout as the reference) for offline diffing.
+                    if let Some(dir) = std::env::var_os("OXIDEAV_MSMPEG4_DUMP_DIR") {
+                        let path = PathBuf::from(dir).join(format!("{}.ours.yuv", fix.name));
+                        let mut f = fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(&path)
+                            .expect("open dump file");
+                        use std::io::Write;
+                        for (p, (pw, ph)) in vf.planes.iter().zip([(w, h), (cw, ch), (cw, ch)]) {
+                            for row in 0..ph {
+                                f.write_all(&p.data[row * p.stride..row * p.stride + pw])
+                                    .expect("write dump");
+                            }
+                        }
                     }
                     let dy =
                         diff_plane_strided(&vf.planes[0].data, vf.planes[0].stride, ref_y, w, h);

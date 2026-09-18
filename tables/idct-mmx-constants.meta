@@ -1,0 +1,16 @@
+# idct-mmx-constants.meta
+source_path: video/msmpeg4/reference/binaries/wmpcdcs8-2001/mpg4c32.dll
+source_sha256: aedb4cf3d33c8554ab8acf04afe2d936eaa7c49107c5fefe163bca2e94b3c099
+tool: extract-08.sh + python3 + struct.unpack (static; no vendor code executed)
+kind: pmaddwd_constant_blocks
+section: .text (file_offset = vma - 0x1c200a00)
+block_a_vma: 0x1c2018f8..0x1c201937 (8 qwords)  consumer: MMX put IDCT 0x1c22a039
+block_b_vma: 0x1c201940..0x1c20197f (8 qwords)  consumer: MMX residual IDCT 0x1c22afcd
+block_a_sha256: 5b1cdcd414da83ad3695bd81ee2b792ca3c33a8e5341f7133550b9670bd7516e
+block_b_sha256: 5b1cdcd414da83ad3695bd81ee2b792ca3c33a8e5341f7133550b9670bd7516e
+blocks_identical: yes
+element: i16 little-endian, four per qword; pmaddwd pairs (w0*x0 + w1*x1, w2*x2 + w3*x3)
+word_pairs_equal_scalar_immediates: yes (565/2276/3406/2408/799/4017/1108/3784/1568/181)
+semantics: see provenance/26 §1.4; the packed operand is (a, a+b) so each
+  pmaddwd computes W*(a+b) + W'*a exactly as the scalar Wang butterfly does.
+verdict: pass

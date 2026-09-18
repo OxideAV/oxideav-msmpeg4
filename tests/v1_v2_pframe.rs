@@ -325,9 +325,11 @@ fn v1_iframe_intra_dc_only_decodes_flat_grey() {
     );
     // Chroma at q=8 has DC scaler 10: the neutral 1024 predictor snaps
     // to the quantised-domain grid (1024 // 10 = 102 → DC 1020, round
-    // 452), and 1020/8 = 127.5 rounds half-down to 127.
-    assert!(pic.cb.iter().all(|&p| p == 127));
-    assert!(pic.cr.iter().all(|&p| p == 127));
+    // 452); the spec/19 §1 integer kernel reconstructs a DC-only block
+    // at `(dc · 8 · 256 + 8192) >> 14` = 128 for DC 1020 (round 459 —
+    // the float kernel it replaced rounded 127.5 downward).
+    assert!(pic.cb.iter().all(|&p| p == 128));
+    assert!(pic.cr.iter().all(|&p| p == 128));
 }
 
 #[test]
@@ -411,10 +413,10 @@ fn v1_iframe_intra_plus_q_mb_type_4_decodes() {
         "v1 INTRA+Q DC-only luma must reconstruct flat grey 128"
     );
     // See v1_iframe_intra_dc_only_decodes_flat_grey: chroma snaps to
-    // 1020 (quantised-domain DC prediction) → 127 after the half-down
-    // IDCT rounding.
-    assert!(pic.cb.iter().all(|&p| p == 127));
-    assert!(pic.cr.iter().all(|&p| p == 127));
+    // 1020 (quantised-domain DC prediction) → 128 through the spec/19
+    // §1 integer kernel.
+    assert!(pic.cb.iter().all(|&p| p == 128));
+    assert!(pic.cr.iter().all(|&p| p == 128));
 }
 
 #[test]
