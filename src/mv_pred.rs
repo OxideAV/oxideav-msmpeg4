@@ -1288,12 +1288,25 @@ impl MvGrid {
     /// - `(width - 1, mb_y)` for `mb_y > 0`: `above_right` is
     ///   `Absent` because the column `mb_x + 1` is past the picture.
     pub fn neighbour_set_for(&self, mb_x: usize, mb_y: usize) -> NeighbourSet {
+        self.neighbour_set_for_slice(mb_x, mb_y, false)
+    }
+
+    /// [`Self::neighbour_set_for`] with spec/19 §3's slice gating:
+    /// when `top_boundary` is set (the MB sits on the first row of a
+    /// prediction slice) the `above` / `above_right` neighbours are
+    /// `Absent` exactly as on picture row 0.
+    pub fn neighbour_set_for_slice(
+        &self,
+        mb_x: usize,
+        mb_y: usize,
+        top_boundary: bool,
+    ) -> NeighbourSet {
         let left = if mb_x > 0 {
             self.cell_at(mb_x - 1, mb_y)
         } else {
             MvGridCell::Absent
         };
-        let (above, above_right) = if mb_y > 0 {
+        let (above, above_right) = if mb_y > 0 && !top_boundary {
             let above = self.cell_at(mb_x, mb_y - 1);
             let above_right = if mb_x + 1 < self.width {
                 self.cell_at(mb_x + 1, mb_y - 1)

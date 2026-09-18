@@ -633,15 +633,13 @@ pub fn encode_pframe_v3_with_stats(
     // §4.2); intra-in-P chroma blocks use the same primary through the
     // intra kernel's escape ladder (spec/17 §3).
     let inter_ac = AcVlcTable::inter_for_chroma_sel(AC_CHROMA_SEL);
-    // Intra-in-P AC tables: `ac_luma_sel` is NOT carried on the v3
-    // P-frame wire, so the decoder's dispatch sees the parser's zero
-    // → G3 luma (spec/14 §3.1); chroma follows the transmitted
-    // `ac_chroma_sel = 2` → G4. The encoder must serialise intra-in-P
-    // blocks through the same pair.
-    // `ac_luma_sel` persists from the most recent I-frame (spec/99
-    // §2.3): use whatever selector the reference picture carries (the
-    // I-frame RD's winner travels on the decoder-side reconstruction).
-    let intra_luma_ac = v3_luma_table_for_sel(reference.ac_luma_sel);
+    // Intra-in-P AC tables: the decoder binds the intra-in-P luma
+    // blocks to the luma class of the P-frame's own selector
+    // ({G3, G1, G5}[ac_chroma_sel] — round 459, fixture-arbitrated;
+    // see `picture::decode_pframe`) and the chroma blocks to the
+    // chroma class ({G2, G0, G4}[ac_chroma_sel]). With
+    // `AC_CHROMA_SEL = 2` that is G5 luma / G4 chroma.
+    let intra_luma_ac = v3_luma_table_for_sel(AC_CHROMA_SEL);
     let intra_chroma_ac = AcVlcTable::v3_intra_g4();
     let mut mv_grid = MvGrid::new(mb_w, mb_h);
     // DC-prediction cache for intra-in-P MBs, mirroring the decoder's
@@ -953,7 +951,7 @@ fn encode_pframe_mb_v3(
     // Scene-change refuge: when even the best MC prediction is worse
     // than what a from-scratch intra coding would face, code the MB
     // intra (joint MCBPCY I-type half, idx = cbp < 64). The decoder
-    // leaves the MV-grid cell Absent for intra MBs, so the predictor
+    // stores a zero MV for intra MBs (round 459), so the predictor
     // chain sees the same neighbourhood on both sides.
     let inter_sad = mb_sad(input, reference, mb_x, mb_y, (mv.x as i32, mv.y as i32));
     if mb_intra_activity(input, mb_x, mb_y) + INTRA_IN_P_MARGIN < inter_sad {
@@ -983,6 +981,7 @@ fn encode_pframe_mb_v3(
             ac_pred,
             true,
         )?;
+        mv_grid.set_cell(mb_x, mb_y, MvGridCell::OneMv(Mv::default()));
         return Ok(MbKind::Intra);
     }
 
@@ -1361,8 +1360,8 @@ pub fn encode_pframe_v1v2_with_stats(
             // activity by a clear margin, code the MB intra — v1
             // MB-type 3 (mcbpc = 12 + cbpc, no ac_pred bit, spec/07
             // §1.4), v2 intra quotient (mcbpc = 4 + cbpc, post-MCBPC
-            // ac_pred bit, spec/07 §2.4). Intra MBs leave the MV-grid
-            // cell Absent, mirroring the decoder.
+            // ac_pred bit, spec/07 §2.4). Intra MBs store a zero MV
+            // in the grid, mirroring the decoder.
             let inter_sad = mb_sad(input, reference, mx, my, (mv.x as i32, mv.y as i32));
             if mb_intra_activity(input, mx, my) + INTRA_IN_P_MARGIN < inter_sad {
                 let (plans, cbpy, cbp_cb, cbp_cr) =
@@ -1398,6 +1397,7 @@ pub fn encode_pframe_v1v2_with_stats(
                         )?;
                     }
                 }
+                mv_grid.set_cell(mx, my, MvGridCell::OneMv(Mv::default()));
                 stats.intra_mbs += 1;
                 continue;
             }

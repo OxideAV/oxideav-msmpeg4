@@ -738,7 +738,20 @@ fn decode_pframe(
     // on the reference picture. Round 452: the DIV3 fixtures' intra-in-P
     // MBs (I-frame selector 2 → G5) desynchronised under the parser's
     // zero default (G3).
-    let luma_ac = luma_ac_table_for(ac_selection, reference.ac_luma_sel);
+    // Intra-in-P AC tables. The P-frame header carries ONE unary class
+    // selector (`1c212067` → `[esi+0xad0]`, parsed as `ac_chroma_sel`).
+    // Round 459: on both third-party DIV3/DIV4 fixtures the intra-in-P
+    // luma blocks decode only through the **luma class of that same
+    // index** ({G3, G1, G5}[sel] — G1 here), not through the I-frame's
+    // persisted `ac_luma_sel` (G5, which desynchronises the frame at
+    // the first intra MB); the chroma blocks follow the chroma class
+    // ({G2, G0, G4}[sel]) as before. spec/99 §2.3 states `[esi+0xad4]`
+    // persists unchanged into P-frames; whether the P-frame setup
+    // re-derives the live intra-luma descriptor `[0xab4]` from
+    // `[0xad0]` is a docs ask (README). `reference.ac_luma_sel` is
+    // still carried forward on the picture for the next I-frame-less
+    // consumer.
+    let luma_ac = luma_ac_table_for(ac_selection, hdr.ac_chroma_sel);
     let chroma_ac = chroma_ac_table_for(ac_selection, hdr);
     // Inter residual VLC: the "chroma + all-inter" descriptor slot
     // `[esi+0xab0]` (spec/99 §4.2 caller `1c2147d2` pushes it for all
@@ -779,7 +792,11 @@ fn decode_pframe(
 
     let slice_rows = slice_rows_for(reference.iframe_ext, mb_h);
     for my in 0..mb_h {
-        if my > 0 && my % slice_rows == 0 {
+        // spec/19 §3: `top_slice = (mb_y mod rows_per_slice) != 0`
+        // gates the top / top-left DC-AC predictors AND is passed to
+        // the MV predictor as its top-boundary flag.
+        let top_boundary = my % slice_rows == 0;
+        if my > 0 && top_boundary {
             // Predictor restart at a slice boundary (see
             // `slice_rows_for`); intra-in-P MBs predict within the
             // slice only.
@@ -801,6 +818,7 @@ fn decode_pframe(
                 &inter_ac,
                 mv_table,
                 hdr.mb_skip_enable,
+                top_boundary,
             )
             .map_err(|e| {
                 Error::invalid(format!(
@@ -832,8 +850,7 @@ fn decode_pframe(
 /// [`crate::mv_pred::BlockCandidates`] for [`crate::mv_pred::Block::TopLeft`],
 /// then writes [`crate::mv_pred::MvGridCell::OneMv`] back into the
 /// grid via [`crate::mv_pred::MvGrid::set_cell`] — intra-in-P MBs
-/// leave the cell `Absent` so downstream median predictors treat that
-/// column as zero per the existing semantics.
+/// store a zero MV (spec/06 §3.4; round 459).
 #[allow(clippy::too_many_arguments)]
 fn decode_pframe_mb(
     br: &mut BitReader<'_>,
@@ -850,6 +867,7 @@ fn decode_pframe_mb(
     inter_ac: &AcVlcTable,
     mv_table: crate::mv::MvTable,
     mb_skip_enable: bool,
+    top_boundary: bool,
 ) -> Result<()> {
     use crate::mcbpcy::{decode_mcbpcy_pframe_opts, PFrameMcbpcy};
 
@@ -902,9 +920,19 @@ fn decode_pframe_mb(
             luma_ac,
             chroma_ac,
         )?;
-        // Intra MBs clear the MV predictor chain: the per-row mv_grid
-        // entry stays `None` so downstream neighbours treat this
-        // column as zero.
+        // An intra MB contributes a **zero MV** to its neighbours'
+        // median predictor (spec/06 §3.4 loads every neighbour from
+        // the MV store and zero-substitutes only picture-boundary
+        // sides; the intra MB's store entry is zero). Round 459: with
+        // the cell left `Absent` the §7.6.5 promotion rule handed the
+        // next MB its top neighbour's MV verbatim and the DIV3/DIV4
+        // fixtures drifted from the MB after the first intra-in-P MB;
+        // as a zero candidate they decode.
+        mv_grid.set_cell(
+            mb_x,
+            mb_y,
+            crate::mv_pred::MvGridCell::OneMv(crate::mv::Mv::default()),
+        );
         return Ok(());
     }
 
@@ -952,7 +980,7 @@ fn decode_pframe_mb(
     // instead of `median(neighbour, 0, 0) = 0`. This affects the first
     // inter MB after a row of intra MBs at row 0 (`left` is the sole
     // valid neighbour) and the analogous edge cases.
-    let predictor = one_mv_predictor(mv_grid, mb_x, mb_y);
+    let predictor = one_mv_predictor(mv_grid, mb_x, mb_y, top_boundary);
     let mv_bit0 = br.bit_position();
     let mv = crate::mv::decode_mv_with_table(br, predictor, mv_table)?;
     if std::env::var_os("OXIDEAV_MSMPEG4_AC_TRACE").is_some() {
@@ -1000,8 +1028,17 @@ fn decode_pframe_mb(
 /// and the v1/v2 P-frame path — per spec/07 §3.5 the v1/v2 MV decoder
 /// body calls the *same* median-of-3 predictor helper (`0x1c217c8c`)
 /// as v3, with identical semantics.
-fn one_mv_predictor(mv_grid: &crate::mv_pred::MvGrid, mb_x: usize, mb_y: usize) -> crate::mv::Mv {
-    let nset = mv_grid.neighbour_set_for(mb_x, mb_y);
+///
+/// `top_boundary` is spec/19 §3's `top_slice == 0`: on the first MB
+/// row of a slice the above / above-right neighbours are unavailable
+/// exactly as on picture row 0.
+fn one_mv_predictor(
+    mv_grid: &crate::mv_pred::MvGrid,
+    mb_x: usize,
+    mb_y: usize,
+    top_boundary: bool,
+) -> crate::mv::Mv {
+    let nset = mv_grid.neighbour_set_for_slice(mb_x, mb_y, top_boundary);
     // Build the §7.6.5 candidate set for the 1-MV-per-MB case (Figure
     // 7-34 top-left sub-diagram) through the spec-derived resolver
     // (round 214) rather than hand-picking the neighbour bytes. For a
@@ -1304,9 +1341,13 @@ fn decode_pframe_mb_v1v2(
             intra_luma_ac,
             intra_chroma_ac,
         )?;
-        // Intra MBs clear the MV predictor chain: leave the mv_grid cell
-        // `Absent` so downstream neighbours treat this column as zero
-        // (same convention as the v3 intra-in-P path).
+        // Intra MBs contribute a zero MV to the neighbours' median
+        // predictor (same convention as the v3 intra-in-P path).
+        mv_grid.set_cell(
+            mb_x,
+            mb_y,
+            crate::mv_pred::MvGridCell::OneMv(crate::mv::Mv::default()),
+        );
         return Ok(());
     }
 
@@ -1337,7 +1378,7 @@ fn decode_pframe_mb_v1v2(
             // v3 per spec/07 §3.5), two separate component reads against
             // the shared 65-entry table (spec/07 §3.2), bias subtract +
             // toroidal wrap inside `decode_mv_v1v2`.
-            let predictor = one_mv_predictor(mv_grid, mb_x, mb_y);
+            let predictor = one_mv_predictor(mv_grid, mb_x, mb_y, false);
             let mv = crate::mv::decode_mv_v1v2(br, predictor)?;
             mv_grid.set_cell(mb_x, mb_y, crate::mv_pred::MvGridCell::OneMv(mv));
             apply_mc_to_mb(pic, reference, mb_x, mb_y, (mv.x as i32, mv.y as i32));
@@ -1768,6 +1809,17 @@ fn decode_intra_mb_with_header(
             4 => dc_cache.chroma_set(false, bx, by, reconstructed_dc),
             5 => dc_cache.chroma_set(true, bx, by, reconstructed_dc),
             _ => unreachable!(),
+        }
+        if std::env::var_os("OXIDEAV_MSMPEG4_AC_TRACE").is_some() {
+            eprintln!(
+                "[iblk trace] mb=({mb_x},{mb_y}) blk={block_idx} cbp={cbp_set} scan={scan:?} pred={:?} pred_level={} dc_level={} dc={} nz={} bit={}",
+                pred.direction,
+                pred.predictor,
+                block_result.dc_level,
+                block_result.coeffs[0],
+                block_result.ac_nonzero,
+                br.bit_position(),
+            );
         }
         let mut pels = [0i32; 64];
         idct8x8_to_pel(&block_result.coeffs, &mut pels);
@@ -2874,7 +2926,7 @@ mod tests {
         grid.set_cell(1, 0, MvGridCell::OneMv(above));
         grid.set_cell(2, 0, MvGridCell::OneMv(above_right));
 
-        let got = one_mv_predictor(&grid, 1, 1);
+        let got = one_mv_predictor(&grid, 1, 1, false);
         let want = predict_block_mv(
             Block::TopLeft,
             &BlockCandidates {
@@ -2930,7 +2982,7 @@ mod tests {
         grid.set_cell(1, 0, MvGridCell::FourMv(above4));
         grid.set_cell(2, 0, MvGridCell::FourMv(above_right4));
 
-        let got = one_mv_predictor(&grid, 1, 1);
+        let got = one_mv_predictor(&grid, 1, 1, false);
         let want = predict_block_mv(
             Block::TopLeft,
             &BlockCandidates {
