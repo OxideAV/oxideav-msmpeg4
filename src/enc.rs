@@ -641,6 +641,10 @@ pub fn encode_pframe_v3_with_stats(
     // `AC_CHROMA_SEL = 2` that is G5 luma / G4 chroma.
     let intra_luma_ac = v3_luma_table_for_sel(AC_CHROMA_SEL);
     let intra_chroma_ac = AcVlcTable::v3_intra_g4();
+    // Half-pel rounding state of this P-frame, mirroring the decoder
+    // (`Picture::next_p_rounding`; the reference is the decoder-side
+    // reconstruction so both sides toggle in lockstep).
+    let rounding = reference.next_p_rounding();
     let mut mv_grid = MvGrid::new(mb_w, mb_h);
     // DC-prediction cache for intra-in-P MBs, mirroring the decoder's
     // per-P-frame cache: only intra MBs write cells; everything else
@@ -666,6 +670,7 @@ pub fn encode_pframe_v3_with_stats(
                 &inter_ac,
                 &intra_luma_ac,
                 &intra_chroma_ac,
+                rounding,
             )?;
             match kind {
                 MbKind::Skip => stats.skip_mbs += 1,
@@ -746,6 +751,7 @@ fn predict_mb_luma(
     mb_x: usize,
     mb_y: usize,
     mv_half: (i32, i32),
+    rounding: u8,
 ) -> [u8; 256] {
     let (ref_y, _, _) = ref_planes(reference);
     let mut luma = [0u8; 256];
@@ -758,13 +764,20 @@ fn predict_mb_luma(
         mv_half.0,
         mv_half.1,
         16,
+        rounding,
     );
     luma
 }
 
 /// Full luma + chroma MC prediction for one MB, mirroring
 /// `mc::mc_macroblock`'s per-plane kernel calls.
-fn predict_mb(reference: &Picture, mb_x: usize, mb_y: usize, mv_half: (i32, i32)) -> MbPrediction {
+fn predict_mb(
+    reference: &Picture,
+    mb_x: usize,
+    mb_y: usize,
+    mv_half: (i32, i32),
+    rounding: u8,
+) -> MbPrediction {
     let (ref_y, ref_cb, ref_cr) = ref_planes(reference);
     let mut pred = MbPrediction {
         luma: [0u8; 256],
@@ -780,12 +793,13 @@ fn predict_mb(reference: &Picture, mb_x: usize, mb_y: usize, mv_half: (i32, i32)
         mv_half.0,
         mv_half.1,
         16,
+        rounding,
     );
     let (cmx, cmy) = chroma_mv_from_luma(mv_half);
     let cx = (mb_x * 8) as i32;
     let cy = (mb_y * 8) as i32;
-    mc_block(&ref_cb, &mut pred.cb, 8, cx, cy, cmx, cmy, 8);
-    mc_block(&ref_cr, &mut pred.cr, 8, cx, cy, cmx, cmy, 8);
+    mc_block(&ref_cb, &mut pred.cb, 8, cx, cy, cmx, cmy, 8, rounding);
+    mc_block(&ref_cr, &mut pred.cr, 8, cx, cy, cmx, cmy, 8, rounding);
     pred
 }
 
@@ -799,8 +813,15 @@ fn mv_predictor(grid: &MvGrid, mb_x: usize, mb_y: usize) -> Mv {
 }
 
 /// Luma SAD between the input MB and the reference MC'd at `mv`.
-fn mb_sad(input: &Picture, reference: &Picture, mb_x: usize, mb_y: usize, mv: (i32, i32)) -> u32 {
-    let pred = predict_mb_luma(reference, mb_x, mb_y, mv);
+fn mb_sad(
+    input: &Picture,
+    reference: &Picture,
+    mb_x: usize,
+    mb_y: usize,
+    mv: (i32, i32),
+    rounding: u8,
+) -> u32 {
+    let pred = predict_mb_luma(reference, mb_x, mb_y, mv, rounding);
     let mut sad = 0u32;
     for j in 0..16 {
         let row = (mb_y * 16 + j) * input.y_stride + mb_x * 16;
@@ -864,6 +885,7 @@ fn motion_search(
     component_reachable: fn(i8, i8) -> bool,
     quant: u32,
     coder: MvCoder,
+    rounding: u8,
 ) -> Mv {
     let reachable =
         |mv: Mv| component_reachable(mv.x, predictor.x) && component_reachable(mv.y, predictor.y);
@@ -882,7 +904,14 @@ fn motion_search(
         if !reachable(mv) {
             return;
         }
-        let sad = mb_sad(input, reference, mb_x, mb_y, (mv.x as i32, mv.y as i32));
+        let sad = mb_sad(
+            input,
+            reference,
+            mb_x,
+            mb_y,
+            (mv.x as i32, mv.y as i32),
+            rounding,
+        );
         let cost = sad as u64 + quant as u64 * mv_rate_bits(coder, predictor, mv) as u64;
         if cost < best_cost {
             best_cost = cost;
@@ -934,6 +963,7 @@ fn encode_pframe_mb_v3(
     inter_ac: &AcVlcTable,
     intra_luma_ac: &AcVlcTable,
     intra_chroma_ac: &AcVlcTable,
+    rounding: u8,
 ) -> Result<MbKind> {
     let predictor = mv_predictor(mv_grid, mb_x, mb_y);
     let mv = motion_search(
@@ -946,6 +976,7 @@ fn encode_pframe_mb_v3(
         mv_component_reachable,
         quant,
         MvCoder::V3(MvTable::Default),
+        rounding,
     );
 
     // Scene-change refuge: when even the best MC prediction is worse
@@ -953,7 +984,14 @@ fn encode_pframe_mb_v3(
     // intra (joint MCBPCY I-type half, idx = cbp < 64). The decoder
     // stores a zero MV for intra MBs (round 459), so the predictor
     // chain sees the same neighbourhood on both sides.
-    let inter_sad = mb_sad(input, reference, mb_x, mb_y, (mv.x as i32, mv.y as i32));
+    let inter_sad = mb_sad(
+        input,
+        reference,
+        mb_x,
+        mb_y,
+        (mv.x as i32, mv.y as i32),
+        rounding,
+    );
     if mb_intra_activity(input, mb_x, mb_y) + INTRA_IN_P_MARGIN < inter_sad {
         let (plans, _cbpy, _cbp_cb, _cbp_cr) = analyse_intra_mb(input, dc_cache, mb_x, mb_y, quant);
         let ac_pred = choose_ac_pred_opts(
@@ -986,7 +1024,7 @@ fn encode_pframe_mb_v3(
     }
 
     // Residual analysis over all 6 blocks at the chosen MV.
-    let (levels, coded) = analyse_inter_residual(input, reference, mb_x, mb_y, mv, quant);
+    let (levels, coded) = analyse_inter_residual(input, reference, mb_x, mb_y, mv, quant, rounding);
     let any_coded = coded.iter().any(|&c| c);
     if mv == (Mv { x: 0, y: 0 }) && !any_coded {
         // Skip MB: 1-bit flag, decoder copies the reference at (0, 0)
@@ -1025,8 +1063,9 @@ fn analyse_inter_residual(
     mb_y: usize,
     mv: Mv,
     quant: u32,
+    rounding: u8,
 ) -> ([[i32; 64]; 6], [bool; 6]) {
-    let pred = predict_mb(reference, mb_x, mb_y, (mv.x as i32, mv.y as i32));
+    let pred = predict_mb(reference, mb_x, mb_y, (mv.x as i32, mv.y as i32), rounding);
     analyse_residual_with_pred(input, &pred, mb_x, mb_y, quant)
 }
 
@@ -1069,7 +1108,13 @@ fn analyse_residual_with_pred(
 /// half-pel luma MVs in Figure 6-8 raster order plus the §7.6.3.4
 /// sum/2K + Table 7-12 chroma derivation — mirroring
 /// `mc::mc_macroblock_4mv`'s kernel calls.
-fn predict_mb_4mv(reference: &Picture, mb_x: usize, mb_y: usize, mvs: [Mv; 4]) -> MbPrediction {
+fn predict_mb_4mv(
+    reference: &Picture,
+    mb_x: usize,
+    mb_y: usize,
+    mvs: [Mv; 4],
+    rounding: u8,
+) -> MbPrediction {
     let (ref_y, ref_cb, ref_cr) = ref_planes(reference);
     let mut pred = MbPrediction {
         luma: [0u8; 256],
@@ -1095,6 +1140,7 @@ fn predict_mb_4mv(reference: &Picture, mb_x: usize, mb_y: usize, mvs: [Mv; 4]) -
             mvx,
             mvy,
             8,
+            rounding,
         );
         for j in 0..8 {
             for i2 in 0..8 {
@@ -1105,8 +1151,8 @@ fn predict_mb_4mv(reference: &Picture, mb_x: usize, mb_y: usize, mvs: [Mv; 4]) -
     let (cmx, cmy) = chroma_mv_from_four_luma(mvs_half);
     let cx = (mb_x * 8) as i32;
     let cy = (mb_y * 8) as i32;
-    mc_block(&ref_cb, &mut pred.cb, 8, cx, cy, cmx, cmy, 8);
-    mc_block(&ref_cr, &mut pred.cr, 8, cx, cy, cmx, cmy, 8);
+    mc_block(&ref_cb, &mut pred.cb, 8, cx, cy, cmx, cmy, 8, rounding);
+    mc_block(&ref_cr, &mut pred.cr, 8, cx, cy, cmx, cmy, 8, rounding);
     pred
 }
 
@@ -1119,6 +1165,7 @@ fn block_sad_8(
     mb_y: usize,
     blk: usize,
     mv: Mv,
+    rounding: u8,
 ) -> u32 {
     let (ref_y, _, _) = ref_planes(reference);
     let bx = (blk & 1) * 8;
@@ -1133,6 +1180,7 @@ fn block_sad_8(
         mv.x as i32,
         mv.y as i32,
         8,
+        rounding,
     );
     let mut sad = 0u32;
     for j in 0..8 {
@@ -1152,6 +1200,7 @@ fn block_sad_8(
 /// smallest rate-aware cost (`SAD + quant · mv_bits`, mirroring
 /// [`motion_search`]) among v1/v2-reachable candidates, and commit.
 /// Returns the four final MVs and the total cost.
+#[allow(clippy::too_many_arguments)]
 fn search_inter4v(
     input: &Picture,
     reference: &Picture,
@@ -1160,6 +1209,7 @@ fn search_inter4v(
     mb_y: usize,
     range: u8,
     quant: u32,
+    rounding: u8,
 ) -> ([Mv; 4], u64) {
     let nset = mv_grid.neighbour_set_for(mb_x, mb_y);
     let mut dec = Macroblock4MvDecoderNeighbours::new(nset);
@@ -1169,7 +1219,7 @@ fn search_inter4v(
     for (i, &block) in Block::ALL.iter().enumerate() {
         let predictor = dec.predictor_for(block);
         let mut best = predictor; // always reachable (residual 0)
-        let mut best_cost = block_sad_8(input, reference, mb_x, mb_y, i, best) as u64
+        let mut best_cost = block_sad_8(input, reference, mb_x, mb_y, i, best, rounding) as u64
             + quant as u64 * mv_rate_bits(MvCoder::V1V2, predictor, best) as u64;
         for &(cx, cy) in &[(0i32, 0i32), (predictor.x as i32, predictor.y as i32)] {
             for dy in -r..=r {
@@ -1188,7 +1238,7 @@ fn search_inter4v(
                     {
                         continue;
                     }
-                    let cost = block_sad_8(input, reference, mb_x, mb_y, i, cand) as u64
+                    let cost = block_sad_8(input, reference, mb_x, mb_y, i, cand, rounding) as u64
                         + quant as u64 * mv_rate_bits(MvCoder::V1V2, predictor, cand) as u64;
                     if cost < best_cost {
                         best_cost = cost;
@@ -1333,6 +1383,8 @@ pub fn encode_pframe_v1v2_with_stats(
     // pair as the v1/v2 I-frame path.
     let intra_luma_ac = AcVlcTable::v3_intra_g5();
     let intra_chroma_ac = AcVlcTable::g4_inter();
+    // v1/v2 keep the fixed `+1` half-pel rounding (see `crate::mc`).
+    let rounding = 0u8;
     let mut mv_grid = MvGrid::new(mb_w, mb_h);
     let mut dc_cache = DcCache::for_v1v2(mb_w, mb_h);
     let mut stats = PFrameStats {
@@ -1353,6 +1405,7 @@ pub fn encode_pframe_v1v2_with_stats(
                 mv_v1v2_component_reachable,
                 quant,
                 MvCoder::V1V2,
+                rounding,
             );
 
             // Scene-change refuge (same census rule as v3): when the
@@ -1362,7 +1415,14 @@ pub fn encode_pframe_v1v2_with_stats(
             // §1.4), v2 intra quotient (mcbpc = 4 + cbpc, post-MCBPC
             // ac_pred bit, spec/07 §2.4). Intra MBs store a zero MV
             // in the grid, mirroring the decoder.
-            let inter_sad = mb_sad(input, reference, mx, my, (mv.x as i32, mv.y as i32));
+            let inter_sad = mb_sad(
+                input,
+                reference,
+                mx,
+                my,
+                (mv.x as i32, mv.y as i32),
+                rounding,
+            );
             if mb_intra_activity(input, mx, my) + INTRA_IN_P_MARGIN < inter_sad {
                 let (plans, cbpy, cbp_cb, cbp_cr) =
                     analyse_intra_mb(input, &mut dc_cache, mx, my, quant);
@@ -1409,7 +1469,14 @@ pub fn encode_pframe_v1v2_with_stats(
             // emitted. The v2 8-symbol MCBPC alphabet has no INTER4V
             // code (spec/16 §3.3), so v2 never takes this branch.
             let inter4v = if version == MsV1V2Version::V1 && config.mv_search_range > 0 {
-                let cost_1mv = mb_sad(input, reference, mx, my, (mv.x as i32, mv.y as i32)) as u64
+                let cost_1mv = mb_sad(
+                    input,
+                    reference,
+                    mx,
+                    my,
+                    (mv.x as i32, mv.y as i32),
+                    rounding,
+                ) as u64
                     + quant as u64 * mv_rate_bits(MvCoder::V1V2, predictor, mv) as u64;
                 let (mvs4, cost_4mv) = search_inter4v(
                     input,
@@ -1419,6 +1486,7 @@ pub fn encode_pframe_v1v2_with_stats(
                     my,
                     config.mv_search_range,
                     quant,
+                    rounding,
                 );
                 let uniform = mvs4.iter().all(|&m| m == mvs4[0]);
                 if !uniform && cost_4mv < cost_1mv {
@@ -1431,7 +1499,7 @@ pub fn encode_pframe_v1v2_with_stats(
             };
 
             if let Some(mvs4) = inter4v {
-                let pred = predict_mb_4mv(reference, mx, my, mvs4);
+                let pred = predict_mb_4mv(reference, mx, my, mvs4, rounding);
                 let (levels, coded) = analyse_residual_with_pred(input, &pred, mx, my, quant);
                 let cbpy = (coded[0] as u8) << 3
                     | (coded[1] as u8) << 2
@@ -1460,7 +1528,8 @@ pub fn encode_pframe_v1v2_with_stats(
                 continue;
             }
 
-            let (levels, coded) = analyse_inter_residual(input, reference, mx, my, mv, quant);
+            let (levels, coded) =
+                analyse_inter_residual(input, reference, mx, my, mv, quant, rounding);
             let any_coded = coded.iter().any(|&c| c);
 
             if mv == (Mv { x: 0, y: 0 }) && !any_coded {

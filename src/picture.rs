@@ -123,6 +123,10 @@ pub struct Picture {
     /// persists into the following P-frames (spec/99 §2.3), so a
     /// P-frame decode reads it from its reference picture.
     pub ac_luma_sel: u8,
+    /// The half-pel averaging rounding this P-frame's prediction used
+    /// (0 → `+1 >> 1`, 1 → `+0 >> 1`; see `crate::mc`). I-frames hold 0.
+    /// The next P-frame derives its own from [`Self::next_p_rounding`].
+    pub mc_rounding: u8,
     /// The 5-bit I-frame header field (`MsV3PictureHeader::iframe_ext`)
     /// in force, carried forward through P-frames like `ac_luma_sel`
     /// (it sizes the predictor slices, see [`slice_rows_for`]).
@@ -146,6 +150,17 @@ impl Picture {
             picture_type,
             ac_luma_sel: 0,
             iframe_ext: 0,
+            mc_rounding: 0,
+        }
+    }
+
+    /// The half-pel rounding a v3 P-frame predicted from this picture
+    /// uses: `0` right after an I-frame, then toggling on every P-frame
+    /// (round 459, fixture-arbitrated — see `crate::mc`).
+    pub fn next_p_rounding(&self) -> u8 {
+        match self.picture_type {
+            PictureType::I => 0,
+            PictureType::P => self.mc_rounding ^ 1,
         }
     }
 }
@@ -729,6 +744,9 @@ fn decode_pframe(
 
     let (mb_w, mb_h) = dims.mb_dims();
     let quant = hdr.quant as u32;
+    // Half-pel rounding state for this P-frame (see `crate::mc`).
+    let rounding = reference.next_p_rounding();
+    pic.mc_rounding = rounding;
     // Intra-in-P prediction context (spec/18 §7): only intra MBs write
     // records; inter / skipped neighbours resolve to the default
     // records computed from this P-frame's PQUANT.
@@ -819,6 +837,7 @@ fn decode_pframe(
                 mv_table,
                 hdr.mb_skip_enable,
                 top_boundary,
+                rounding,
             )
             .map_err(|e| {
                 Error::invalid(format!(
@@ -868,6 +887,7 @@ fn decode_pframe_mb(
     mv_table: crate::mv::MvTable,
     mb_skip_enable: bool,
     top_boundary: bool,
+    rounding: u8,
 ) -> Result<()> {
     use crate::mcbpcy::{decode_mcbpcy_pframe_opts, PFrameMcbpcy};
 
@@ -892,7 +912,7 @@ fn decode_pframe_mb(
             mb_y,
             crate::mv_pred::MvGridCell::OneMv(crate::mv::Mv::default()),
         );
-        apply_mc_to_mb(pic, reference, mb_x, mb_y, (0, 0));
+        apply_mc_to_mb(pic, reference, mb_x, mb_y, (0, 0), rounding);
         return Ok(());
     }
 
@@ -999,7 +1019,14 @@ fn decode_pframe_mb(
 
     // Lay down the motion-compensated prediction first; the residual
     // (decoded below) is added on top of it.
-    apply_mc_to_mb(pic, reference, mb_x, mb_y, (mv.x as i32, mv.y as i32));
+    apply_mc_to_mb(
+        pic,
+        reference,
+        mb_x,
+        mb_y,
+        (mv.x as i32, mv.y as i32),
+        rounding,
+    );
 
     decode_inter_residual_blocks(
         br,
@@ -1314,7 +1341,7 @@ fn decode_pframe_mb_v1v2(
             mb_y,
             crate::mv_pred::MvGridCell::OneMv(crate::mv::Mv::default()),
         );
-        apply_mc_to_mb(pic, reference, mb_x, mb_y, (0, 0));
+        apply_mc_to_mb(pic, reference, mb_x, mb_y, (0, 0), 0);
         return Ok(());
     }
 
@@ -1381,7 +1408,7 @@ fn decode_pframe_mb_v1v2(
             let predictor = one_mv_predictor(mv_grid, mb_x, mb_y, false);
             let mv = crate::mv::decode_mv_v1v2(br, predictor)?;
             mv_grid.set_cell(mb_x, mb_y, crate::mv_pred::MvGridCell::OneMv(mv));
-            apply_mc_to_mb(pic, reference, mb_x, mb_y, (mv.x as i32, mv.y as i32));
+            apply_mc_to_mb(pic, reference, mb_x, mb_y, (mv.x as i32, mv.y as i32), 0);
         }
         4 => {
             // INTER4V: decode one MVD per Figure 6-8 block in raster
@@ -1406,7 +1433,7 @@ fn decode_pframe_mb_v1v2(
                 (block_mvs[2].x as i32, block_mvs[2].y as i32),
                 (block_mvs[3].x as i32, block_mvs[3].y as i32),
             ];
-            apply_mc_4mv_to_mb(pic, reference, mb_x, mb_y, mvs_half);
+            apply_mc_4mv_to_mb(pic, reference, mb_x, mb_y, mvs_half, 0);
         }
         other => {
             return Err(Error::invalid(format!(
@@ -1647,6 +1674,7 @@ fn apply_mc_to_mb(
     mb_x: usize,
     mb_y: usize,
     mv_half: (i32, i32),
+    rounding: u8,
 ) {
     let ref_y = crate::mc::RefPlane {
         data: &reference.y,
@@ -1678,6 +1706,7 @@ fn apply_mc_to_mb(
         mb_x,
         mb_y,
         mv_half,
+        rounding,
     );
 }
 
@@ -1691,6 +1720,7 @@ fn apply_mc_4mv_to_mb(
     mb_x: usize,
     mb_y: usize,
     block_mvs_half: [(i32, i32); 4],
+    rounding: u8,
 ) {
     let ref_y = crate::mc::RefPlane {
         data: &reference.y,
@@ -1722,6 +1752,7 @@ fn apply_mc_4mv_to_mb(
         mb_x,
         mb_y,
         block_mvs_half,
+        rounding,
     );
 }
 
@@ -3130,13 +3161,13 @@ mod tests {
         // motion-compensated at the *propagated* MV. If the predictor
         // works, the decoder's MB(1,0) luma equals this.
         let mut expected = Picture::alloc(dims, PictureType::P);
-        apply_mc_to_mb(&mut expected, &reference, 1, 0, exp_mv_half);
+        apply_mc_to_mb(&mut expected, &reference, 1, 0, exp_mv_half, 0);
 
         // And a zero-MV copy of MB(1,0) — what a broken (dropped) predictor
         // would produce. The two must differ, else the inequality below is
         // vacuous (it isn't: the reference pattern varies across the shift).
         let mut zero_mv = Picture::alloc(dims, PictureType::P);
-        apply_mc_to_mb(&mut zero_mv, &reference, 1, 0, (0, 0));
+        apply_mc_to_mb(&mut zero_mv, &reference, 1, 0, (0, 0), 0);
 
         // Compare MB(1,0)'s 16x16 luma block: columns 16..32, rows 0..16.
         let stride = pic.y_stride;
@@ -3275,9 +3306,9 @@ mod tests {
         // MB(1,0) must reconstruct at exp_mv_half (its raw residual, since
         // the predictor is all-zero). Build the independent expectation.
         let mut expected = Picture::alloc(dims, PictureType::P);
-        apply_mc_to_mb(&mut expected, &reference, 1, 0, exp_mv_half);
+        apply_mc_to_mb(&mut expected, &reference, 1, 0, exp_mv_half, 0);
         let mut zero_mv = Picture::alloc(dims, PictureType::P);
-        apply_mc_to_mb(&mut zero_mv, &reference, 1, 0, (0, 0));
+        apply_mc_to_mb(&mut zero_mv, &reference, 1, 0, (0, 0), 0);
 
         let stride = pic.y_stride;
         let mut matches_residual = true;

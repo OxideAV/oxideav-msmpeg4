@@ -940,6 +940,7 @@ fn v1_pframe_inter4v_neighbour_propagates_block2_mv_to_next_mb() {
         1, // mb_x = 1
         0, // mb_y = 0
         (propagated.x as i32, propagated.y as i32),
+        0,
     );
 
     // Compare MB(1,0)'s 16x16 luma against the independent reconstruction.

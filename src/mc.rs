@@ -17,6 +17,18 @@
 //!   I-type/P-type split and **no** INTER4V code, and no traced v3
 //!   bitstream signal selects 4-MV (docs gap #1895), so the v3 picture
 //!   decoder is 1-MV-per-MB.
+//! * Half-pel rounding control. spec/04 §3.1 / spec/99 §4.6 read the MC
+//!   kernels (`0x1c22f01c` MMX / `0x1c22d7db`) as a fixed
+//!   `(a + b + 1) >> 1`; the DIV3/DIV4 fixtures (round 459) require the
+//!   MPEG-4-style alternation instead: the first P-frame after an
+//!   I-frame averages with `+1 >> 1` / `+2 >> 2`, the next with
+//!   `+0 >> 1` / `+1 >> 2`, toggling on every P-frame and resetting at
+//!   each I-frame ([`crate::picture::Picture::next_p_rounding`]). With
+//!   the fixed rule every half-pel macroblock of the second P-frame is
+//!   off by one (84 % luma-exact); with the toggle the whole 50-frame
+//!   clips stay at max |Δ| 2 (~97 % luma-exact). No docs trace covers
+//!   a per-frame rounding state; the README records the ask. v1/v2
+//!   keep the fixed `+1` rounding (no fixture arbitrates them).
 //! * Chroma 8×8 MC. For a 1-MV MB the chroma component is the luma MV
 //!   halved with the H.263 §6.1.1 quarter-to-half rounding
 //!   ([`chroma_mv_from_luma`]). For an INTER4V
@@ -69,7 +81,11 @@ pub fn mc_block(
     mv_x_half: i32,
     mv_y_half: i32,
     block_size: usize,
+    rounding: u8,
 ) {
+    // Half-pel rounding control (see the module doc): 0 → `+1 >> 1` /
+    // `+2 >> 2`, 1 → `+0 >> 1` / `+1 >> 2`.
+    let r = (rounding & 1) as u32;
     // Split half-pel MV into integer + fractional.
     let int_x = mv_x_half >> 1; // arithmetic shift (sign-preserving)
     let int_y = mv_y_half >> 1;
@@ -88,20 +104,20 @@ pub fn mc_block(
                 (1, 0) => {
                     let a = reference.sample(ix, iy) as u32;
                     let b = reference.sample(ix + 1, iy) as u32;
-                    ((a + b + 1) >> 1) as u8
+                    ((a + b + 1 - r) >> 1) as u8
                 }
                 (0, 1) => {
                     let a = reference.sample(ix, iy) as u32;
                     let b = reference.sample(ix, iy + 1) as u32;
-                    ((a + b + 1) >> 1) as u8
+                    ((a + b + 1 - r) >> 1) as u8
                 }
                 _ => {
-                    // (1, 1): 2D bilinear with +2 rounding.
+                    // (1, 1): 2D bilinear with +2 (or +1) rounding.
                     let a = reference.sample(ix, iy) as u32;
                     let b = reference.sample(ix + 1, iy) as u32;
                     let c = reference.sample(ix, iy + 1) as u32;
                     let d = reference.sample(ix + 1, iy + 1) as u32;
-                    ((a + b + c + d + 2) >> 2) as u8
+                    ((a + b + c + d + 2 - r) >> 2) as u8
                 }
             };
             let off = (j) * dst_stride + i;
@@ -222,6 +238,7 @@ pub fn mc_macroblock_4mv(
     mb_x: usize,
     mb_y: usize,
     block_mvs_half: [(i32, i32); 4],
+    rounding: u8,
 ) {
     // Four 8x8 luma blocks in Figure 6-8 raster order.
     for (i, &(mvx, mvy)) in block_mvs_half.iter().enumerate() {
@@ -240,6 +257,7 @@ pub fn mc_macroblock_4mv(
                 mvx,
                 mvy,
                 8,
+                rounding,
             );
         }
     }
@@ -259,6 +277,7 @@ pub fn mc_macroblock_4mv(
             cmx,
             cmy,
             8,
+            rounding,
         );
     }
     if chroma_off < dst_cr.len() {
@@ -271,6 +290,7 @@ pub fn mc_macroblock_4mv(
             cmx,
             cmy,
             8,
+            rounding,
         );
     }
 }
@@ -291,6 +311,7 @@ pub fn mc_macroblock(
     mb_x: usize,
     mb_y: usize,
     mv_half: (i32, i32),
+    rounding: u8,
 ) {
     // Luma block top-left in picture coordinates.
     let luma_x = (mb_x * 16) as i32;
@@ -308,6 +329,7 @@ pub fn mc_macroblock(
             mv_half.0,
             mv_half.1,
             16,
+            rounding,
         );
     }
 
@@ -327,6 +349,7 @@ pub fn mc_macroblock(
             cmx,
             cmy,
             8,
+            rounding,
         );
     }
     if chroma_off < dst_cr.len() {
@@ -339,6 +362,7 @@ pub fn mc_macroblock(
             cmx,
             cmy,
             8,
+            rounding,
         );
     }
 }
@@ -369,7 +393,7 @@ mod tests {
             height: h,
         };
         let mut dst = vec![0u8; 16 * 16];
-        mc_block(&rp, &mut dst, 16, 8, 8, 0, 0, 16);
+        mc_block(&rp, &mut dst, 16, 8, 8, 0, 0, 16, 0);
         for y in 0..16 {
             for x in 0..16 {
                 assert_eq!(
@@ -396,7 +420,7 @@ mod tests {
         };
         let mut dst = vec![0u8; 4 * 4];
         // half-pel MV = (1, 0) means 0.5 pixel offset in X.
-        mc_block(&rp, &mut dst, 4, 4, 4, 1, 0, 4);
+        mc_block(&rp, &mut dst, 4, 4, 4, 1, 0, 4, 0);
         for &v in &dst {
             assert_eq!(v, 100);
         }
@@ -504,6 +528,7 @@ mod tests {
             0,
             0,
             [(0, 0); 4],
+            0,
         );
         assert_eq!(dy, y, "four zero-MV luma blocks must copy the MB");
         assert_eq!(dcb, cb);
@@ -560,6 +585,7 @@ mod tests {
             0,
             0,
             [(2, 0), (0, 0), (0, 0), (0, 0)],
+            0,
         );
         for j in 0..8usize {
             for i in 0..8usize {
@@ -590,7 +616,7 @@ mod tests {
         };
         let mut dst = vec![0u8; 4 * 4];
         // MV pushes sampling past the right edge.
-        mc_block(&rp, &mut dst, 4, 14, 14, 20, 20, 4);
+        mc_block(&rp, &mut dst, 4, 14, 14, 20, 20, 4, 0);
         for &v in &dst {
             assert_eq!(v, 50);
         }
