@@ -116,11 +116,27 @@ pub struct AcVlcTable {
     /// only).
     pub lmax: Option<&'static LevelLimitTable>,
     /// RMAX[last_idx][level] — max `run` over all primary alphabet
-    /// symbols with the given `(last, |level|)` pair. The tier-2 escape
-    /// decodes a `run_base` from a re-VLC and emits
-    /// `run_actual = run_base + RMAX[last][level] + 1` per spec/04
-    /// §2.3. `None` disables the tier-2 walk.
+    /// symbols with the given `(last, |level|)` pair; equals the
+    /// binary's own run-extension arrays (descriptor `+0x14` / `+0x18`,
+    /// pinned by `esc_ext_arrays_match_derived_lmax_rmax_all_g`). The
+    /// run-extension escape arm decodes a `run_base` from a re-VLC and
+    /// emits `run_actual = run_base + RMAX[last][level] + run_ext_bias`.
+    /// `None` disables the arm.
     pub rmax: Option<&'static RunLimitTable>,
+    /// Constant added on top of `RMAX` by the run-extension arm — the
+    /// one place the intra and inter kernels' escape ladders differ:
+    ///
+    /// * **0** for the intra kernel (`0x1c216d97`): spec/17 §3,
+    ///   `run = run_lut[s] + run_ext[last][level]`, measured on four
+    ///   hand-built G3 frames and pixel-exact on both arm-2 escapes of
+    ///   the Microsoft `mp43.wmv` I-frame (round 459).
+    /// * **1** for the inter kernel (`0x1c215e6f`, its own copy of the
+    ///   ladder reading the same arrays at `1c216021`/`1c216030`,
+    ///   spec/08 §1): fixture-selected — every `mp43.wmv` P-frame's
+    ///   46 run-extension escapes reconstruct exactly with `+ 1` and
+    ///   drift 2 % of the luma without it (round 459). No docs trace
+    ///   covers the inter arm's arithmetic; see the README docs ask.
+    pub run_ext_bias: u8,
 }
 
 /// LMAX storage: `lmax[last][run]` indexed by `last ∈ {0,1}`, `run ∈
@@ -151,6 +167,7 @@ impl AcVlcTable {
         esc_last_bits: Self::MPEG4_ESC_LAST_BITS,
         esc_run_bits: Self::MPEG4_ESC_RUN_BITS,
         esc_level_bits: Self::MPEG4_ESC_LEVEL_BITS,
+        run_ext_bias: 0,
         lmax: None,
         rmax: None,
     };
@@ -192,6 +209,7 @@ impl AcVlcTable {
             esc_last_bits: Self::MPEG4_ESC_LAST_BITS,
             esc_run_bits: Self::MPEG4_ESC_RUN_BITS,
             esc_level_bits: Self::MPEG4_ESC_LEVEL_BITS,
+            run_ext_bias: 0,
             lmax: Some(g5_lmax()),
             rmax: Some(g5_rmax()),
         }
@@ -209,6 +227,7 @@ impl AcVlcTable {
             esc_last_bits: Self::MPEG4_ESC_LAST_BITS,
             esc_run_bits: Self::MPEG4_ESC_RUN_BITS,
             esc_level_bits: Self::MPEG4_ESC_LEVEL_BITS,
+            run_ext_bias: 0,
             // The inter kernel at `0x1c215d2c` has a 1-tier ESC body
             // only (spec/04 §1.3 step 10). G4 is also used in v3 inter
             // blocks via the per-MB inter driver `1c2147d2`, so we
@@ -233,6 +252,7 @@ impl AcVlcTable {
             esc_last_bits: Self::MPEG4_ESC_LAST_BITS,
             esc_run_bits: Self::MPEG4_ESC_RUN_BITS,
             esc_level_bits: Self::MPEG4_ESC_LEVEL_BITS,
+            run_ext_bias: 0,
             lmax: Some(g4_lmax()),
             rmax: Some(g4_rmax()),
         }
@@ -252,10 +272,16 @@ impl AcVlcTable {
     /// ladder and desynchronises at the first escaped inter block
     /// under the 1-tier reading.
     pub fn inter_for_chroma_sel(sel: u8) -> AcVlcTable {
-        match sel {
+        let base = match sel {
             0 => Self::v3_intra_g2(),
             1 => Self::v3_intra_g0(),
             _ => Self::v3_intra_g4(),
+        };
+        // The inter kernel's run-extension arm adds one on top of the
+        // run-extension array (see `run_ext_bias`).
+        AcVlcTable {
+            run_ext_bias: 1,
+            ..base
         }
     }
 
@@ -288,6 +314,7 @@ impl AcVlcTable {
             esc_last_bits: Self::MPEG4_ESC_LAST_BITS,
             esc_run_bits: Self::MPEG4_ESC_RUN_BITS,
             esc_level_bits: Self::MPEG4_ESC_LEVEL_BITS,
+            run_ext_bias: 0,
             lmax: Some(g0_lmax()),
             rmax: Some(g0_rmax()),
         }
@@ -304,6 +331,7 @@ impl AcVlcTable {
             esc_last_bits: Self::MPEG4_ESC_LAST_BITS,
             esc_run_bits: Self::MPEG4_ESC_RUN_BITS,
             esc_level_bits: Self::MPEG4_ESC_LEVEL_BITS,
+            run_ext_bias: 0,
             lmax: Some(g0_lmax()),
             rmax: Some(g0_rmax()),
         }
@@ -335,6 +363,7 @@ impl AcVlcTable {
             esc_last_bits: Self::MPEG4_ESC_LAST_BITS,
             esc_run_bits: Self::MPEG4_ESC_RUN_BITS,
             esc_level_bits: Self::MPEG4_ESC_LEVEL_BITS,
+            run_ext_bias: 0,
             lmax: Some(g1_lmax()),
             rmax: Some(g1_rmax()),
         }
@@ -347,6 +376,7 @@ impl AcVlcTable {
             esc_last_bits: Self::MPEG4_ESC_LAST_BITS,
             esc_run_bits: Self::MPEG4_ESC_RUN_BITS,
             esc_level_bits: Self::MPEG4_ESC_LEVEL_BITS,
+            run_ext_bias: 0,
             lmax: Some(g1_lmax()),
             rmax: Some(g1_rmax()),
         }
@@ -378,6 +408,7 @@ impl AcVlcTable {
             esc_last_bits: Self::MPEG4_ESC_LAST_BITS,
             esc_run_bits: Self::MPEG4_ESC_RUN_BITS,
             esc_level_bits: Self::MPEG4_ESC_LEVEL_BITS,
+            run_ext_bias: 0,
             lmax: Some(g2_lmax()),
             rmax: Some(g2_rmax()),
         }
@@ -390,6 +421,7 @@ impl AcVlcTable {
             esc_last_bits: Self::MPEG4_ESC_LAST_BITS,
             esc_run_bits: Self::MPEG4_ESC_RUN_BITS,
             esc_level_bits: Self::MPEG4_ESC_LEVEL_BITS,
+            run_ext_bias: 0,
             lmax: Some(g2_lmax()),
             rmax: Some(g2_rmax()),
         }
@@ -427,6 +459,7 @@ impl AcVlcTable {
             esc_last_bits: Self::MPEG4_ESC_LAST_BITS,
             esc_run_bits: Self::MPEG4_ESC_RUN_BITS,
             esc_level_bits: Self::MPEG4_ESC_LEVEL_BITS,
+            run_ext_bias: 0,
             lmax: Some(g3_lmax()),
             rmax: Some(g3_rmax()),
         }
@@ -439,6 +472,7 @@ impl AcVlcTable {
             esc_last_bits: Self::MPEG4_ESC_LAST_BITS,
             esc_run_bits: Self::MPEG4_ESC_RUN_BITS,
             esc_level_bits: Self::MPEG4_ESC_LEVEL_BITS,
+            run_ext_bias: 0,
             lmax: Some(g3_lmax()),
             rmax: Some(g3_rmax()),
         }
@@ -952,14 +986,23 @@ pub fn decode_token(br: &mut BitReader<'_>, table: &AcVlcTable) -> Result<Token>
 /// at `0x1c216f5f` — its 1-bit `last` is the block terminator and its
 /// 8-bit level carries its own sign (spec/17 §3: no sign bit follows).
 ///
-/// Selector-2 = `1` was never emitted across 7472 traced escapes; the
-/// only body left in the kernel for it is spec/04 §2.3's second
-/// escape at `0x1c216f02` (re-VLC + symbol-indexed run offset), so
-/// this decoder routes it to the run-extension re-VLC
-/// (`run = base + RMAX[last][|level|] + 1`). That arm is an
-/// inference from the kernel layout, not a traced observation; no
-/// Microsoft-produced stream exercises it and this crate's encoder
-/// never emits it.
+/// Selector-2 = `1` is the run-extension arm, pinned in spec/17 §3
+/// (rounds 26–28, `tables/tcoef-escape-arm2.csv`): one more codeword
+/// `s` from the same table (`s == ESC` is the kernel's error exit),
+/// `last = (s ≥ desc[+8] + 1)` — i.e. the symbol's own sub-class —
+/// `level = level_lut[s]`, `run = run_lut[s] + run_ext[last][level]`,
+/// then one sign bit; **no** fixed-length field follows. `run_ext` is
+/// the per-`(last, |level|)` maximum run of the bound alphabet
+/// (`RMAX`): the four hand-built G3 probes of spec/17 §3 measure
+/// `s ∈ {0, 5, 83, 84}` → run 20 / 3 / 39 / 40 with `run_lut[s]` = 0 /
+/// 0 / 19 / 20 and G3's `RMAX[0][1] = 20`, `RMAX[0][6] = 3`. The
+/// vendor encoder never emits the arm, but the Microsoft-encoded
+/// `mp43.wmv` fixture does (I-frame MB (9,6) luma block 1, round
+/// 459), and its reconstruction is pixel-exact only under this rule —
+/// the earlier `+ 1` (MPEG-4 Part 2 §7.4.1.4 style) reading put the
+/// run one position too far. The **inter** kernel's own copy of the
+/// arm does add one (`AcVlcTable::run_ext_bias`, fixture-selected on
+/// the same stream's P-frames). This crate's encoder never emits it.
 ///
 /// The inter kernel (`lmax`/`rmax` = None) has a single verbatim FLC
 /// tier directly after the marker (spec/04 §1.3 step 10).
@@ -1015,7 +1058,9 @@ fn decode_escape_body(br: &mut BitReader<'_>, table: &AcVlcTable) -> Result<Toke
     if !selector_2 {
         return decode_escape_flc(br, table, trace);
     }
-    // Selector-2 = 1: run-extension re-VLC (inferred arm, see above).
+    // Selector-2 = 1: run-extension re-VLC (spec/17 §3, see above):
+    // `run = run_lut[s] + run_ext[last][level]` (+ the kernel's
+    // `run_ext_bias`: 0 intra, 1 inter).
     match vlc::decode_named(br, table.entries, "ac esc run-ext re-vlc")? {
         Symbol::RunLevel { last, run, level } => {
             let last_idx = if last { 1 } else { 0 };
@@ -1024,8 +1069,10 @@ fn decode_escape_body(br: &mut BitReader<'_>, table: &AcVlcTable) -> Result<Toke
             } else {
                 0
             };
-            let run_actual = ((run as u16).saturating_add(rmax_value).saturating_add(1))
-                .min(u8::MAX as u16) as u8;
+            let run_actual = ((run as u16)
+                .saturating_add(rmax_value)
+                .saturating_add(table.run_ext_bias as u16))
+            .min(u8::MAX as u16) as u8;
             let sign = br.read_bit()?;
             let signed = if sign { -(level as i32) } else { level as i32 };
             if trace {
@@ -1573,6 +1620,7 @@ mod tests {
             esc_last_bits: AcVlcTable::MPEG4_ESC_LAST_BITS,
             esc_run_bits: AcVlcTable::MPEG4_ESC_RUN_BITS,
             esc_level_bits: AcVlcTable::MPEG4_ESC_LEVEL_BITS,
+            run_ext_bias: 0,
             // Toy table exercises the verbatim-only path; the 3-tier
             // walk is covered by the dedicated G5 escape tests.
             lmax: None,
@@ -1844,11 +1892,67 @@ mod tests {
     }
 
     #[test]
+    fn esc_arm2_matches_the_spec17_g3_probes() {
+        // spec/17 §3: four hand-built frames under the G3 luma table
+        // with `s ∈ {0, 5, 83, 84}` measured run 20 / 3 / 39 / 40,
+        // level 1 / 6 / 1 / 1 negated by the sign bit, `last = 0` even
+        // at s = 84 (threshold s ≥ 85 = the sub-class boundary).
+        let t = AcVlcTable::v3_intra_g3();
+        let esc_entry = t
+            .entries
+            .iter()
+            .find(|e| matches!(e.value, Symbol::Escape))
+            .expect("G3 ESC entry");
+        let sym = |want_run: u8, want_level: u16| {
+            t.entries
+                .iter()
+                .find(|e| {
+                    matches!(e.value, Symbol::RunLevel { last: false, run, level }
+                        if run == want_run && level == want_level)
+                })
+                .unwrap_or_else(|| panic!("G3 (last 0, run {want_run}, level {want_level})"))
+        };
+        // (s, run_lut[s], level_lut[s], measured run, measured level)
+        for (run_lut, level_lut, want_run, want_level) in [
+            (0u8, 1u16, 20u8, -1i16),
+            (0, 6, 3, -6),
+            (19, 1, 39, -1),
+            (20, 1, 40, -1),
+        ] {
+            let e = sym(run_lut, level_lut);
+            let bytes = pack(&[
+                (esc_entry.code, esc_entry.bits as u32),
+                (0, 1), // selector 1 = 0
+                (1, 1), // selector 2 = 1 → run-extension arm
+                (e.code, e.bits as u32),
+                (1, 1), // sign = 1 → negate
+            ]);
+            let mut br = BitReader::new(&bytes);
+            let tok = decode_token(&mut br, &t).expect("decode arm-2 body");
+            assert!(!tok.last, "s=(run {run_lut}, level {level_lut}): last");
+            assert_eq!(
+                tok.run, want_run,
+                "s=(run {run_lut}, level {level_lut}): run"
+            );
+            assert_eq!(
+                tok.level, want_level,
+                "s=(run {run_lut}, level {level_lut}): level"
+            );
+        }
+        // The G3 sub-class boundary sits at idx 85 (idx 84 = last 0,
+        // run 20, level 1 is the alphabet's longest level-1 run), so
+        // `last = (s >= 85)` is the symbol's own `last` flag.
+        let rmax = t.rmax.expect("G3 RMAX");
+        assert_eq!(rmax[0][1], 20);
+        assert_eq!(rmax[0][6], 3);
+    }
+
+    #[test]
     fn esc_tier2_extends_run_via_rmax() {
         // Tier 2 = run extension: ESC marker → selector bit `0` →
         // re-VLC (= idx 0 (run=0, level=1, last=0)) → sign. RMAX[0][1]
         // = 14 (max run for sub-A level 1). So run_actual =
-        // 0 + 14 + 1 = 15.
+        // 0 + 14 = 14 (spec/17 §3: no `+ 1`).
         let t = AcVlcTable::v3_intra_g5();
         let esc_entry = t
             .entries
@@ -1866,10 +1970,7 @@ mod tests {
         let tok = decode_token(&mut br, &t).expect("decode tier-2 ESC body");
         assert_eq!(tok.last, false);
         assert_eq!(tok.level, 1, "tier 2: level untouched (= re-VLC value)");
-        assert_eq!(
-            tok.run, 15,
-            "tier 2: run = base(0) + RMAX[0][1](14) + 1 = 15"
-        );
+        assert_eq!(tok.run, 14, "tier 2: run = base(0) + RMAX[0][1](14) = 14");
     }
 
     #[test]

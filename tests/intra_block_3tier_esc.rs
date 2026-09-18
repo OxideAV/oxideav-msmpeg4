@@ -315,9 +315,10 @@ fn intra_block_tier_1_esc_level_extension() {
 // =====================================================================
 
 /// Run-extension arm (spec/17 §3 ladder): ESC → selector-1 `0` →
-/// selector-2 `1` → primary VLC → sign. The emitted run is `run_base + RMAX[last][|level|] + 1`. Use
+/// selector-2 `1` → primary VLC → sign. On the intra kernel the emitted
+/// run is `run_base + RMAX[last][|level|]` (no `+ 1`, spec/17 §3). Use
 /// inner = idx 0 (run=0, level=1, last=false): RMAX[0][1] = 14 per
-/// audit/01 §4.1, so the emitted run is 0 + 14 + 1 = 15.
+/// audit/01 §4.1, so the emitted run is 0 + 14 = 14.
 #[test]
 fn intra_block_tier_2_esc_run_extension() {
     let pred_dc = 1024i32;
@@ -351,9 +352,9 @@ fn intra_block_tier_2_esc_run_extension() {
     )
     .expect("intra block with tier-2 ESC decodes");
 
-    // Tier-2 token: run = 15, level = 1. Position after start_pos=1 is
-    // 1 + 15 = 16.
-    let expected_pos = 16;
+    // Tier-2 token: run = 14, level = 1. Position after start_pos=1 is
+    // 1 + 14 = 15.
+    let expected_pos = 15;
     let expected_level = expected_dequantised_ac(1, quant);
     assert_eq!(
         block.coeffs[ZIGZAG[expected_pos]], expected_level,

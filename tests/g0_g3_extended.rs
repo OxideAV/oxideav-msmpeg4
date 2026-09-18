@@ -343,16 +343,17 @@ fn g0_synthetic_esc_tier1_level_extension() {
 fn g1_synthetic_esc_tier2_run_extension() {
     // spec/17 §3 ladder: ESC marker + selector-1 `0` + selector-2 `1`
     // ⇒ run-extension arm: the next decoded (last, run_base, |level|)
-    // becomes (last, run_base + RMAX[last][level] + 1, level).
+    // becomes (last, run_base + RMAX[last][level], level) on the intra
+    // kernel (no `+ 1`, spec/17 §3).
     let g = GExtended::G1;
     let count_a = g.count_a();
     let bl = synthetic_bl(count_a);
     let table = AcVlcTable::v3_intra_g1_synthetic();
 
     // Pick base idx 0 = (last=0, run=0, level=1). The run-extension
-    // tier gives run_actual = 0 + RMAX[0][1] + 1.
+    // tier gives run_actual = 0 + RMAX[0][1].
     let rmax_0_1 = table.rmax.unwrap()[0][1];
-    let expected_run = rmax_0_1 + 1;
+    let expected_run = rmax_0_1;
     let bytes = pack(&[
         (count_a as u32, bl), // ESC marker
         (0, 1),               // selector 1 = 0
@@ -363,7 +364,7 @@ fn g1_synthetic_esc_tier2_run_extension() {
     let mut br = BitReader::new(&bytes);
     let tok = decode_token(&mut br, &table).expect("tier-2 ESC decode");
     assert!(!tok.last);
-    assert_eq!(tok.run, expected_run, "tier-2 run = run_base + RMAX + 1");
+    assert_eq!(tok.run, expected_run, "tier-2 run = run_base + RMAX");
     assert_eq!(tok.level, 1);
 }
 

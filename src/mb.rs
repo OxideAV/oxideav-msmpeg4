@@ -926,6 +926,7 @@ mod tests {
             esc_level_bits: AcVlcTable::MPEG4_ESC_LEVEL_BITS,
             lmax: None,
             rmax: None,
+            run_ext_bias: 0,
         };
 
         // ac_pred=0, CBPY=15 (all 4 luma blocks coded; code `11`),
