@@ -635,24 +635,27 @@ struct Expectations {
 }
 
 const EXPECTATIONS: &[Expectations] = &[
-    // div3.avi: I-frames fully parse; P-frames drift (round 452).
+    // div3.avi (round 459): 50/50 frames, aggregate Y 96.9 %, frame 0
+    // 99.42 % at max |Δ| 1 — the residue is the black-box reference's
+    // IDCT rounding (see `ffmpeg_decode_to_yuv`).
     Expectations {
-        min_decoded: 45,
-        min_y_match_pct: 5.0,
-        min_frame0_y_pct: 97.0,
+        min_decoded: 50,
+        min_y_match_pct: 94.0,
+        min_frame0_y_pct: 99.0,
     },
-    // div4.avi: same tier as div3.
+    // div4.avi (round 459): 50/50 frames, aggregate Y 97.3 %.
     Expectations {
-        min_decoded: 45,
-        min_y_match_pct: 5.0,
-        min_frame0_y_pct: 97.0,
+        min_decoded: 50,
+        min_y_match_pct: 94.0,
+        min_frame0_y_pct: 99.0,
     },
     // mp43.wmv: full-clip decode; frame 49's packet is truncated in
-    // the container, so 49 of 50.
+    // the container, so 49 of 50. Round 459: aggregate Y 96.7 %,
+    // frame 0 99.72 % at max |Δ| 1.
     Expectations {
         min_decoded: 49,
         min_y_match_pct: 95.0,
-        min_frame0_y_pct: 99.0,
+        min_frame0_y_pct: 99.5,
     },
 ];
 

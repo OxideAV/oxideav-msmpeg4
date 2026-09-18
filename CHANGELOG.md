@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Round 459 — spec/19 applied: exact IDCT, level-domain prediction
+  context, slice law; DIV3/DIV4 P-frames decode end-to-end.**
+  1. **Exact integer IDCT** (spec/19 §1): the float kernel is replaced
+     by the vendor's Chen–Wang butterfly in its MMX int16/23-bit lane
+     form (`idct8x8_int`, normative per §1.4) with the exact scalar
+     form (`idct8x8_scalar`) as reference; pixel-exact on the
+     hardware-grade saturation probe (128/128 samples), constants
+     pinned against the staged extractions. The fixture harness now
+     runs the black-box reference with its `int` IDCT selection (its
+     default kernel rounds a DC-only 636 to 79 where the vendor
+     arithmetic gives 80).
+  2. **Run-extension escape arm** (spec/17 §3): `run = run_lut[s] +
+     RMAX[last][level]` on the intra kernel (the `+ 1` was one
+     position too far — the arm IS exercised by `mp43.wmv`, two
+     I-frame blocks go pixel-exact); the inter kernel keeps `+ 1`
+     (`AcVlcTable::run_ext_bias`, fixture-selected).
+  3. **Level-domain DC/AC prediction context** (spec/19 §2): records
+     hold DC levels, unavailable neighbours resolve to the per-plane
+     default record `floor(1024 / dc_scaler + 0.5)`, the direction rule
+     runs in the level domain; v1/v2 DC scaler is the constant 8
+     (spec/99 §10.2). `DcCache::for_v3_quant` / `for_v1v2` / `reset`.
+  4. **P-frames**: intra-in-P luma binds the luma class of the
+     P-frame's selector (G1 on the DIV3/DIV4 fixtures; G0..G5 sweep);
+     intra MBs contribute a zero MV to the median predictor (spec/06
+     §3.4); the MV predictor's top side is gated at slice boundaries
+     (spec/19 §3); chroma MV from a single luma MV uses the H.263
+     §6.1.1 quarter-to-half rounding; half-pel averaging alternates
+     `+1` / `+0` per P-frame and resets at I-frames (both
+     fixture-arbitrated, docs asks in the README). Encoder mirrors all
+     of it (its reconstruction is the production decoder).
+  5. **Slice law** (spec/19 §3): `iframe_ext ≤ 22` and `value − 22 >
+     mb_rows` are rejected; `rows_per_slice = floor(mb_rows / (value −
+     22))`.
+  6. **Runtime DC codebooks** (spec/99 §0.1 row 29): the hex-derived
+     intra-DC VLCs are pinned against the staged
+     `intra-dcsize-*-runtime.csv` tables (120 records each, ESC 119).
+  7. **Fuzz**: `fuzz/` sub-crate with `decode_v3`, `decode_v1v2`,
+     `idct`, `encode_roundtrip` targets + nightly Fuzz workflow; zero
+     findings in the round's foreground runs.
+  Scorecard (black-box `int` reference): mp43 49/50 frames, frame 0
+  99.72 % / 99.88 % / 99.83 % Y/U/V at max |Δ| 1, aggregate 96.7 %;
+  div3 and div4 50/50 frames (from 47/50), frame 0 99.42 % at
+  max |Δ| 1, aggregate 96.9 % / 97.3 % Y at max |Δ| 2 (from 12 % /
+  16 %). Harness minimums raised accordingly.
+
 ## [0.0.10](https://github.com/OxideAV/oxideav-msmpeg4/compare/v0.0.9...v0.0.10) - 2026-08-30
 
 ### Other

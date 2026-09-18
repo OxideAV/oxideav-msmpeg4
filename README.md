@@ -67,42 +67,53 @@ codes for 0 of 128 symbols).
 
 Round 452 applied the spec/17 + spec/18 docs stagings (intra MB layer +
 escape ladder; inter MB header) and re-arbitrated every open semantic
-on the pinned Microsoft fixtures: the TCOEF escape ladder's two
-selector bits and signed fixed-length arm, the per-I-frame 5-bit header
-field and the predictor slices it sizes, intra AC **coefficient**
-prediction, the coded-bit luma-CBP spatial predictor, quantised-domain
-DC prediction, half-down IDCT rounding, the P-frame `mb_skip_enable`
-header bit, the intra-only `ac_pred` element of the joint MB header,
-the selector-bound inter AC descriptor (with the same escape ladder on
-v2/v3 inter blocks), and `ac_luma_sel` persistence into P-frames. The
-definitive Microsoft stream (`mp43.wmv`, WMFSDK 7) now decodes
-end-to-end: every I-frame parses 400/400 MBs, frames 44..48 are fully
-pixel-exact, and the other P-frames hold ~84% pixel-exact MBs (the
-residual is float-vs-integer IDCT rounding, not parse); the DIV3 AVI
-fixtures' I-frames parse 330/330 at ~99% exact luma (see "What's still
-open" for their P-frame drift).
+on the pinned Microsoft fixtures; round 459 applied spec/19 (the
+decoder's IDCT, the intra prediction context and the slice law) and
+closed the P-frame frontier of the third-party DIV3/DIV4 fixtures.
+
+**Round 459 scorecard** (`tests/microsoft_fixtures.rs`, black-box
+reference decode with its `int` IDCT selection — see the caveat below):
+
+| Fixture | Frames | Frame 0 (I) Y / U / V exact | Aggregate Y / U / V | max \|Δ\| |
+| --- | --- | --- | --- | --- |
+| `mp43.wmv` (Microsoft, 400×250, 2 slices) | 49/50 (frame 49 truncated in the container) | 99.72 % / 99.88 % / 99.83 % | 96.7 % / 98.6 % / 98.6 % | 1 (I), ≤ 5 by frame 40 |
+| `div3.avi` (third-party, 352×240) | 50/50 | 99.42 % / 99.56 % / 99.80 % | 96.9 % / 96.8 % / 99.0 % | 1 (I), 2 (every P) |
+| `div4.avi` (third-party, 352×240) | 50/50 | 99.42 % / 99.84 % / 99.83 % | 97.3 % / 99.2 % / 99.5 % | 1 (I), 2 (every P) |
+
+Before round 459: mp43 98.5 % / 99.6 % / 99.5 % with frame 0 at 99.71 %
+and max |Δ| 17; div3 / div4 decoded 47/50 frames at 12 % / 16 % Y
+(P-frames desynchronised at the first intra-in-P macroblock).
+
+Every remaining difference is ±1 (I-frames) growing to ±2..5 through a
+GOP: the black-box reference's `int` IDCT is not the vendor arithmetic
+either (its default kernel rounds a DC-only 636 to 79 where spec/19 §1
+gives 80, and scored 53 % against the exact kernel), and the ±1
+residue it leaves on ~0.5 % of intra samples accumulates through
+motion compensation. The crate implements spec/19 §1.4's MMX lane
+model, pixel-exact on the hardware-grade saturation probe
+(`tables/idct-mmx-saturation-probe.csv`, 128/128 samples).
 
 | Piece                                          | Status     |
 | ---------------------------------------------- | ---------- |
 | Bitstream classifier (`classify`)              | complete   |
 | V3 picture-header parser (I / P)               | complete   |
 | Scan tables (zigzag + alternate H/V)           | complete   |
-| IDCT (float reference)                         | complete   |
+| IDCT (spec/19 §1 exact integer kernel: MMX int16/23-bit lane model, scalar reference form) | complete (round 459; hardware-grade saturation probe 128/128) |
 | Quantiser dequantisation + DC scalers          | complete   |
 | CBPY + DC-size VLCs                             | complete   |
 | Intra MB header + DC differential decode       | complete   |
 | Joint MCBPCY VLC (v3 **P-frames**, 128-entry, extracted wire codes) | complete (round 405 wire codes, Kraft=1.0; round 420 pinned the table as P-frame-only per its staged `tables-ff` companion role) |
 | Intra CBPCY VLC (v3 **I-frames**, 64-entry, XOR-predicted luma bits) | complete (round 420: re-aligned `region_05eed0` ≡ staged `msmp4-mb-i-table`, Kraft=1.0; patent 7,054,494 CBPCY-XOR rule pinned on both DIV3 fixtures) |
-| DC spatial predictor + AC scan dispatcher      | complete   |
+| DC/AC prediction context (level domain, spec/19 §2 default record, slice restart) | complete (round 459) |
 | Intra MB pipeline (DC pred + IDCT + store)     | complete   |
 | G0..G5 canonical-Huffman primary AC VLC        | complete   |
-| MS-MPEG4v3 intra/inter TCOEF escape ladder     | complete (spec/17 §3 selector-1/selector-2 dispatch; LMAX/RMAX for all 6 G-families; run-extension arm is an inference — unobserved on Microsoft streams) |
+| MS-MPEG4v3 intra/inter TCOEF escape ladder     | complete (spec/17 §3 selector-1/selector-2 dispatch; LMAX/RMAX for all 6 G-families; run-extension arm `run = run_lut[s] + RMAX` pinned on the spec/17 G3 probes and on two `mp43.wmv` I-frame blocks; the inter kernel's copy adds 1 — fixture-selected, see docs asks) |
 | Inter AC residual (`ac_chroma_sel`-bound G2/G0/G4 VLC → IDCT → add to MC) | complete (round 452: per-frame descriptor binding + intra-kernel escape ladder on v2/v3 inter blocks) |
-| P-frame MV VLC + half-pel MC (default + alt)   | complete (decodes against extracted wire codes, spec/16 §1; alt-table byte-LUT selection picture-level-pinned, round 362) |
+| P-frame MV VLC + half-pel MC (default + alt)   | complete (decodes against extracted wire codes, spec/16 §1; alt-table byte-LUT selection picture-level-pinned, round 362; round 459: H.263-style chroma-MV rounding + per-P-frame half-pel rounding alternation, both fixture-arbitrated — see docs asks) |
 | P-frame 1-MV predictor (Figure 7-34)           | complete (picture-level median-propagation pin, round 359) |
 | 4-MV-per-MB predictor surface + neighbour resolver | complete (per-block bordering-cell pick; INTER4V→1-MV-neighbour propagation picture-level-pinned, round 366) |
 | V3 intra-luma I-frame end-to-end via `decode_picture` | complete |
-| Intra-in-P MB (v1/v2/v3) picture-level pixel path | complete (round 374: v3 + v1/v2 intra-in-P pinned end-to-end through `decode_picture`; ac_pred scan-flip on a CBP-coded block, v1 zigzag-only, intra-in-P → `Absent` predictor cell) |
+| Intra-in-P MB (v1/v2/v3) picture-level pixel path | complete (round 459: DIV3/DIV4 intra-in-P MBs decode — luma AC table = luma class of the P-frame selector, default-record predictors for inter neighbours per spec/18 §7, zero-MV grid cell) |
 | V1 / V2 P-frame pixel pipeline (incl. INTER+Q + INTER4V) | complete (INTER4V luma + §7.6.3.4 chroma + per-MB-neighbour propagation picture-level-pinned, round 366) |
 | V1 P-frame MB-type table (`MB_TYPE_V1_INFO`)   | complete (binary-extracted, spec/16 §3) |
 | V1 / V2 intra pipeline (I-frame + intra-in-P)  | complete (size+value DC, spec/16 §2) |
@@ -116,46 +127,63 @@ open" for their P-frame drift).
 
 ## What's still open for real-content decode
 
-- **V3 real-content decode (round 452 frontier)**: spec/17 + spec/18
-  closed the round-420 asks — the escape-body selector routing
-  (selector-1 `1` = level extension; `0`,`0` = the signed verbatim FLC
-  arm), the raw chroma CBP bits, and the inter MB header's
-  intra-only `ac_pred` element are all pinned by the docs and
-  validated on the fixtures. The mid-frame drift is resolved: it was
-  the compound of the mis-shaped escape ladder, missing intra AC
-  coefficient prediction, the DC-gradient CBP predictor, pel-domain DC
-  prediction, and (on MP43) the un-modelled predictor slices.
-  Remaining opens, in Microsoft-fixture priority order:
-  1. **Exact IDCT**: the crate's float IDCT with half-down rounding
-     leaves scattered ±1-pel diffs against the reference decode
-     (~60/400 MBs per busy MP43 frame; they accumulate slowly across a
-     GOP but re-zero at each I-frame). **Docs ask**: transcribe the
-     DLL's non-MMX integer IDCT (`1c20d426..1c20e4be` + constant
-     tables `0x1c2610f0` / `0x1c261138` / `0x1c261360`) so the kernel
-     can be integer-exact.
-  2. **DIV3/DIV4 P-frame drift**: both third-party-encoded AVI
-     fixtures decode structurally (skip-disable header bit `0` → no
-     skip prefixes, alternate MV table, G0 inter) but drift from the
-     first **intra-in-P** macroblock; the reference reconstructs
-     those MBs with DC values our neutral-predictor intra-in-P path
-     does not reach. No Microsoft-produced fixture exercises
-     intra-in-P at all (mp43.wmv codes zero intra MBs in 49
-     P-frames), so the Microsoft-ground-truth rule can't arbitrate.
-     **Docs ask**: trace the v3 intra-in-P DC/AC prediction context —
-     what the DLL uses as the DC predictor when the causal neighbours
-     are inter MBs (neutral 1024, or a value derived from the
-     reconstructed neighbour pels), and whether the CBP/AC prediction
-     state survives inter MBs.
-  3. **`iframe_ext` semantics**: the 5-bit per-I-frame field (23 on
-     both 352x240 fixtures and every spec/17-traced 176x144 frame; 24
-     on the 400x250 MP43 stream) is modelled as `slices = value − 22`
-     with DC/AC prediction restarting per slice — it fits all three
-     fixtures but is an inference from two observed values. **Docs
-     ask**: trace the `1c21224b` consumer.
-  4. **Selector-2 = 1 escape arm**: unobserved in 7472 traced escapes
-     (spec/17 §3); decoded as the run-extension re-VLC per the
-     kernel-layout inference. Any stream that actually exercises it
-     would firm this up.
+- **V3 real-content decode (round 459 frontier)**: the three Microsoft
+  fixtures decode end-to-end (scorecard above). What remains is
+  docs-side — rules the fixtures arbitrated that no staged trace
+  covers, plus one reference-side limitation:
+  1. **Reference planes.** The harness reference is a black-box decode
+     whose IDCT is not the vendor kernel; `spec/19` §4 lists
+     hardware-grade vendor planes (`provenance/sandbox-04/outputs/`)
+     that sit outside the Implementer wall. **Docs ask**: stage those
+     three `.planes.yuv` files (+ their input streams) under
+     `tables/` or a wall-legal fixtures directory so the crate can
+     assert 100 % sample-exactness against the vendor decoder instead
+     of a ±1 proxy.
+  2. **Inter-kernel run-extension arm.** spec/17 §3 pins the intra
+     kernel's `run = run_lut[s] + run_ext[last][level]`; the inter
+     kernel (`0x1c215e6f`, its own copy of the ladder at
+     `1c216021`/`1c216030`, spec/08 §1) needs `+ 1` on every one of
+     the 46 run-extension escapes of the `mp43.wmv` P-frames. **Docs
+     ask**: trace `0x1c215fdb..0x1c216040` — is there an `inc` /
+     `+1` after the `run_ext` load, and is the `last` threshold the
+     same `desc[+8] + 1`?
+  3. **Intra-in-P luma table binding.** spec/99 §2.3 says `[esi+0xad4]`
+     persists from the I-frame into P-frames; both DIV3/DIV4 fixtures
+     decode their intra-in-P luma blocks only through the luma class
+     of the **P-frame's** selector (`{G3, G1, G5}[[0xad0]]`, G1 here)
+     and desynchronise under the persisted G5. **Docs ask**: trace
+     the P-frame descriptor copy at `1c2138d1..1c2138f3` — which
+     selector indexes the live intra-luma slot `[0xab4]` on
+     P-frames?
+  4. **Chroma MV rounding.** The crate uses the H.263 §6.1.1
+     quarter-to-half rule (`|v| = 4k+1 → 2k+1`); the binary's
+     byte-indexed chroma-MV LUT at `0x1c23a7d8` (spec/99 §3.3) is not
+     staged. **Docs ask**: extract the LUT into `tables/`.
+  5. **Half-pel rounding alternation.** spec/04 §3.1 / spec/99 §4.6
+     read the MC kernels as a fixed `(a + b + 1) >> 1`; the DIV3/DIV4
+     fixtures need the MPEG-4-style toggle (`+1` on the first P-frame
+     after an I-frame, `+0` on the next, alternating; reset by every
+     I-frame) or every half-pel macroblock of the second P-frame is
+     off by one. **Docs ask**: trace the rounding constant of
+     `0x1c22f01c` / `0x1c22d7db` (and the second MC vtable
+     `ds:0x1c2ae500`, spec/05 §2.2) for per-frame state.
+  6. **MV predictor with an intra neighbour.** spec/06 §3.4 loads
+     every neighbour from the MV store; the crate now stores a zero
+     MV for intra-in-P macroblocks (the §7.6.5 promotion of the
+     remaining neighbour desynchronised both fixtures). **Docs ask**:
+     confirm the MB loop writes `(0, 0)` to the MV store for intra
+     macroblocks.
+  7. **`iframe_ext` read frequency.** spec/19 §3 says the field is
+     read once per decoder instance; every I-frame of the three
+     fixtures carries it (the DIV3 clips' second I-frame at frame 36
+     included) and the crate reads it on every I-frame. **Docs ask**:
+     is the `[esi+0xb2c]` guard reset per keyframe by the ICM wrapper?
+- **V1 / V2 header fields (spec/99 §2.4, §0.1 row 28)**: the crate's
+  v1/v2 picture header does not yet read the first-I-frame 5-bit
+  `iframe_ext` (v1: rows per slice = value; v2: the v3 law) nor the
+  v2 P-frame skip-enable bit, and still reads a v1 P-frame UMV bit
+  that row 28 refutes. Encoder and decoder are symmetric today and no
+  v1/v2 fixture exists; scheduled as a follow-up.
 - **V3 4-MV-per-MB picture decode (hard docs gap #1895)**: the
   predictor / neighbour-resolver surface is complete and is exercised
   end-to-end on the v1 P-frame INTER4V path (`spec/16` §3.1, the real
