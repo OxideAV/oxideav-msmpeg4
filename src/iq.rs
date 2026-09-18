@@ -151,6 +151,12 @@ pub const C_DC_SCALE_TABLE: [u8; 32] = [
 
 /// Intra DC scaler — `block_idx` 0..=3 selects luma, 4..=5 selects
 /// chroma. Panics if `quant > 31`.
+/// The v1 / v2 intra DC scaler: a constant 8 (spec/99 §10.2, object
+/// slots `0x128 / 0x12c` — "v3: MPEG-4 Table 7-2 function of PQUANT;
+/// v1/v2: 8"; spec/19 §2.2: the v1/v2 default record is 128 because
+/// the scaler is 8). Only v3 consults [`dc_scaler`].
+pub const DC_SCALER_V1V2: u32 = 8;
+
 pub fn dc_scaler(block_idx: usize, quant: u32) -> u32 {
     let q = quant as usize;
     if block_idx < 4 {

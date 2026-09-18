@@ -41,7 +41,7 @@ use crate::ac::{encode_inter_ac, encode_intra_ac, AcVlcTable, Scan};
 use crate::dc_pred::DcCache;
 use crate::header::{MsV3PictureHeader, PictureType};
 use crate::idct::fdct8x8_from_pels;
-use crate::iq::{dc_scaler, quantise_block_h263};
+use crate::iq::quantise_block_h263;
 use crate::mb::{encode_intra_dc_diff_v1v2, encode_intra_dc_diff_v3};
 use crate::mc::{chroma_mv_from_four_luma, chroma_mv_from_luma, mc_block, RefPlane};
 use crate::mcbpcy::{
@@ -186,7 +186,7 @@ pub fn encode_iframe_v3_opts(
     let (mb_w, mb_h) = dims.mb_dims();
     let quant = config.quant as u32;
 
-    let mut dc_cache = DcCache::new(mb_w, mb_h);
+    let mut dc_cache = DcCache::for_v3_quant(mb_w, mb_h, quant);
     let mut mbs = Vec::with_capacity(mb_w * mb_h);
     for my in 0..mb_h {
         for mx in 0..mb_w {
@@ -254,18 +254,20 @@ fn analyse_intra_mb(
             _ => unreachable!(),
         };
 
-        // DC prediction happens in the quantised domain (the decoder's
-        // `reconstruct_intra_dc` / `predicted_dc_level`), so quantise
-        // the target DC first and difference the levels.
-        let scaler = dc_scaler(block_idx, quant) as i32;
+        // DC prediction happens in the level domain (spec/19 §2.3; the
+        // decoder's `reconstruct_intra_dc_level`), so quantise the
+        // target DC first and difference the levels. The scaler is the
+        // v3 PQUANT table or the v1/v2 constant 8, carried by the
+        // cache's defaults.
+        let scaler = dc_cache.dc_scaler(block_idx) as i32;
         let dc_level = (f[0] / scaler as f32).round() as i32;
-        let pred_level = crate::mb::predicted_dc_level(pred.predictor, scaler);
+        let pred_level = pred.predictor;
         let dc_diff = (dc_level - pred_level).clamp(-255, 255);
-        let dc_recon = crate::mb::reconstruct_intra_dc(dc_diff, pred.predictor, block_idx, quant);
+        let dc_recon_level = crate::mb::reconstruct_intra_dc_level(dc_diff, pred_level);
         match block_idx {
-            0..=3 => dc_cache.luma_set(bx, by, dc_recon),
-            4 => dc_cache.chroma_set(false, bx, by, dc_recon),
-            5 => dc_cache.chroma_set(true, bx, by, dc_recon),
+            0..=3 => dc_cache.luma_set(bx, by, dc_recon_level),
+            4 => dc_cache.chroma_set(false, bx, by, dc_recon_level),
+            5 => dc_cache.chroma_set(true, bx, by, dc_recon_level),
             _ => unreachable!(),
         }
 
@@ -645,7 +647,7 @@ pub fn encode_pframe_v3_with_stats(
     // DC-prediction cache for intra-in-P MBs, mirroring the decoder's
     // per-P-frame cache: only intra MBs write cells; everything else
     // predicts against the neutral substitution.
-    let mut dc_cache = DcCache::new(mb_w, mb_h);
+    let mut dc_cache = DcCache::for_v3_quant(mb_w, mb_h, quant);
     let mut stats = PFrameStats {
         total_mbs: mb_w * mb_h,
         ..Default::default()
@@ -1239,7 +1241,7 @@ pub fn encode_iframe_v1v2(
 
     let luma_ac = AcVlcTable::v3_intra_g5();
     let chroma_ac = AcVlcTable::g4_inter();
-    let mut dc_cache = DcCache::new(mb_w, mb_h);
+    let mut dc_cache = DcCache::for_v1v2(mb_w, mb_h);
 
     for my in 0..mb_h {
         for mx in 0..mb_w {
@@ -1333,7 +1335,7 @@ pub fn encode_pframe_v1v2_with_stats(
     let intra_luma_ac = AcVlcTable::v3_intra_g5();
     let intra_chroma_ac = AcVlcTable::g4_inter();
     let mut mv_grid = MvGrid::new(mb_w, mb_h);
-    let mut dc_cache = DcCache::new(mb_w, mb_h);
+    let mut dc_cache = DcCache::for_v1v2(mb_w, mb_h);
     let mut stats = PFrameStats {
         total_mbs: mb_w * mb_h,
         ..Default::default()
@@ -1937,7 +1939,7 @@ mod tests {
         let luma = v3_luma_table_for_sel(0);
         let chroma = v3_chroma_table_for_sel(0);
         let (mb_w, mb_h) = dims.mb_dims();
-        let mut dc_cache = DcCache::new(mb_w, mb_h);
+        let mut dc_cache = DcCache::for_v3_quant(mb_w, mb_h, quant);
         let mut fired = 0usize;
         for my in 0..mb_h {
             for mx in 0..mb_w {
@@ -2005,7 +2007,7 @@ mod tests {
 
             // Re-run the analysis and force the historical selectors.
             let (mb_w, mb_h) = dims.mb_dims();
-            let mut dc_cache = DcCache::new(mb_w, mb_h);
+            let mut dc_cache = DcCache::for_v3_quant(mb_w, mb_h, quant as u32);
             let mut mbs = Vec::new();
             for my in 0..mb_h {
                 for mx in 0..mb_w {

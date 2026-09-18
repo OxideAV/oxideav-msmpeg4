@@ -455,18 +455,15 @@ pub fn slice_rows_for(iframe_ext: u8, mb_h: usize) -> usize {
 /// (4 luma + 2 chroma), dequantises, IDCTs, and writes the reconstructed
 /// pel values into the output planes.
 ///
-/// Per MPEG-4 Part 2 §7.4.3 / MSMPEG4 spec/03 §1.3, each block's DC
-/// coefficient is predicted from the gradient of three already-decoded
-/// neighbours (left `A`, top `B`, top-left diagonal `D`):
-///
-///   * `|A - D| < |A - B|` → predict from `A` (left);
-///   * otherwise → predict from `B` (top).
-///
-/// Missing neighbours (picture edges) are substituted with the neutral
-/// value `1024`. The prediction direction also drives the AC-scan
-/// dispatcher — left-predicted blocks scan alt-horizontal,
-/// top-predicted blocks scan alt-vertical (spec/04 §4.4). When the
-/// MB-level `ac_pred_flag` is off, zigzag is used regardless.
+/// Per spec/19 §2.3, each block's DC level is predicted from the
+/// gradient of three already-decoded neighbour records (left `L`, top
+/// `T`, top-left `TL`): `|TL − T| ≥ |TL − L|` → predict from `T`
+/// (top), otherwise from `L` (left). Unavailable neighbours (picture
+/// edges, the row above a slice boundary) resolve to the per-plane
+/// default record (`floor(1024 / dc_scaler + 0.5)`, AC 0). The
+/// prediction direction also drives the AC-scan dispatcher and the
+/// AC predictor strip (spec/19 §2.4) when the MB-level `ac_pred` is
+/// set; otherwise zigzag with no AC prediction.
 fn decode_iframe(
     br: &mut BitReader<'_>,
     dims: PictureDims,
@@ -477,11 +474,12 @@ fn decode_iframe(
 ) -> Result<()> {
     let (mb_w, mb_h) = dims.mb_dims();
 
-    // DC prediction cache — one entry per 8×8 block (luma 2×mb per MB,
-    // chroma 1×1 per MB per plane). See `dc_pred::DcCache`.
-    let mut dc_cache = DcCache::new(mb_w, mb_h);
-
     let quant = hdr.quant as u32;
+    // DC/AC prediction context — one record per 8×8 block (luma 2×2
+    // per MB, chroma 1 per MB per plane) plus the per-plane default
+    // records of spec/19 §2.2. See `dc_pred::DcCache`.
+    let mut dc_cache = DcCache::for_v3_quant(mb_w, mb_h, quant);
+
     let luma_ac = luma_ac_table_for(ac_selection, hdr.ac_luma_sel);
     let chroma_ac = chroma_ac_table_for(ac_selection, hdr);
 
@@ -496,7 +494,7 @@ fn decode_iframe(
             // Predictor restart at a slice boundary (see
             // `slice_rows_for`): DC and AC prediction start over; the
             // CBP prediction grid is kept.
-            dc_cache = DcCache::new(mb_w, mb_h);
+            dc_cache.reset();
         }
         for mx in 0..mb_w {
             decode_intra_mb_iframe_v3(
@@ -619,6 +617,7 @@ fn decode_intra_mb_iframe_v3(
                     a
                 },
                 ac_nonzero: 0,
+                dc_level: crate::mb::reconstruct_intra_dc_level(dc_diff, pred.predictor),
             }
         } else {
             let ac_pred_src = if ac_pred {
@@ -672,7 +671,7 @@ fn decode_intra_mb_iframe_v3(
             );
         }
 
-        let reconstructed_dc = block_result.coeffs[0];
+        let reconstructed_dc = block_result.dc_level;
         match block_idx {
             0..=3 => dc_cache.luma_set(bx, by, reconstructed_dc),
             4 => dc_cache.chroma_set(false, bx, by, reconstructed_dc),
@@ -729,8 +728,11 @@ fn decode_pframe(
     }
 
     let (mb_w, mb_h) = dims.mb_dims();
-    let mut dc_cache = DcCache::new(mb_w, mb_h);
     let quant = hdr.quant as u32;
+    // Intra-in-P prediction context (spec/18 §7): only intra MBs write
+    // records; inter / skipped neighbours resolve to the default
+    // records computed from this P-frame's PQUANT.
+    let mut dc_cache = DcCache::for_v3_quant(mb_w, mb_h, quant);
     // `ac_luma_sel` is not on the P-frame wire; the value transmitted
     // by the most recent I-frame persists (spec/99 §2.3) and travels
     // on the reference picture. Round 452: the DIV3 fixtures' intra-in-P
@@ -781,7 +783,7 @@ fn decode_pframe(
             // Predictor restart at a slice boundary (see
             // `slice_rows_for`); intra-in-P MBs predict within the
             // slice only.
-            dc_cache = DcCache::new(mb_w, mb_h);
+            dc_cache.reset();
         }
         for mx in 0..mb_w {
             decode_pframe_mb(
@@ -1213,7 +1215,7 @@ fn decode_pframe_v1v2(
     let mut mv_grid = crate::mv_pred::MvGrid::new(mb_w, mb_h);
     // DC prediction cache for the intra-in-P MBs (the spatial DC
     // predictor is shared with the I-frame path / v3 per spec/99 §4.4).
-    let mut dc_cache = DcCache::new(mb_w, mb_h);
+    let mut dc_cache = DcCache::for_v1v2(mb_w, mb_h);
 
     for my in 0..mb_h {
         for mx in 0..mb_w {
@@ -1418,7 +1420,7 @@ fn decode_iframe_v1v2(
 
     let (mb_w, mb_h) = dims.mb_dims();
     let mut pic = Picture::alloc(dims, PictureType::I);
-    let mut dc_cache = DcCache::new(mb_w, mb_h);
+    let mut dc_cache = DcCache::for_v1v2(mb_w, mb_h);
     let quant = hdr.quant as u32;
     // Spec/14 §3.2: v1/v2 default luma DCT descriptor = G5, chroma = G4.
     // Neither has a per-frame selector in v1/v2 (the AC-selector reads
@@ -1510,7 +1512,7 @@ fn decode_intra_mb_v1v2_to_picture(
             // bits would misalign on real content, but this keeps
             // synthetic DC-only streams decodable, matching the v3 path).
             let dc_diff = crate::mb::decode_intra_dc_diff_v1v2(br, block_idx)?;
-            let dc = crate::mb::reconstruct_intra_dc(dc_diff, pred.predictor, block_idx, quant);
+            let dc = crate::mb::reconstruct_intra_dc_v1v2(dc_diff, pred.predictor);
             crate::mb::DecodedIntraBlock {
                 coeffs: {
                     let mut a = [0i32; 64];
@@ -1518,6 +1520,7 @@ fn decode_intra_mb_v1v2_to_picture(
                     a
                 },
                 ac_nonzero: 0,
+                dc_level: crate::mb::reconstruct_intra_dc_level(dc_diff, pred.predictor),
             }
         } else {
             crate::mb::decode_intra_block_full_v1v2(
@@ -1530,7 +1533,7 @@ fn decode_intra_mb_v1v2_to_picture(
                 ac_table,
             )?
         };
-        let reconstructed_dc = block_result.coeffs[0];
+        let reconstructed_dc = block_result.dc_level;
         match block_idx {
             0..=3 => dc_cache.luma_set(bx, by, reconstructed_dc),
             4 => dc_cache.chroma_set(false, bx, by, reconstructed_dc),
@@ -1727,6 +1730,7 @@ fn decode_intra_mb_with_header(
                     a
                 },
                 ac_nonzero: 0,
+                dc_level: crate::mb::reconstruct_intra_dc_level(dc_diff, pred.predictor),
             }
         } else {
             let ac_pred_src = if header.ac_pred {
@@ -1758,7 +1762,7 @@ fn decode_intra_mb_with_header(
             }
             blk
         };
-        let reconstructed_dc = block_result.coeffs[0];
+        let reconstructed_dc = block_result.dc_level;
         match block_idx {
             0..=3 => dc_cache.luma_set(bx, by, reconstructed_dc),
             4 => dc_cache.chroma_set(false, bx, by, reconstructed_dc),

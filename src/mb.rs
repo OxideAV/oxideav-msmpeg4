@@ -450,25 +450,27 @@ pub fn encode_intra_dc_diff_v3(
     Ok(())
 }
 
-/// Reconstruct the DC coefficient value for one intra block, combining
-/// the bitstream differential with a predicted DC (provided by the
-/// caller from the neighbour cache).
-pub fn reconstruct_intra_dc(dc_diff: i32, pred_dc: i32, block_idx: usize, quant: u32) -> i32 {
-    let scaler = dc_scaler(block_idx, quant) as i32;
-    (predicted_dc_level(pred_dc, scaler) + dc_diff) * scaler
+/// The reconstructed DC **level** of one intra block: the predictor
+/// record's level plus the decoded differential (spec/19 §2.3,
+/// `0x1c214b8c`). The record written back holds this value, so the
+/// next block predicts from the reconstructed level, never from the
+/// differential.
+pub fn reconstruct_intra_dc_level(dc_diff: i32, pred_level: i32) -> i32 {
+    pred_level.wrapping_add(dc_diff)
 }
 
-/// The predicted DC in the **quantised** domain: the neighbour's
-/// reconstructed DC divided by the DC scaler, rounded to nearest
-/// (MPEG-4 Part 2 §7.4.3.2 `//`). The prediction is added to the
-/// decoded differential *before* rescaling, so a neutral predictor
-/// (1024) that is not a multiple of the scaler snaps to the grid —
-/// e.g. `1024 // 12 = 85` → 1020 at PQUANT 6. Round 452: the MP43
-/// fixture's first macroblock only reconstructs its three predicted
-/// luma blocks (each exactly one grey level off under the pel-domain
-/// `pred + diff * scaler`) with the prediction in this domain.
-pub fn predicted_dc_level(pred_dc: i32, scaler: i32) -> i32 {
-    (pred_dc + scaler / 2).div_euclid(scaler)
+/// The v3 DC coefficient of one intra block from its differential and
+/// the predicted level: `(pred_level + dc_diff) · dc_scaler(PQUANT)`
+/// (spec/19 §2.3). Wrapping like the vendor's 32-bit arithmetic on
+/// hostile streams; the IDCT truncates to int16 anyway (spec/19 §1.4).
+pub fn reconstruct_intra_dc(dc_diff: i32, pred_level: i32, block_idx: usize, quant: u32) -> i32 {
+    reconstruct_intra_dc_level(dc_diff, pred_level).wrapping_mul(dc_scaler(block_idx, quant) as i32)
+}
+
+/// The v1 / v2 DC coefficient: the same reconstruction with the
+/// constant scaler 8 ([`crate::iq::DC_SCALER_V1V2`]).
+pub fn reconstruct_intra_dc_v1v2(dc_diff: i32, pred_level: i32) -> i32 {
+    reconstruct_intra_dc_level(dc_diff, pred_level).wrapping_mul(crate::iq::DC_SCALER_V1V2 as i32)
 }
 
 /// Fully-decoded 8×8 intra block in the coefficient domain (post
@@ -478,6 +480,9 @@ pub struct DecodedIntraBlock {
     pub coeffs: [i32; 64],
     /// Number of non-zero AC levels emitted (DC excluded).
     pub ac_nonzero: u32,
+    /// The reconstructed DC level (`coeffs[0] / dc_scaler`) — what the
+    /// block's prediction record stores (spec/19 §2.3).
+    pub dc_level: i32,
 }
 
 impl Default for DecodedIntraBlock {
@@ -485,6 +490,7 @@ impl Default for DecodedIntraBlock {
         Self {
             coeffs: [0i32; 64],
             ac_nonzero: 0,
+            dc_level: 0,
         }
     }
 }
@@ -521,7 +527,10 @@ pub fn decode_intra_block_full(
     let dc_diff = decode_intra_dc_diff(br, block_idx)?;
     let dc = reconstruct_intra_dc(dc_diff, pred_dc, block_idx, quant);
 
-    let mut out = DecodedIntraBlock::default();
+    let mut out = DecodedIntraBlock {
+        dc_level: reconstruct_intra_dc_level(dc_diff, pred_dc),
+        ..Default::default()
+    };
     out.coeffs[0] = dc;
 
     if cbp_set {
@@ -562,7 +571,10 @@ pub fn decode_intra_block_full_v3_ac_pred(
     let dc_diff = decode_intra_dc_diff_v3(br, block_idx, dc_size_sel)?;
     let dc = reconstruct_intra_dc(dc_diff, pred_dc, block_idx, quant);
 
-    let mut out = DecodedIntraBlock::default();
+    let mut out = DecodedIntraBlock {
+        dc_level: reconstruct_intra_dc_level(dc_diff, pred_dc),
+        ..Default::default()
+    };
     out.coeffs[0] = dc;
 
     if cbp_set {
@@ -605,7 +617,10 @@ pub fn decode_intra_block_full_v3(
     let dc_diff = decode_intra_dc_diff_v3(br, block_idx, dc_size_sel)?;
     let dc = reconstruct_intra_dc(dc_diff, pred_dc, block_idx, quant);
 
-    let mut out = DecodedIntraBlock::default();
+    let mut out = DecodedIntraBlock {
+        dc_level: reconstruct_intra_dc_level(dc_diff, pred_dc),
+        ..Default::default()
+    };
     out.coeffs[0] = dc;
 
     if cbp_set {
@@ -638,9 +653,14 @@ pub fn decode_intra_block_full_v1v2(
     ac_table: &AcVlcTable,
 ) -> Result<DecodedIntraBlock> {
     let dc_diff = decode_intra_dc_diff_v1v2(br, block_idx)?;
-    let dc = reconstruct_intra_dc(dc_diff, pred_dc, block_idx, quant);
+    // v1/v2 DC scaler is the constant 8 (spec/99 §10.2), not the v3
+    // PQUANT-driven table.
+    let dc = reconstruct_intra_dc_v1v2(dc_diff, pred_dc);
 
-    let mut out = DecodedIntraBlock::default();
+    let mut out = DecodedIntraBlock {
+        dc_level: reconstruct_intra_dc_level(dc_diff, pred_dc),
+        ..Default::default()
+    };
     out.coeffs[0] = dc;
 
     if cbp_set {
@@ -813,15 +833,15 @@ mod tests {
 
     #[test]
     fn reconstruct_intra_dc_applies_scaler() {
-        // Quantised-domain prediction (`predicted_dc_level`):
-        // q=8 luma -> scaler 16; 1024 // 16 = 64; (64 + 1) * 16 = 1040.
-        assert_eq!(reconstruct_intra_dc(1, 1024, 0, 8), 1040);
-        // Chroma q=8 -> scaler 10; 1024 // 10 = 102 (102.9 rounds via
-        // +scaler/2 = 102); (102 - 2) * 10 = 1000 — the predictor
-        // snaps to the scaler grid before the differential is added.
-        assert_eq!(reconstruct_intra_dc(-2, 1024, 4, 8), 1000);
-        assert_eq!(predicted_dc_level(1024, 16), 64);
-        assert_eq!(predicted_dc_level(1024, 12), 85);
+        // Level-domain prediction (spec/19 §2.3): q=8 luma → scaler
+        // 16; default level 64; (64 + 1) * 16 = 1040.
+        assert_eq!(reconstruct_intra_dc(1, 64, 0, 8), 1040);
+        // Chroma q=8 → scaler 10, default level 102; (102 − 2) * 10 =
+        // 1000.
+        assert_eq!(reconstruct_intra_dc(-2, 102, 4, 8), 1000);
+        assert_eq!(reconstruct_intra_dc_level(-2, 102), 100);
+        // v1/v2: constant scaler 8.
+        assert_eq!(reconstruct_intra_dc_v1v2(3, 128), 131 * 8);
     }
 
     #[test]
@@ -947,7 +967,8 @@ mod tests {
         fields.push((0, 16)); // tail padding
         let bytes = pack(&fields);
         let mut br = BitReader::new(&bytes);
-        let pred = [1024i32; 6];
+        // Predicted DC levels (spec/19 §2.3): 64 = the q=8 luma default.
+        let pred = [64i32; 6];
         let decoded = decode_intra_mb(&mut br, 8, true, true, pred, Scan::Zigzag, &ac_table)
             .expect("6-block decode");
 
@@ -956,8 +977,9 @@ mod tests {
         // Each luma block carries one non-zero AC (level 1 post-decode).
         for (i, b) in decoded.blocks[..4].iter().enumerate() {
             assert_eq!(b.ac_nonzero, 1, "luma block {i} non-zero count");
-            // DC = pred + 0 * scaler = 1024.
+            // DC = (pred level 64 + 0) * scaler 16 = 1024.
             assert_eq!(b.coeffs[0], 1024, "luma block {i} DC");
+            assert_eq!(b.dc_level, 64, "luma block {i} DC level");
         }
         // Chroma also coded (we asked for cbp_cb=cbp_cr=true).
         for (i, b) in decoded.blocks[4..].iter().enumerate() {

@@ -158,7 +158,7 @@ fn expected_dequantised_ac(level: i32, quant: u32) -> i32 {
 /// composes correctly with the AC walk and that no ESC body is reached.
 #[test]
 fn intra_block_dc_diff_and_terminator() {
-    let pred_dc = 1024i32;
+    let pred_dc = 64i32; // predicted DC level (spec/19 §2.3)
     let dc_magnitude: usize = 3;
     let (dc_bl, dc_code) = dc_luma_sel0_code(dc_magnitude);
     // Round 420 standard sign convention: sign bit set ⇒ negative. We
@@ -184,8 +184,7 @@ fn intra_block_dc_diff_and_terminator() {
     )
     .expect("intra block with DC + terminator decodes");
     let scaler = dc_scaler(0, quant) as i32;
-    let expected_dc =
-        (oxideav_msmpeg4::mb::predicted_dc_level(pred_dc, scaler) + dc_magnitude as i32) * scaler;
+    let expected_dc = (pred_dc + dc_magnitude as i32) * scaler;
     assert_eq!(block.coeffs[0], expected_dc, "DC reconstructed");
 
     // Terminator: scan position advances from start_pos=1 by `run`
@@ -215,7 +214,7 @@ fn intra_block_dc_diff_and_terminator() {
 /// the DC bit position differs from the magnitude-with-sign-bit case.
 #[test]
 fn intra_block_dc_zero_no_sign_bit() {
-    let pred_dc = 1024i32;
+    let pred_dc = 64i32; // predicted DC level (spec/19 §2.3)
     let (dc_bl, dc_code) = dc_luma_sel0_code(0);
     let (term_code, term_bits, term_run, _term_level) = g5_shortest_terminator();
     let bytes = pack(&[
@@ -237,10 +236,14 @@ fn intra_block_dc_zero_no_sign_bit() {
         0,
     )
     .expect("intra block with DC=0 decodes");
+    // `pred_dc` is the predicted *level* (spec/19 §2.3); the coefficient
+    // is the level times the luma scaler of PQUANT 8 (16).
     assert_eq!(
-        block.coeffs[0], pred_dc,
+        block.coeffs[0],
+        pred_dc * dc_scaler(0, quant) as i32,
         "DC unchanged when differential = 0"
     );
+    assert_eq!(block.dc_level, pred_dc);
     let pos = 1usize + term_run as usize;
     assert!(
         block.coeffs[ZIGZAG[pos]] != 0,
@@ -259,7 +262,7 @@ fn intra_block_dc_zero_no_sign_bit() {
 /// public boundary with the leading DC VLC also consumed.
 #[test]
 fn intra_block_tier_1_esc_level_extension() {
-    let pred_dc = 1024i32;
+    let pred_dc = 64i32; // predicted DC level (spec/19 §2.3)
     let dc_magnitude: usize = 2;
     let (dc_bl, dc_code) = dc_luma_sel0_code(dc_magnitude);
     let (esc_code, esc_bits) = g5_esc_entry();
@@ -321,7 +324,7 @@ fn intra_block_tier_1_esc_level_extension() {
 /// audit/01 §4.1, so the emitted run is 0 + 14 = 14.
 #[test]
 fn intra_block_tier_2_esc_run_extension() {
-    let pred_dc = 1024i32;
+    let pred_dc = 64i32; // predicted DC level (spec/19 §2.3)
     let (dc_bl, dc_code) = dc_luma_sel0_code(0); // zero-DC fast path
     let (esc_code, esc_bits) = g5_esc_entry();
     let (inner_code, inner_bits) = g5_entry_for(false, 0, 1);
@@ -382,7 +385,7 @@ fn intra_block_tier_2_esc_run_extension() {
 /// terminator entry is needed.
 #[test]
 fn intra_block_tier_3_esc_verbatim() {
-    let pred_dc = 1024i32;
+    let pred_dc = 64i32; // predicted DC level (spec/19 §2.3)
     let (dc_bl, dc_code) = dc_luma_sel0_code(0);
     let (esc_code, esc_bits) = g5_esc_entry();
 
@@ -432,7 +435,7 @@ fn intra_block_tier_3_esc_verbatim() {
 /// silently start consuming AC bits.
 #[test]
 fn intra_block_cbp_zero_skips_ac_walk() {
-    let pred_dc = 1024i32;
+    let pred_dc = 64i32; // predicted DC level (spec/19 §2.3)
     let dc_magnitude: usize = 7;
     let (dc_bl, dc_code) = dc_luma_sel0_code(dc_magnitude);
     // Deliberately include AC-looking bytes after the DC bits to prove
@@ -464,8 +467,7 @@ fn intra_block_cbp_zero_skips_ac_walk() {
         "cbp=0 must stop at end of DC bits — AC bits left untouched"
     );
     let scaler = dc_scaler(0, quant) as i32;
-    let expected_dc =
-        (oxideav_msmpeg4::mb::predicted_dc_level(pred_dc, scaler) + dc_magnitude as i32) * scaler;
+    let expected_dc = (pred_dc + dc_magnitude as i32) * scaler;
     assert_eq!(block.coeffs[0], expected_dc, "DC reconstructed");
     assert!(
         block.coeffs[1..].iter().all(|&c| c == 0),
@@ -484,7 +486,7 @@ fn intra_block_cbp_zero_skips_ac_walk() {
 /// pins that routing through the public boundary.
 #[test]
 fn intra_block_chroma_uses_chroma_dc_scaler() {
-    let pred_dc = 1024i32;
+    let pred_dc = 64i32; // predicted DC level (spec/19 §2.3)
     let dc_magnitude: usize = 2;
     // Chroma block_idx ≥ 4 routes the intra-DC decode through the
     // chroma DC VLC (per `src/mb.rs::dc_table`), so we encode the
@@ -514,8 +516,7 @@ fn intra_block_chroma_uses_chroma_dc_scaler() {
     )
     .expect("chroma intra block decodes");
     let scaler = dc_scaler(4, quant) as i32;
-    let expected_dc =
-        (oxideav_msmpeg4::mb::predicted_dc_level(pred_dc, scaler) + dc_magnitude as i32) * scaler;
+    let expected_dc = (pred_dc + dc_magnitude as i32) * scaler;
     assert_eq!(
         block.coeffs[0], expected_dc,
         "chroma DC scaler used for block_idx=4"
@@ -537,8 +538,8 @@ fn intra_block_chroma_uses_chroma_dc_scaler() {
 /// correctly when followed by a normal AC walk.
 #[test]
 fn intra_block_dc_esc_tier_decodes() {
-    let pred_dc = 1024i32;
-    // idx 119 = ESC sentinel.
+    let pred_dc = 64i32; // predicted DC level (spec/19 §2.3)
+                         // idx 119 = ESC sentinel.
     let (esc_bl, esc_code) = dc_luma_sel0_code(119);
     let (term_code, term_bits, term_run, _) = g5_shortest_terminator();
     // ESC raw = 0x80, sign = 0 ⇒ positive 128 (round 420 standard
@@ -564,7 +565,7 @@ fn intra_block_dc_esc_tier_decodes() {
     )
     .expect("intra block with DC-ESC decodes");
     let scaler = dc_scaler(0, quant) as i32;
-    let expected_dc = (oxideav_msmpeg4::mb::predicted_dc_level(pred_dc, scaler) + 128) * scaler;
+    let expected_dc = (pred_dc + 128) * scaler;
     assert_eq!(
         block.coeffs[0], expected_dc,
         "DC = (pred_level + 128) * scaler"
