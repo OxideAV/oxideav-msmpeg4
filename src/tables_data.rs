@@ -62,7 +62,7 @@ include!(concat!(env!("OUT_DIR"), "/mv_v3_alt.rs"));
 // 0x1c25fad0 (file offset 0x5eed0). The 64 (bit_length, wire code)
 // entries are indexed by the 6-bit CBP pattern in block-decode order
 // and are byte-identical to the independently staged
-// `docs/video/msmpeg4/tables-ff/msmp4-mb-i-table.csv`. This closes
+// `docs/video/msmpeg4/tables/intra-cbpcy-cbp-map.csv`. This closes
 // the spec/99 §0.1 row 8 OPEN role (both the "candidate intra-AC
 // primary" and "candidate v2 MCBPCY" hypotheses are refuted). Defines:
 //   - MCBPCY_V3_INTRA_ALPHABET: usize (= 64)
@@ -328,7 +328,7 @@ mod tests {
     #[test]
     fn intra_cbpcy_v3_matches_staged_numeric_table() {
         // Round 420: the re-aligned region_05eed0 pairs must match the
-        // independently staged tables-ff/msmp4-mb-i-table.csv. Spot
+        // independently staged tables/intra-cbpcy-cbp-map.csv. Spot
         // rows transcribed from that staged file: cbp 0 -> (0x1, 1),
         // cbp 1 -> (0x17, 6), cbp 2 -> (0x9, 5), cbp 3 -> (0x5, 5),
         // cbp 4 -> (0x6, 5), cbp 5 -> (0x47, 9).

@@ -58,8 +58,8 @@ fn table() -> &'static [VlcEntry<u8>] {
 /// re-aligned `region_05eed0` source at VMA `0x1c25fad0` — 64
 /// `(bit_length, wire code)` entries indexed directly by the 6-bit
 /// CBP pattern, byte-identical to the independently staged
-/// `tables-ff/msmp4-mb-i-table.csv` ("intra picture macroblock coded
-/// block pattern"). Kraft = 1.0.
+/// `tables/intra-cbpcy-cbp-map.csv` (the vendor-binary intra CBPCY
+/// map). Kraft = 1.0.
 ///
 /// I-frames do **not** use the 128-entry joint MCBPCY table — that
 /// table is the P-frame MB header ("non intra picture macroblock

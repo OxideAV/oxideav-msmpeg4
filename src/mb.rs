@@ -1015,8 +1015,8 @@ mod tests {
     /// Chroma sel=0 is `region_05f4a0` (round 420 table-pairing fix:
     /// the four DC regions pair as sel0 = {05f0d8 luma, 05f4a0 chroma}
     /// and sel1 = {05f868 luma, 05fc30 chroma}, per the spec/99 §4.5
-    /// slot grouping and the staged `tables-ff/msmp4-dc-tables`
-    /// companion — pinned empirically on the real-content fixtures,
+    /// slot grouping and the staged `tables/intra-dcsize-*-runtime`
+    /// codebooks — pinned empirically on the real-content fixtures,
     /// whose dc_size_sel=1 I-frames only reconstruct through the
     /// {05f868, 05fc30} pair). `region_05f4a0` has `(bl=2, code=0)`
     /// for symbol 0: bits `00` decode to DC=0 with no sign bit.

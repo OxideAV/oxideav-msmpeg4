@@ -136,13 +136,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Round 420 — v3 I-frame real-content overhaul.** Seven independent
   corrections, each pinned empirically against the staged real
   Microsoft DIV3 fixtures (`tests/microsoft_fixtures.rs` ground truth)
-  and cross-corroborated by the staged numeric tables under
-  `docs/video/msmpeg4/tables-ff/`:
+  and cross-corroborated by the staged vendor-binary numeric tables
+  under `docs/video/msmpeg4/tables/`:
   1. **I-frames use a dedicated 64-entry intra-CBPCY VLC** (the
      re-aligned `region_05eed0` source at VMA `0x1c25fad0` — its
      Extractor-03 dump was a count-header mis-parse of the same class
      provenance/22 fixed for `region_05eac8`; re-aligned it is
-     byte-identical to the staged `tables-ff/msmp4-mb-i-table.csv`
+     byte-identical to the staged `tables/intra-cbpcy-cbp-map.csv`
      and Kraft = 1.0). The 128-entry joint MCBPCY table is the
      **P-frame** MB header only. This closes spec/99 §0.1 row 8's
      OPEN role for `0x1c25fad0` and retires both the "candidate
@@ -167,7 +167,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   5. **v3 intra-DC table pairing fixed**: the four `dc_size_sel`
      regions pair as sel0 = {`05f0d8` luma, `05f4a0` chroma} and
      sel1 = {`05f868` luma, `05fc30` chroma} (spec/99 §4.5 grouping,
-     corroborated by `tables-ff/msmp4-dc-tables`); the previous
+     corroborated by the staged `tables/intra-dcsize-*-runtime` codebooks); the previous
      grouping assigned `05f4a0`/`05f868` to the wrong roles.
   6. **Intra AC escape dispatch is a one-bit selector after the ESC
      marker** — selector 1 ⇒ level-extension tier

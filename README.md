@@ -102,7 +102,7 @@ model, pixel-exact on the hardware-grade saturation probe
 | Quantiser dequantisation + DC scalers          | complete   |
 | CBPY + DC-size VLCs                             | complete   |
 | Intra MB header + DC differential decode       | complete   |
-| Joint MCBPCY VLC (v3 **P-frames**, 128-entry, extracted wire codes) | complete (round 405 wire codes, Kraft=1.0; round 420 pinned the table as P-frame-only per its staged `tables-ff` companion role) |
+| Joint MCBPCY VLC (v3 **P-frames**, 128-entry, extracted wire codes) | complete (round 405 wire codes, Kraft=1.0; round 420 pinned the table as P-frame-only per its staged `tables/` companion role) |
 | Intra CBPCY VLC (v3 **I-frames**, 64-entry, XOR-predicted luma bits) | complete (round 420: re-aligned `region_05eed0` ≡ staged `msmp4-mb-i-table`, Kraft=1.0; patent 7,054,494 CBPCY-XOR rule pinned on both DIV3 fixtures) |
 | DC/AC prediction context (level domain, spec/19 §2 default record, slice restart) | complete (round 459) |
 | Intra MB pipeline (DC pred + IDCT + store)     | complete   |
