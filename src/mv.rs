@@ -62,8 +62,8 @@ use oxideav_core::bits::{BitReader, BitWriter};
 use oxideav_core::{Error, Result};
 
 use crate::tables_data::{
-    MVDX_V3_ALT_BYTES, MVDX_V3_BYTES, MVDY_V3_ALT_BYTES, MVDY_V3_BYTES, MV_V1_V2_BIAS,
-    MV_V1_V2_RAW, MV_V3_ALT_RAW, MV_V3_ESC_INDEX, MV_V3_RAW,
+    MV_V1_V2_BIAS, MV_V1_V2_RAW, MV_V3_ALT_RAW, MV_V3_ESC_INDEX, MV_V3_RAW, MVDX_V3_ALT_BYTES,
+    MVDX_V3_BYTES, MVDY_V3_ALT_BYTES, MVDY_V3_BYTES,
 };
 use crate::vlc::{self, VlcEntry};
 
@@ -336,11 +336,7 @@ impl MvEncodeLut {
 
     fn lookup(&self, raw_x: u8, raw_y: u8) -> Option<u16> {
         let v = self.best_idx[raw_x as usize * 64 + raw_y as usize];
-        if v == u16::MAX {
-            None
-        } else {
-            Some(v)
-        }
+        if v == u16::MAX { None } else { Some(v) }
     }
 }
 

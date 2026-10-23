@@ -5,9 +5,9 @@
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_core::bits::BitReader;
-use oxideav_msmpeg4::enc::{encode_iframe_v3, encode_pframe_v3, EncoderConfig};
+use oxideav_msmpeg4::enc::{EncoderConfig, encode_iframe_v3, encode_pframe_v3};
 use oxideav_msmpeg4::header::PictureType;
-use oxideav_msmpeg4::picture::{decode_picture, Picture, PictureDims};
+use oxideav_msmpeg4::picture::{Picture, PictureDims, decode_picture};
 
 fn picture_from(data: &[u8], dims: PictureDims, kind: PictureType) -> Picture {
     let mut pic = Picture::alloc(dims, kind);

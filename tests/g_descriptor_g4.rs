@@ -7,7 +7,7 @@
 //! bit-length table into `AcVlcTable` once the walker tree at file
 //! offset `0x3df40` (spec/99 §5.3) is resolved.
 
-use oxideav_msmpeg4::g_descriptor::{g4_decode, g4_iter, GSymbol, GToken};
+use oxideav_msmpeg4::g_descriptor::{GSymbol, GToken, g4_decode, g4_iter};
 use oxideav_msmpeg4::tables_data::{G4_COUNT_A, G4_COUNT_B, G4_PRI_A, G4_PRI_B};
 
 #[test]

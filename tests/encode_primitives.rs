@@ -5,8 +5,8 @@
 
 use oxideav_core::bits::{BitReader, BitWriter};
 use oxideav_msmpeg4::ac::{
-    decode_inter_ac, decode_intra_ac, decode_token, encode_inter_ac, encode_intra_ac, encode_token,
-    AcVlcTable, Scan, Symbol, Token,
+    AcVlcTable, Scan, Symbol, Token, decode_inter_ac, decode_intra_ac, decode_token,
+    encode_inter_ac, encode_intra_ac, encode_token,
 };
 use oxideav_msmpeg4::header::{MsV1V2PictureHeader, MsV3PictureHeader, PictureType};
 use oxideav_msmpeg4::mb::{
@@ -14,12 +14,12 @@ use oxideav_msmpeg4::mb::{
     encode_intra_dc_diff_v3,
 };
 use oxideav_msmpeg4::mcbpcy::{
-    compose_cbp, decode_mcbpcy, decode_mcbpcy_v1, decode_mcbpcy_v2, encode_mcbpcy,
-    encode_mcbpcy_v1, encode_mcbpcy_v2, V2FrameType,
+    V2FrameType, compose_cbp, decode_mcbpcy, decode_mcbpcy_v1, decode_mcbpcy_v2, encode_mcbpcy,
+    encode_mcbpcy_v1, encode_mcbpcy_v2,
 };
 use oxideav_msmpeg4::mv::{
-    decode_mv_v1v2, decode_mv_with_table, encode_mv_v1v2, encode_mv_with_table,
-    mv_component_reachable, mv_v1v2_component_reachable, Mv, MvTable,
+    Mv, MvTable, decode_mv_v1v2, decode_mv_with_table, encode_mv_v1v2, encode_mv_with_table,
+    mv_component_reachable, mv_v1v2_component_reachable,
 };
 
 // ==================== picture header ====================
@@ -333,27 +333,31 @@ fn ac_token_escape_round_trips_on_single_tier_inter_table() {
 fn ac_token_rejects_invalid_shapes() {
     let table = AcVlcTable::v3_intra_g5();
     let mut bw = BitWriter::new();
-    assert!(encode_token(
-        &mut bw,
-        &table,
-        Token {
-            last: false,
-            run: 0,
-            level: 0
-        }
-    )
-    .is_err());
+    assert!(
+        encode_token(
+            &mut bw,
+            &table,
+            Token {
+                last: false,
+                run: 0,
+                level: 0
+            }
+        )
+        .is_err()
+    );
     let mut bw = BitWriter::new();
-    assert!(encode_token(
-        &mut bw,
-        &table,
-        Token {
-            last: false,
-            run: 64,
-            level: 1
-        }
-    )
-    .is_err());
+    assert!(
+        encode_token(
+            &mut bw,
+            &table,
+            Token {
+                last: false,
+                run: 64,
+                level: 1
+            }
+        )
+        .is_err()
+    );
 }
 
 // ==================== AC block walks ====================

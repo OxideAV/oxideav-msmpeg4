@@ -18,9 +18,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use oxideav_core::CodecRegistry;
 use oxideav_core::bits::BitReader;
 use oxideav_core::time::TimeBase;
-use oxideav_core::CodecRegistry;
 use oxideav_core::{CodecId, CodecParameters, Packet};
 use oxideav_msmpeg4::header::{MsV3PictureHeader, PictureType};
 
@@ -58,11 +58,7 @@ fn mint_div3_avi(dir: &Path) -> Option<PathBuf> {
         .ok()
         .map(|s| s.success())
         .unwrap_or(false);
-    if ok {
-        Some(out)
-    } else {
-        None
-    }
+    if ok { Some(out) } else { None }
 }
 
 /// Enumerate all `00dc` (video) payloads in an AVI in file order.
@@ -79,7 +75,7 @@ fn all_video_chunks(avi: &[u8]) -> Vec<Vec<u8>> {
                 out.push(avi[payload_start..payload_end].to_vec());
             }
             let mut next = payload_end;
-            if next % 2 != 0 {
+            if !next.is_multiple_of(2) {
                 next += 1;
             }
             i = next;
@@ -87,7 +83,7 @@ fn all_video_chunks(avi: &[u8]) -> Vec<Vec<u8>> {
             i += 12;
         } else {
             let mut next = i + 8 + size;
-            if next % 2 != 0 {
+            if !next.is_multiple_of(2) {
                 next += 1;
             }
             i = next;
@@ -115,7 +111,7 @@ fn first_video_chunk(avi: &[u8]) -> Option<Vec<u8>> {
             i += 12;
         } else {
             let mut next = i + 8 + size;
-            if next % 2 != 0 {
+            if !next.is_multiple_of(2) {
                 next += 1;
             }
             i = next;
@@ -677,7 +673,7 @@ fn real_fixture_psnr_diagnostic() {
         20.0 * (255.0_f64.log10()) - 10.0 * mse.log10()
     }
 
-    use oxideav_msmpeg4::picture::{decode_picture_with_ac, AcSelection, PictureDims};
+    use oxideav_msmpeg4::picture::{AcSelection, PictureDims, decode_picture_with_ac};
 
     for selection in [AcSelection::Placeholder, AcSelection::G5] {
         let mut br = BitReader::new(chunk);

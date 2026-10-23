@@ -1,8 +1,8 @@
 [package]
 name = "oxideav-msmpeg4"
 version = "0.0.10"
-edition = "2021"
-rust-version = "1.80"
+edition = "2024"
+rust-version = "1.95"
 license = "MIT"
 authors = ["Mark Karpeles"]
 description = "Pure-Rust Microsoft MPEG-4 (v1 / v2 / v3) decoder for oxideav — the codec behind DIV3 / DIV4 / MP41 / MP42 / MP43 AVI files, distinct from standard MPEG-4 Part 2 (XVID / DIVX / DX50)"

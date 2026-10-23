@@ -583,7 +583,7 @@ enum GTable {
 ///    scanner in [`crate::vlc::decode`] matches by raw `(bits, code)`
 ///    pair so any prefix-free assignment works.
 fn build_g_primary(raw: &[(u32, u32)], esc_index: usize, table: GTable) -> Vec<VlcEntry<Symbol>> {
-    use crate::g_descriptor::{g4_decode, g5_decode, GSymbol};
+    use crate::g_descriptor::{GSymbol, g4_decode, g5_decode};
     use crate::g_enum::{g0_decode, g1_decode, g2_decode, g3_decode};
 
     let mut entries: Vec<VlcEntry<Symbol>> = Vec::with_capacity(raw.len());
@@ -667,7 +667,7 @@ fn g5_rmax() -> &'static RunLimitTable {
 /// per-run LMAX profile and confirmed exact match to MPEG-4 Part 2
 /// Table 11-15 ESCL(a) Intra TCOEF).
 fn build_g5_lmax() -> LevelLimitTable {
-    use crate::g_descriptor::{g5_iter, GSymbol};
+    use crate::g_descriptor::{GSymbol, g5_iter};
     let mut lmax: LevelLimitTable = [[0u8; 64]; 2];
     for (_idx, sym) in g5_iter() {
         if let GSymbol::Token(t) = sym {
@@ -692,7 +692,7 @@ fn build_g5_lmax() -> LevelLimitTable {
 /// count beyond the RMAX-clipped primary alphabet (per spec/04 §2.3:
 /// "adds a symbol-indexed offset to the run").
 fn build_g5_rmax() -> RunLimitTable {
-    use crate::g_descriptor::{g5_iter, GSymbol};
+    use crate::g_descriptor::{GSymbol, g5_iter};
     let mut rmax: RunLimitTable = [[0u8; 32]; 2];
     for (_idx, sym) in g5_iter() {
         if let GSymbol::Token(t) = sym {
@@ -738,7 +738,7 @@ static G4_RMAX: std::sync::OnceLock<RunLimitTable> = std::sync::OnceLock::new();
 /// LMAX over the G4 alphabet ([`crate::g_descriptor::g4_iter`]); same
 /// construction as [`build_g5_lmax`].
 fn g4_lmax() -> &'static LevelLimitTable {
-    use crate::g_descriptor::{g4_iter, GSymbol};
+    use crate::g_descriptor::{GSymbol, g4_iter};
     G4_LMAX.get_or_init(|| {
         let mut lmax: LevelLimitTable = [[0u8; 64]; 2];
         for (_idx, sym) in g4_iter() {
@@ -755,7 +755,7 @@ fn g4_lmax() -> &'static LevelLimitTable {
 
 /// RMAX over the G4 alphabet; same construction as [`build_g5_rmax`].
 fn g4_rmax() -> &'static RunLimitTable {
-    use crate::g_descriptor::{g4_iter, GSymbol};
+    use crate::g_descriptor::{GSymbol, g4_iter};
     G4_RMAX.get_or_init(|| {
         let mut rmax: RunLimitTable = [[0u8; 32]; 2];
         for (_idx, sym) in g4_iter() {
@@ -1174,12 +1174,12 @@ pub fn encode_token(bw: &mut BitWriter, table: &AcVlcTable, tok: Token) -> Resul
     let negative = tok.level < 0;
 
     // Tier 0 — primary codeword.
-    if level_mag <= u8::MAX as u16 {
-        if let Some(e) = find_run_level_entry(table, tok.last, tok.run, level_mag) {
-            bw.write_u32(e.code, e.bits as u32);
-            bw.write_bit(negative);
-            return Ok(());
-        }
+    if level_mag <= u8::MAX as u16
+        && let Some(e) = find_run_level_entry(table, tok.last, tok.run, level_mag)
+    {
+        bw.write_u32(e.code, e.bits as u32);
+        bw.write_bit(negative);
+        return Ok(());
     }
 
     let esc = escape_entry(table).ok_or_else(|| {
@@ -1254,11 +1254,7 @@ pub fn encode_intra_ac(
     let coded: Vec<(usize, i32)> = (start_pos..64)
         .filter_map(|pos| {
             let lv = levels[order[pos]];
-            if lv == 0 {
-                None
-            } else {
-                Some((pos, lv))
-            }
+            if lv == 0 { None } else { Some((pos, lv)) }
         })
         .collect();
     if coded.is_empty() {
@@ -1304,11 +1300,7 @@ pub fn encode_inter_ac(bw: &mut BitWriter, levels: &[i32; 64], table: &AcVlcTabl
     let coded: Vec<(usize, i32)> = (0..64)
         .filter_map(|pos| {
             let lv = levels[order[pos]];
-            if lv == 0 {
-                None
-            } else {
-                Some((pos, lv))
-            }
+            if lv == 0 { None } else { Some((pos, lv)) }
         })
         .collect();
     if coded.is_empty() {
@@ -2471,7 +2463,9 @@ mod tests {
         };
         let slice_u32 = |idx: usize| -> Vec<u32> {
             ESC_EXT_SLICES[idx]
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect()
         };
@@ -2513,7 +2507,7 @@ mod tests {
         // inter table uses a 1-tier ESC and does not consult them, but
         // the binary still carries the arrays — cross-check the data).
         let (g4_lmax, g4_rmax) = {
-            use crate::g_descriptor::{g4_iter, GSymbol};
+            use crate::g_descriptor::{GSymbol, g4_iter};
             let mut l: LevelLimitTable = [[0u8; 64]; 2];
             let mut r: RunLimitTable = [[0u8; 32]; 2];
             for (_i, sym) in g4_iter() {

@@ -24,7 +24,7 @@
 
 use oxideav_core::bits::BitReader;
 use oxideav_msmpeg4::header::{MsV1V2PictureHeader, PictureType};
-use oxideav_msmpeg4::mcbpcy::{decode_mcbpcy_v1, decode_mcbpcy_v2, V2FrameType};
+use oxideav_msmpeg4::mcbpcy::{V2FrameType, decode_mcbpcy_v1, decode_mcbpcy_v2};
 
 fn pack(fields: &[(u32, u32)]) -> Vec<u8> {
     let mut out: Vec<u8> = Vec::new();
@@ -218,8 +218,8 @@ fn v1_v2_cbpy_reserved_sentinel_codes_are_rejected() {
 /// Skipped if the validator encoder is not available.
 #[test]
 fn ffmpeg_v2_picture_header_parses_through_decoder() {
-    use oxideav_core::time::TimeBase;
     use oxideav_core::CodecRegistry;
+    use oxideav_core::time::TimeBase;
     use oxideav_core::{CodecId, CodecParameters, Packet};
     use std::process::Command;
 
@@ -286,7 +286,7 @@ fn ffmpeg_v2_picture_header_parses_through_decoder() {
                 i += 12;
             } else {
                 let mut next = i + 8 + size;
-                if next % 2 != 0 {
+                if !next.is_multiple_of(2) {
                     next += 1;
                 }
                 i = next;

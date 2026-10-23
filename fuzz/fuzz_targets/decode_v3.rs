@@ -5,7 +5,7 @@
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_core::bits::BitReader;
-use oxideav_msmpeg4::picture::{decode_picture, Picture, PictureDims};
+use oxideav_msmpeg4::picture::{Picture, PictureDims, decode_picture};
 
 fuzz_target!(|data: &[u8]| {
     if data.len() < 3 {

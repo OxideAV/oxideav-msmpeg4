@@ -37,24 +37,24 @@
 use oxideav_core::bits::BitWriter;
 use oxideav_core::{Error, Result};
 
-use crate::ac::{encode_inter_ac, encode_intra_ac, AcVlcTable, Scan};
+use crate::ac::{AcVlcTable, Scan, encode_inter_ac, encode_intra_ac};
 use crate::dc_pred::DcCache;
 use crate::header::{MsV3PictureHeader, PictureType};
 use crate::idct::fdct8x8_from_pels;
 use crate::iq::quantise_block_h263;
 use crate::mb::{encode_intra_dc_diff_v1v2, encode_intra_dc_diff_v3};
-use crate::mc::{chroma_mv_from_four_luma, chroma_mv_from_luma, mc_block, RefPlane};
+use crate::mc::{RefPlane, chroma_mv_from_four_luma, chroma_mv_from_luma, mc_block};
 use crate::mcbpcy::{
-    compose_cbp, encode_intra_cbpcy_sym, encode_mcbpcy, encode_mcbpcy_v1, encode_mcbpcy_v2,
-    V2FrameType,
+    V2FrameType, compose_cbp, encode_intra_cbpcy_sym, encode_mcbpcy, encode_mcbpcy_v1,
+    encode_mcbpcy_v2,
 };
 use crate::mv::{
-    encode_mv_v1v2, encode_mv_with_table, mv_component_reachable, mv_v1v2_component_reachable, Mv,
-    MvTable,
+    Mv, MvTable, encode_mv_v1v2, encode_mv_with_table, mv_component_reachable,
+    mv_v1v2_component_reachable,
 };
 use crate::mv_pred::{
-    predict_block_mv, resolve_block_candidates, Block, Macroblock4MvDecoderNeighbours, MvGrid,
-    MvGridCell,
+    Block, Macroblock4MvDecoderNeighbours, MvGrid, MvGridCell, predict_block_mv,
+    resolve_block_candidates,
 };
 use crate::picture::{MsV1V2Version, Picture, PictureDims};
 use crate::tables_data::MCBPCY_V3_PARTITION;
@@ -212,7 +212,7 @@ pub fn encode_iframe_v3_opts(
                         bytes.len()
                     );
                 }
-                if best.as_ref().map_or(true, |b| bytes.len() < b.len()) {
+                if best.as_ref().is_none_or(|b| bytes.len() < b.len()) {
                     best = Some(bytes);
                 }
             }
@@ -346,10 +346,14 @@ fn write_intra_blocks_opts(
                 .iter()
                 .enumerate()
                 .skip(1)
-                .filter(|(_, &v)| v != 0)
+                .filter(|&(_, &v)| v != 0)
                 .map(|(i, &v)| (i, v))
                 .collect();
-            eprintln!("[enc blk] blk={block_idx} coded={coded} ac_pred={ac_pred} dc_diff={} bit={} nz={nz:?}", plan.dc_diff, bw.bit_position());
+            eprintln!(
+                "[enc blk] blk={block_idx} coded={coded} ac_pred={ac_pred} dc_diff={} bit={} nz={nz:?}",
+                plan.dc_diff,
+                bw.bit_position()
+            );
         }
         if coded {
             let table = if block_idx <= 3 { luma_ac } else { chroma_ac };

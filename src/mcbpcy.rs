@@ -28,8 +28,8 @@ use oxideav_core::{Error, Result};
 
 use crate::tables::CBPY_INTRA_TABLE;
 use crate::tables_data::{
-    MB_TYPE_V1_INFO, MCBPCY_V3_INTRA_ALPHABET, MCBPCY_V3_PARTITION, MCBPCY_V3_RAW, MCBPC_V1_RAW,
-    MCBPC_V2_RAW,
+    MB_TYPE_V1_INFO, MCBPC_V1_RAW, MCBPC_V2_RAW, MCBPCY_V3_INTRA_ALPHABET, MCBPCY_V3_PARTITION,
+    MCBPCY_V3_RAW,
 };
 use crate::vlc::{self, VlcEntry};
 
@@ -180,11 +180,7 @@ impl McbpcyDecode {
     /// 4 for the 4-MV-coded MBs.
     #[must_use]
     pub const fn num_motion_vectors(&self) -> u8 {
-        if self.is_intra {
-            0
-        } else {
-            1
-        }
+        if self.is_intra { 0 } else { 1 }
     }
 }
 

@@ -93,11 +93,7 @@ fn read_unary_cap2(br: &mut BitReader<'_>) -> Result<u8> {
     if !br.read_bit()? {
         return Ok(0);
     }
-    if !br.read_bit()? {
-        Ok(1)
-    } else {
-        Ok(2)
-    }
+    if !br.read_bit()? { Ok(1) } else { Ok(2) }
 }
 
 /// Write a unary-capped-at-2 value — the exact inverse of

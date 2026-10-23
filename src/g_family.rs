@@ -42,7 +42,7 @@
 //! **structural** facts (counts, partition, role); use
 //! [`crate::ac::AcVlcTable`] for the bitstream VLC.
 
-use crate::g_descriptor::{g4_decode, g4_iter, g5_decode, g5_iter, GSymbol};
+use crate::g_descriptor::{GSymbol, g4_decode, g4_iter, g5_decode, g5_iter};
 use crate::g_enum::GExtended;
 use crate::tables_data::{G_COUNTS_SPEC15, G_SUBCLASS_SIZES_SPEC15};
 

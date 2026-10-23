@@ -9,7 +9,7 @@
 //! plus ESC, MSMPEG4 intra-luma DCT TCOEF). They mirror the round-18
 //! G4 integration tests in `g_descriptor_g4.rs`.
 
-use oxideav_msmpeg4::g_descriptor::{g5_decode, g5_iter, GSymbol};
+use oxideav_msmpeg4::g_descriptor::{GSymbol, g5_decode, g5_iter};
 use oxideav_msmpeg4::tables_data::{G5_COUNT_A, G5_COUNT_B, G5_PRI_A, G5_PRI_B};
 
 #[test]

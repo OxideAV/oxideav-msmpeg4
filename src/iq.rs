@@ -105,11 +105,7 @@ pub fn quantise_h263(coeff: f32, quant: u32) -> i32 {
     let bias = q - even_flag;
     let level = ((coeff.abs() - bias) / (2.0 * q)).round().max(0.0) as i32;
     let level = level.min(127);
-    if coeff < 0.0 {
-        -level
-    } else {
-        level
-    }
+    if coeff < 0.0 { -level } else { level }
 }
 
 /// Quantise a whole 8×8 float DCT block into bitstream levels,

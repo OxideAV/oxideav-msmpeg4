@@ -49,11 +49,11 @@ use oxideav_core::{
 };
 
 use crate::enc::{
-    encode_iframe_v1v2, encode_iframe_v3_opts, encode_pframe_v1v2_with_stats,
-    encode_pframe_v3_with_stats, EncoderConfig,
+    EncoderConfig, encode_iframe_v1v2, encode_iframe_v3_opts, encode_pframe_v1v2_with_stats,
+    encode_pframe_v3_with_stats,
 };
 use crate::header::PictureType;
-use crate::picture::{decode_picture_v1v2, MsV1V2Version, Picture, PictureDims};
+use crate::picture::{MsV1V2Version, Picture, PictureDims, decode_picture_v1v2};
 
 /// Which MS-MPEG4 bitstream version an encoder instance emits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -143,11 +143,7 @@ impl RateControl {
     fn type_target(&self, is_key: bool, gop: u32) -> f64 {
         let n = gop.max(1) as f64;
         let tp = self.bits_per_frame * n / (n - 1.0 + I_BUDGET_WEIGHT);
-        if is_key {
-            tp * I_BUDGET_WEIGHT
-        } else {
-            tp
-        }
+        if is_key { tp * I_BUDGET_WEIGHT } else { tp }
     }
 
     /// Buffer-adjusted target for the next frame: drain 1/8 of the

@@ -44,7 +44,7 @@
 
 use oxideav_core::bits::BitReader;
 use oxideav_msmpeg4::ac::{AcVlcTable, Symbol};
-use oxideav_msmpeg4::picture::{decode_picture, decode_picture_with_ac, AcSelection, PictureDims};
+use oxideav_msmpeg4::picture::{AcSelection, PictureDims, decode_picture, decode_picture_with_ac};
 use oxideav_msmpeg4::tables_data::{INTRA_DC_LUMA_SEL0_RAW, MCBPCY_V3_INTRA_RAW};
 
 /// Bit-pack helper: append each `(value, width)` MSB-first, then pad the
@@ -82,10 +82,11 @@ fn g3_code_for(last: bool, run: u8, level: u16) -> (u32, u32) {
             run: er,
             level: ev,
         } = e.value
+            && el == last
+            && er == run
+            && ev == level
         {
-            if el == last && er == run && ev == level {
-                return (e.code, e.bits as u32);
-            }
+            return (e.code, e.bits as u32);
         }
     }
     panic!("no G3 token for (last={last}, run={run}, level={level})");

@@ -27,12 +27,12 @@
 //!   (default variant, spec/16 §1) parsed by `build.rs::emit_mv_v3_packed`.
 
 use oxideav_core::bits::BitReader;
-use oxideav_msmpeg4::mv::{decode_mv, Mv};
+use oxideav_msmpeg4::mv::{Mv, decode_mv};
 use oxideav_msmpeg4::mv_pred::{
-    predict_block_mv, predict_macroblock_4mv_with_finals, Block, BlockCandidates,
-    Macroblock4MvDecoder, MacroblockCandidates,
+    Block, BlockCandidates, Macroblock4MvDecoder, MacroblockCandidates, predict_block_mv,
+    predict_macroblock_4mv_with_finals,
 };
-use oxideav_msmpeg4::tables_data::{MVDX_V3_BYTES, MVDY_V3_BYTES, MV_V3_ESC_INDEX, MV_V3_RAW};
+use oxideav_msmpeg4::tables_data::{MV_V3_ESC_INDEX, MV_V3_RAW, MVDX_V3_BYTES, MVDY_V3_BYTES};
 
 /// Pack `(value, bit_count)` pairs MSB-first into a fresh byte vector,
 /// then append 8 bytes of trailing zeros so the BitReader can over-read

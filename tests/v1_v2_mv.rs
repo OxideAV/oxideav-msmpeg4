@@ -23,8 +23,8 @@
 //! docs gap.
 
 use oxideav_core::bits::BitReader;
-use oxideav_msmpeg4::mcbpcy::{decode_mcbpcy_v1, decode_mcbpcy_v2, V2FrameType};
-use oxideav_msmpeg4::mv::{decode_mv_v1v2, decode_mvd_v1v2_raw, median_predictor, Mv};
+use oxideav_msmpeg4::mcbpcy::{V2FrameType, decode_mcbpcy_v1, decode_mcbpcy_v2};
+use oxideav_msmpeg4::mv::{Mv, decode_mv_v1v2, decode_mvd_v1v2_raw, median_predictor};
 use oxideav_msmpeg4::tables_data::{MV_V1_V2_BIAS, MV_V1_V2_RAW};
 
 fn pack(fields: &[(u32, u32)]) -> Vec<u8> {

@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- edition 2024, MSRV 1.95
 - **Round 459 — spec/19 applied: exact IDCT, level-domain prediction
   context, slice law; DIV3/DIV4 P-frames decode end-to-end.**
   1. **Exact integer IDCT** (spec/19 §1): the float kernel is replaced

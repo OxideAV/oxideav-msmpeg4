@@ -13,8 +13,8 @@
 //! * The complete G5 table is prefix-free (the decoder cannot deadlock).
 
 use oxideav_core::bits::BitReader;
-use oxideav_msmpeg4::ac::{decode_token, AcVlcTable, Symbol, Token};
-use oxideav_msmpeg4::g_descriptor::{g5_decode, GSymbol};
+use oxideav_msmpeg4::ac::{AcVlcTable, Symbol, Token, decode_token};
+use oxideav_msmpeg4::g_descriptor::{GSymbol, g5_decode};
 use oxideav_msmpeg4::tables_data::{G5_PRIMARY_ESC_INDEX, G5_PRIMARY_RAW};
 
 /// Bit-pack helper: each `(value, width)` is appended MSB-first.

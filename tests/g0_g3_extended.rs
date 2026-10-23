@@ -27,7 +27,7 @@
 //!    chain correctly through [`decode_token`].
 
 use oxideav_core::bits::BitReader;
-use oxideav_msmpeg4::ac::{decode_token, AcVlcTable, Symbol};
+use oxideav_msmpeg4::ac::{AcVlcTable, Symbol, decode_token};
 use oxideav_msmpeg4::g_descriptor::GSymbol;
 use oxideav_msmpeg4::g_enum::GExtended;
 

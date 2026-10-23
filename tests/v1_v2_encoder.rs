@@ -4,9 +4,9 @@
 //! must track the input within the quantiser's loss bound.
 
 use oxideav_core::bits::BitReader;
-use oxideav_msmpeg4::enc::{encode_iframe_v1v2, encode_pframe_v1v2, EncoderConfig};
+use oxideav_msmpeg4::enc::{EncoderConfig, encode_iframe_v1v2, encode_pframe_v1v2};
 use oxideav_msmpeg4::header::PictureType;
-use oxideav_msmpeg4::picture::{decode_picture_v1v2, MsV1V2Version, Picture, PictureDims};
+use oxideav_msmpeg4::picture::{MsV1V2Version, Picture, PictureDims, decode_picture_v1v2};
 
 const VERSIONS: [MsV1V2Version; 2] = [MsV1V2Version::V1, MsV1V2Version::V2];
 

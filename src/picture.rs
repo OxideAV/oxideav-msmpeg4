@@ -268,8 +268,14 @@ pub fn decode_picture_opts(
     if std::env::var_os("OXIDEAV_MSMPEG4_AC_TRACE").is_some() {
         eprintln!(
             "[hdr trace] type={:?} q={} iframe_ext={} ac_chroma_sel={} ac_luma_sel={} dc_size_sel={} mv_table_sel={} bit_pos={}",
-            hdr.picture_type, hdr.quant, hdr.iframe_ext, hdr.ac_chroma_sel, hdr.ac_luma_sel,
-            hdr.dc_size_sel, hdr.mv_table_sel, br.bit_position(),
+            hdr.picture_type,
+            hdr.quant,
+            hdr.iframe_ext,
+            hdr.ac_chroma_sel,
+            hdr.ac_luma_sel,
+            hdr.dc_size_sel,
+            hdr.mv_table_sel,
+            br.bit_position(),
         );
     }
     let mut pic = Picture::alloc(dims, hdr.picture_type);
@@ -434,11 +440,7 @@ fn chroma_ac_table_for(selection: AcSelection, hdr: &MsV3PictureHeader) -> AcVlc
 /// candidate rules over `(left, top, top_left)`, only this one carries
 /// every I-frame of all three fixtures through to the last macroblock.
 pub fn predict_cbp_bit(left: bool, top: bool, top_left: bool) -> bool {
-    if top == left {
-        top
-    } else {
-        !top_left
-    }
+    if top == left { top } else { !top_left }
 }
 
 /// Number of macroblock rows per prediction slice of a v2 / v3 picture
@@ -690,7 +692,7 @@ fn decode_intra_mb_iframe_v3(
                 .map(|l| {
                     l.iter()
                         .enumerate()
-                        .filter(|(i, &v)| *i > 0 && v != 0)
+                        .filter(|&(ref i, &v)| *i > 0 && v != 0)
                         .map(|(i, &v)| (i, v))
                         .collect()
                 })
@@ -907,7 +909,7 @@ fn decode_pframe_mb(
     top_boundary: bool,
     rounding: u8,
 ) -> Result<()> {
-    use crate::mcbpcy::{decode_mcbpcy_pframe_opts, PFrameMcbpcy};
+    use crate::mcbpcy::{PFrameMcbpcy, decode_mcbpcy_pframe_opts};
 
     let (skip, mb_info) = match decode_mcbpcy_pframe_opts(br, mb_skip_enable)? {
         PFrameMcbpcy::Skip => (true, None),
@@ -1030,7 +1032,15 @@ fn decode_pframe_mb(
     if std::env::var_os("OXIDEAV_MSMPEG4_AC_TRACE").is_some() {
         eprintln!(
             "[pmb trace] mb=({mb_x},{mb_y}) inter idx={} cbpy={:04b} cb={} cr={} pred=({},{}) mv=({},{}) bit={}",
-            decode.idx, decode.cbpy, decode.cbp_cb, decode.cbp_cr, predictor.x, predictor.y, mv.x, mv.y, br.bit_position()
+            decode.idx,
+            decode.cbpy,
+            decode.cbp_cb,
+            decode.cbp_cr,
+            predictor.x,
+            predictor.y,
+            mv.x,
+            mv.y,
+            br.bit_position()
         );
     }
     mv_grid.set_cell(mb_x, mb_y, crate::mv_pred::MvGridCell::OneMv(mv));
@@ -1153,7 +1163,7 @@ fn decode_inter_residual_blocks(
             let nz: Vec<(usize, i32)> = coeffs
                 .iter()
                 .enumerate()
-                .filter(|(_, &c)| c != 0)
+                .filter(|&(_, &c)| c != 0)
                 .map(|(i, &c)| (i, c))
                 .collect();
             eprintln!(
@@ -1342,7 +1352,7 @@ fn decode_pframe_mb_v1v2(
     intra_luma_ac: &AcVlcTable,
     intra_chroma_ac: &AcVlcTable,
 ) -> Result<()> {
-    use crate::mcbpcy::{decode_mcbpcy_v1, decode_mcbpcy_v2, V2FrameType};
+    use crate::mcbpcy::{V2FrameType, decode_mcbpcy_v1, decode_mcbpcy_v2};
 
     let decode = match version {
         MsV1V2Version::V1 => decode_mcbpcy_v1(br)?,
@@ -1502,7 +1512,7 @@ fn decode_iframe_v1v2(
     hdr: &MsV1V2PictureHeader,
     version: MsV1V2Version,
 ) -> Result<Picture> {
-    use crate::mcbpcy::{decode_mcbpcy_v1, decode_mcbpcy_v2, V2FrameType};
+    use crate::mcbpcy::{V2FrameType, decode_mcbpcy_v1, decode_mcbpcy_v2};
 
     let (mb_w, mb_h) = dims.mb_dims();
     let mut pic = Picture::alloc(dims, PictureType::I);
@@ -2735,7 +2745,7 @@ mod tests {
         fields.push((0, 1)); // skip = 0
         fields.push((code_mb, bl_mb)); // MCBPCY idx 32 (inter, Y0 coded)
         fields.push((mv0_code, mv0_bl)); // MV sym 0 → MV (0,0)
-                                         // Luma block 0 residual: single sub-class-B terminator + sign 0.
+        // Luma block 0 residual: single sub-class-B terminator + sign 0.
         fields.push((term_entry.code, term_entry.bits as u32));
         fields.push((0, 1)); // sign = positive
         fields.push((0, 16)); // tail padding
@@ -2969,7 +2979,7 @@ mod tests {
         // `predict_block_mv(Block::TopLeft, ..)` call built by hand from
         // the same three neighbour MVs.
         use crate::mv::Mv;
-        use crate::mv_pred::{predict_block_mv, Block, BlockCandidates, MvGrid, MvGridCell};
+        use crate::mv_pred::{Block, BlockCandidates, MvGrid, MvGridCell, predict_block_mv};
 
         let mut grid = MvGrid::new(3, 3);
         let left = Mv { x: 4, y: -2 };
@@ -3009,7 +3019,7 @@ mod tests {
         // mapping and against a by-hand `predict_block_mv` built from
         // exactly those bordering cells.
         use crate::mv::Mv;
-        use crate::mv_pred::{predict_block_mv, Block, BlockCandidates, MvGrid, MvGridCell};
+        use crate::mv_pred::{Block, BlockCandidates, MvGrid, MvGridCell, predict_block_mv};
 
         let mk = |base: i8| {
             [

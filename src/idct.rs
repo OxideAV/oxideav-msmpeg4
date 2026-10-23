@@ -360,7 +360,7 @@ mod tests {
                 idct8x8_scalar(c, &mut out);
                 out.iter()
                     .zip(p.iter())
-                    .filter(|(&v, &want)| clip255(v) != want)
+                    .filter(|&(&v, &want)| clip255(v) != want)
                     .count()
             })
             .collect();

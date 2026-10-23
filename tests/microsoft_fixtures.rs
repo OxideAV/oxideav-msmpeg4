@@ -69,7 +69,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use oxideav_core::{
-    time::TimeBase, CodecId, CodecParameters, CodecRegistry, Decoder, Error, Frame, Packet,
+    CodecId, CodecParameters, CodecRegistry, Decoder, Error, Frame, Packet, time::TimeBase,
 };
 
 // ---------------------------------------------------------------------------
@@ -259,7 +259,7 @@ fn all_video_chunks(avi: &[u8]) -> Vec<Vec<u8>> {
                 out.push(avi[payload_start..payload_end].to_vec());
             }
             let mut next = payload_end;
-            if next % 2 != 0 {
+            if !next.is_multiple_of(2) {
                 next += 1;
             }
             i = next;
@@ -267,7 +267,7 @@ fn all_video_chunks(avi: &[u8]) -> Vec<Vec<u8>> {
             i += 12;
         } else {
             let mut next = i + 8 + size;
-            if next % 2 != 0 {
+            if !next.is_multiple_of(2) {
                 next += 1;
             }
             i = next;
@@ -303,14 +303,14 @@ fn remux_asf_to_avi(fix: &Fixture) -> Option<PathBuf> {
     }
     let src = cache_path(fix.name);
     let out = cache_path(&format!("{}.remux.avi", fix.name));
-    if let Ok(meta) = fs::metadata(&out) {
-        if meta.len() > 0 {
-            // Best-effort cache: if the remux already exists and is non-
-            // empty, assume it's good. (A stale remux from an old SHA
-            // is very unlikely because we re-fetch the source on hash
-            // mismatch above.)
-            return Some(out);
-        }
+    if let Ok(meta) = fs::metadata(&out)
+        && meta.len() > 0
+    {
+        // Best-effort cache: if the remux already exists and is non-
+        // empty, assume it's good. (A stale remux from an old SHA
+        // is very unlikely because we re-fetch the source on hash
+        // mismatch above.)
+        return Some(out);
     }
     let ok = Command::new("ffmpeg")
         .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])

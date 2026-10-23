@@ -21,7 +21,7 @@ use std::sync::OnceLock;
 use oxideav_core::bits::{BitReader, BitWriter};
 use oxideav_core::{Error, Result};
 
-use crate::ac::{decode_intra_ac, AcVlcTable, Scan};
+use crate::ac::{AcVlcTable, Scan, decode_intra_ac};
 use crate::dc_pred::PredDir;
 use crate::iq::{dc_scaler, dequantise_h263};
 use crate::tables::{CBPY_INTRA_TABLE, DC_SIZE_CHROMA_TABLE, DC_SIZE_LUMA_TABLE};
@@ -910,16 +910,18 @@ mod tests {
         ]);
         let mut br = BitReader::new(&bytes);
         let pred = [1024i32; 6];
-        assert!(decode_intra_mb(
-            &mut br,
-            8,
-            false,
-            false,
-            pred,
-            crate::ac::Scan::Zigzag,
-            &crate::ac::AcVlcTable::V3_INTRA_PLACEHOLDER,
-        )
-        .is_err());
+        assert!(
+            decode_intra_mb(
+                &mut br,
+                8,
+                false,
+                false,
+                pred,
+                crate::ac::Scan::Zigzag,
+                &crate::ac::AcVlcTable::V3_INTRA_PLACEHOLDER,
+            )
+            .is_err()
+        );
     }
 
     #[test]

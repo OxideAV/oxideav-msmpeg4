@@ -539,7 +539,7 @@ fn intra_block_chroma_uses_chroma_dc_scaler() {
 #[test]
 fn intra_block_dc_esc_tier_decodes() {
     let pred_dc = 64i32; // predicted DC level (spec/19 §2.3)
-                         // idx 119 = ESC sentinel.
+    // idx 119 = ESC sentinel.
     let (esc_bl, esc_code) = dc_luma_sel0_code(119);
     let (term_code, term_bits, term_run, _) = g5_shortest_terminator();
     // ESC raw = 0x80, sign = 0 ⇒ positive 128 (round 420 standard

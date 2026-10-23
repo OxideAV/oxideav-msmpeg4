@@ -2054,8 +2054,8 @@ fn emit_g_descriptor_cluster(hex_path: &Path, g5_pri_b_path: &Path, out_path: &P
     //   r0:8 entries (idx 67..74), r1:3 (75..77), r2..6:2 each (78..87),
     //   r7..20: 1 each (88..101).
     let mut g5_subb_expected_runs: Vec<u32> = Vec::with_capacity(35);
-    g5_subb_expected_runs.extend(std::iter::repeat(0u32).take(8));
-    g5_subb_expected_runs.extend(std::iter::repeat(1u32).take(3));
+    g5_subb_expected_runs.extend(std::iter::repeat_n(0u32, 8));
+    g5_subb_expected_runs.extend(std::iter::repeat_n(1u32, 3));
     for r in 2u32..=6 {
         g5_subb_expected_runs.push(r);
         g5_subb_expected_runs.push(r);
@@ -2154,7 +2154,7 @@ fn emit_g_descriptor_cluster(hex_path: &Path, g5_pri_b_path: &Path, out_path: &P
 /// numeric checks (the emitter casts to `u8` when writing the constant).
 fn decode_pri_b_u32_le(bytes: &[u8], label: &str) -> Vec<u32> {
     let mut out: Vec<u32> = Vec::with_capacity(bytes.len() / 4);
-    for (i, chunk) in bytes.chunks_exact(4).enumerate() {
+    for (i, chunk) in bytes.as_chunks::<4>().0.iter().enumerate() {
         let v = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
         if v > 0xff {
             panic!(

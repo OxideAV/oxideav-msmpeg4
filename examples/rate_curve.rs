@@ -16,7 +16,7 @@
 use oxideav_core::bits::BitReader;
 use oxideav_core::{CodecId, CodecParameters, Frame, VideoFrame, VideoPlane};
 use oxideav_msmpeg4::picture::PictureDims;
-use oxideav_msmpeg4::picture::{decode_picture, decode_picture_v1v2, MsV1V2Version, Picture};
+use oxideav_msmpeg4::picture::{MsV1V2Version, Picture, decode_picture, decode_picture_v1v2};
 
 const W: usize = 176;
 const H: usize = 144;

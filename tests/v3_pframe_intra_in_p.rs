@@ -47,7 +47,7 @@
 use oxideav_core::bits::BitReader;
 use oxideav_msmpeg4::header::PictureType;
 use oxideav_msmpeg4::mcbpcy::decode_mcbpcy;
-use oxideav_msmpeg4::picture::{decode_picture, Picture, PictureDims};
+use oxideav_msmpeg4::picture::{Picture, PictureDims, decode_picture};
 use oxideav_msmpeg4::tables_data::{
     INTRA_DC_CHROMA_SEL0_RAW, INTRA_DC_LUMA_SEL0_RAW, MCBPCY_V3_PARTITION,
 };
@@ -87,10 +87,11 @@ fn mcbpcy_code_for(target: u8) -> (u32, u32) {
         for code in 0u32..(1u32 << bl) {
             let bytes = pack(&[(code, bl)]);
             let mut br = BitReader::new(&bytes);
-            if let Ok(dec) = decode_mcbpcy(&mut br) {
-                if dec.idx == target && br.bit_position() == bl as u64 {
-                    return (code, bl);
-                }
+            if let Ok(dec) = decode_mcbpcy(&mut br)
+                && dec.idx == target
+                && br.bit_position() == bl as u64
+            {
+                return (code, bl);
             }
         }
     }
@@ -275,10 +276,11 @@ fn g3_code_for(last: bool, run: u8, level: u16) -> Option<(u32, u32)> {
             run: er,
             level: ev,
         } = e.value
+            && el == last
+            && er == run
+            && ev == level
         {
-            if el == last && er == run && ev == level {
-                return Some((e.code, e.bits as u32));
-            }
+            return Some((e.code, e.bits as u32));
         }
     }
     None
@@ -324,7 +326,7 @@ fn build_v3_pframe_intra_in_p_coded(ac_pred: u32, run: u8, level: u16) -> Vec<u8
         .unwrap_or_else(|| panic!("no G3 token for (last=false, run={run}, level={level})"));
     fields.push((ac0_code, ac0_bl));
     fields.push((0, 1)); // sign = positive
-                         // sub-B terminator (last=true, 0, 1), then sign.
+    // sub-B terminator (last=true, 0, 1), then sign.
     let (ac1_code, ac1_bl) =
         g3_code_for(true, 0, 1).expect("G3 alphabet must carry a (last=true, 0, 1) terminator");
     fields.push((ac1_code, ac1_bl));

@@ -63,8 +63,8 @@ use std::fs;
 use std::path::PathBuf;
 
 use oxideav_core::{
-    time::TimeBase, CodecId, CodecParameters, CodecRegistry, CodecResolver, CodecTag, Decoder,
-    Frame, Packet, ProbeContext,
+    CodecId, CodecParameters, CodecRegistry, CodecResolver, CodecTag, Decoder, Frame, Packet,
+    ProbeContext, time::TimeBase,
 };
 
 /// Locate `docs/video/msmpeg4-fixtures/<name>/`. Tests run with CWD set
@@ -89,7 +89,7 @@ fn all_video_chunks(avi: &[u8]) -> Vec<Vec<u8>> {
                 out.push(avi[payload_start..payload_end].to_vec());
             }
             let mut next = payload_end;
-            if next % 2 != 0 {
+            if !next.is_multiple_of(2) {
                 next += 1;
             }
             i = next;
@@ -97,7 +97,7 @@ fn all_video_chunks(avi: &[u8]) -> Vec<Vec<u8>> {
             i += 12;
         } else {
             let mut next = i + 8 + size;
-            if next % 2 != 0 {
+            if !next.is_multiple_of(2) {
                 next += 1;
             }
             i = next;

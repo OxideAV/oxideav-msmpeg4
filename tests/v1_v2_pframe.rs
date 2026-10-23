@@ -30,7 +30,7 @@
 
 use oxideav_core::bits::BitReader;
 use oxideav_msmpeg4::header::PictureType;
-use oxideav_msmpeg4::picture::{decode_picture_v1v2, MsV1V2Version, Picture, PictureDims};
+use oxideav_msmpeg4::picture::{MsV1V2Version, Picture, PictureDims, decode_picture_v1v2};
 use oxideav_msmpeg4::tables_data::{
     CBPY_V1_V2_RAW, DC_SIZE_CHROMA_V1V2_RAW, DC_SIZE_LUMA_V1V2_RAW, MCBPC_V1_RAW, MCBPC_V2_RAW,
     MV_V1_V2_RAW,
@@ -350,7 +350,7 @@ fn v1_iframe_intra_nonzero_dc_shifts_luma() {
     let (luma1_code, luma1_bl) = code_for(DC_SIZE_LUMA_V1V2_RAW, 1);
     fields.push((luma1_code, luma1_bl));
     fields.push((1, 1)); // 1 value bit = `1` → +1
-                         // Luma blocks 1..=3 + 2 chroma: size 0.
+    // Luma blocks 1..=3 + 2 chroma: size 0.
     let (luma0_code, luma0_bl) = code_for(DC_SIZE_LUMA_V1V2_RAW, 0);
     let (chroma0_code, chroma0_bl) = code_for(DC_SIZE_CHROMA_V1V2_RAW, 0);
     for _ in 0..3 {
@@ -466,10 +466,11 @@ fn g5_code_for(last: bool, run: u8, level: u16) -> Option<(u32, u32)> {
             run: er,
             level: ev,
         } = e.value
+            && el == last
+            && er == run
+            && ev == level
         {
-            if el == last && er == run && ev == level {
-                return Some((e.code, e.bits as u32));
-            }
+            return Some((e.code, e.bits as u32));
         }
     }
     None
@@ -763,8 +764,8 @@ fn v1_pframe_inter4v_applies_cbp_residual_on_block() {
         .expect("G4 sub-class-B terminator with non-zero level");
 
     let (mcbpc_code, mcbpc_bl) = code_for(MCBPC_V1_RAW, 8); // mb_type 2
-                                                            // CBPY raw sym 7 → one's-complement (15 - 7) = 8 = 0b1000: only
-                                                            // luma block 0 (the MSB of the 4-bit pattern) is coded.
+    // CBPY raw sym 7 → one's-complement (15 - 7) = 8 = 0b1000: only
+    // luma block 0 (the MSB of the 4-bit pattern) is coded.
     let (cbpy_code, cbpy_bl) = code_for(CBPY_V1_V2_RAW, 7);
     let (mv0_code, mv0_bl) = code_for(MV_V1_V2_RAW, 32); // 0
     let mut fields = v1_pframe_header(8);
@@ -827,8 +828,8 @@ fn v1_pframe_inter4v_neighbour_propagates_block2_mv_to_next_mb() {
     // exercise of an INTER4V MB feeding a 1-MV neighbour through the full
     // v1/v2 decoder (the prior `one_mv_predictor` FourMv coverage was a
     // synthetic-grid unit test only).
-    use oxideav_msmpeg4::mc::{mc_macroblock, RefPlane};
-    use oxideav_msmpeg4::mv::{decode_mv_v1v2, Mv};
+    use oxideav_msmpeg4::mc::{RefPlane, mc_macroblock};
+    use oxideav_msmpeg4::mv::{Mv, decode_mv_v1v2};
     use oxideav_msmpeg4::mv_pred::{Block, Macroblock4MvDecoderNeighbours, NeighbourSet};
 
     let dims = PictureDims::new(32, 16).unwrap();

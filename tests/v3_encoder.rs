@@ -5,9 +5,9 @@
 //! quantiser's loss bound.
 
 use oxideav_core::bits::BitReader;
-use oxideav_msmpeg4::enc::{encode_iframe_v3, encode_pframe_v3, EncoderConfig};
+use oxideav_msmpeg4::enc::{EncoderConfig, encode_iframe_v3, encode_pframe_v3};
 use oxideav_msmpeg4::header::PictureType;
-use oxideav_msmpeg4::picture::{decode_picture, Picture, PictureDims};
+use oxideav_msmpeg4::picture::{Picture, PictureDims, decode_picture};
 
 fn textured_input(dims: PictureDims) -> Picture {
     let mut pic = Picture::alloc(dims, PictureType::I);

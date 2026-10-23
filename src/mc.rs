@@ -151,11 +151,7 @@ pub fn chroma_mv_from_luma(luma_mv_half: (i32, i32)) -> (i32, i32) {
     fn half(v: i32) -> i32 {
         let m = v.unsigned_abs() as i32;
         let r = (m >> 1) | (m & 1);
-        if v < 0 {
-            -r
-        } else {
-            r
-        }
+        if v < 0 { -r } else { r }
     }
     (half(luma_mv_half.0), half(luma_mv_half.1))
 }
