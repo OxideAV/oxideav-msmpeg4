@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- motion compensation edge-extends references from the coded (macroblock-aligned) picture instead of the visible size, so at widths or heights that are not multiples of 16 the last macroblock's samples past the visible edge predict as they do in deployed decoders (previously up to |Δ| 31 in the right-hand columns of a 170×98 stream)
 - edition 2024, MSRV 1.95
 - **Round 459 — spec/19 applied: exact IDCT, level-domain prediction
   context, slice law; DIV3/DIV4 P-frames decode end-to-end.**

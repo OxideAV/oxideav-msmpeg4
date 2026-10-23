@@ -1695,7 +1695,10 @@ fn add_residual_to_picture(
 }
 
 /// Apply motion compensation to the (mb_x, mb_y) MB using the given
-/// half-pel MV. Writes luma + chroma into the picture.
+/// half-pel MV. Writes luma + chroma into the picture. References are
+/// edge-extended from the coded (macroblock-aligned) area, not the visible
+/// size: when the width or height is not a multiple of 16, the last
+/// macroblock's samples past the visible edge are real predictors.
 fn apply_mc_to_mb(
     pic: &mut Picture,
     reference: &Picture,
@@ -1707,20 +1710,20 @@ fn apply_mc_to_mb(
     let ref_y = crate::mc::RefPlane {
         data: &reference.y,
         stride: reference.y_stride,
-        width: reference.width as usize,
-        height: reference.height as usize,
+        width: reference.y_stride,
+        height: reference.y.len() / reference.y_stride,
     };
     let ref_cb = crate::mc::RefPlane {
         data: &reference.cb,
         stride: reference.c_stride,
-        width: (reference.width as usize).div_ceil(2),
-        height: (reference.height as usize).div_ceil(2),
+        width: reference.c_stride,
+        height: reference.cb.len() / reference.c_stride,
     };
     let ref_cr = crate::mc::RefPlane {
         data: &reference.cr,
         stride: reference.c_stride,
-        width: (reference.width as usize).div_ceil(2),
-        height: (reference.height as usize).div_ceil(2),
+        width: reference.c_stride,
+        height: reference.cr.len() / reference.c_stride,
     };
     crate::mc::mc_macroblock(
         &ref_y,
@@ -1753,20 +1756,20 @@ fn apply_mc_4mv_to_mb(
     let ref_y = crate::mc::RefPlane {
         data: &reference.y,
         stride: reference.y_stride,
-        width: reference.width as usize,
-        height: reference.height as usize,
+        width: reference.y_stride,
+        height: reference.y.len() / reference.y_stride,
     };
     let ref_cb = crate::mc::RefPlane {
         data: &reference.cb,
         stride: reference.c_stride,
-        width: (reference.width as usize).div_ceil(2),
-        height: (reference.height as usize).div_ceil(2),
+        width: reference.c_stride,
+        height: reference.cb.len() / reference.c_stride,
     };
     let ref_cr = crate::mc::RefPlane {
         data: &reference.cr,
         stride: reference.c_stride,
-        width: (reference.width as usize).div_ceil(2),
-        height: (reference.height as usize).div_ceil(2),
+        width: reference.c_stride,
+        height: reference.cr.len() / reference.c_stride,
     };
     crate::mc::mc_macroblock_4mv(
         &ref_y,
@@ -1953,6 +1956,27 @@ fn write_block_to_picture(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn motion_compensation_reads_coded_samples_past_the_visible_edge() {
+        // 170 wide: the last macroblock column codes x 160..175, of which
+        // 170..175 lie past the visible edge but are decoded samples.
+        let dims = PictureDims::new(170, 32).unwrap();
+        let mut reference = Picture::alloc(dims, PictureType::I);
+        for (i, sample) in reference.y.iter_mut().enumerate() {
+            *sample = if i % reference.y_stride >= 170 {
+                200
+            } else {
+                50
+            };
+        }
+        let mut pic = Picture::alloc(dims, PictureType::P);
+        // Last macroblock, two whole samples to the right: x 168 predicts
+        // from reference x 170.
+        apply_mc_to_mb(&mut pic, &reference, 10, 0, (4, 0), 0);
+        assert_eq!(pic.y[168], 200);
+        assert_eq!(pic.y[167], 50);
+    }
 
     /// `(bit_length, code)` wire codeword for a joint-MCBPCY symbol,
     /// read straight from the extracted table
