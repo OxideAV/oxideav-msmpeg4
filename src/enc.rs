@@ -726,25 +726,31 @@ struct MbPrediction {
     cr: [u8; 64],
 }
 
+/// The reference planes the encoder predicts from. Like the decoder's
+/// `apply_mc_to_mb`, they span the coded (macroblock-aligned) area, not
+/// the visible size: H.263 §4.1 decodes a picture whose width or height
+/// is not a multiple of 16 as if it had the next larger multiple, so the
+/// last macroblock's samples past the visible edge are real predictors
+/// (Annex Q.3 NOTE). Any other extent would drift from the decoder.
 fn ref_planes(reference: &Picture) -> (RefPlane<'_>, RefPlane<'_>, RefPlane<'_>) {
     (
         RefPlane {
             data: &reference.y,
             stride: reference.y_stride,
-            width: reference.width as usize,
-            height: reference.height as usize,
+            width: reference.y_stride,
+            height: reference.y.len() / reference.y_stride,
         },
         RefPlane {
             data: &reference.cb,
             stride: reference.c_stride,
-            width: (reference.width as usize).div_ceil(2),
-            height: (reference.height as usize).div_ceil(2),
+            width: reference.c_stride,
+            height: reference.cb.len() / reference.c_stride,
         },
         RefPlane {
             data: &reference.cr,
             stride: reference.c_stride,
-            width: (reference.width as usize).div_ceil(2),
-            height: (reference.height as usize).div_ceil(2),
+            width: reference.c_stride,
+            height: reference.cr.len() / reference.c_stride,
         },
     )
 }
@@ -1660,6 +1666,31 @@ mod tests {
                 pic.cr[y * pic.c_stride + x] = ((y + 140) % 220) as u8;
             }
         }
+    }
+
+    #[test]
+    fn prediction_reads_coded_samples_past_the_visible_edge() {
+        // 170 wide: the last macroblock column codes luma x 160..175 and
+        // chroma x 80..87; luma 170.. / chroma 85.. lie past the visible
+        // edge but are decoded samples the decoder predicts from, so the
+        // encoder must predict from them too.
+        let dims = PictureDims::new(170, 32).unwrap();
+        let mut reference = Picture::alloc(dims, PictureType::I);
+        let (ys, cs) = (reference.y_stride, reference.c_stride);
+        for (i, sample) in reference.y.iter_mut().enumerate() {
+            *sample = if i % ys >= 170 { 200 } else { 50 };
+        }
+        for (i, sample) in reference.cb.iter_mut().enumerate() {
+            *sample = if i % cs >= 85 { 220 } else { 60 };
+        }
+        // Last macroblock, two whole luma samples to the right.
+        let pred = predict_mb(&reference, 10, 0, (4, 0), 0);
+        assert_eq!(pred.luma[8], 200, "x 168 predicts from reference x 170");
+        assert_eq!(pred.luma[7], 50);
+        // Chroma x 87 sits in the coded-only columns whatever the
+        // derived chroma vector; a visible-size clamp would give 60.
+        assert_eq!(pred.cb[7], 220);
+        assert_eq!(predict_mb_luma(&reference, 10, 0, (4, 0), 0), pred.luma);
     }
 
     #[test]
