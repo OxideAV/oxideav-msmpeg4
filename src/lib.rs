@@ -208,6 +208,7 @@ pub const CODEC_ID_V3: &str = "msmpeg4v3";
 
 /// What a given bitstream's first packet looks like.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Classification {
     /// Standard MPEG-4 Part 2 (ISO/IEC 14496-2). Dispatch to
     /// [`oxideav-mpeg4video`](https://crates.io/crates/oxideav-mpeg4video).

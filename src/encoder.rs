@@ -118,10 +118,12 @@ fn int_option(params: &CodecParameters, key: &str, default: u32, lo: u32, hi: u3
 /// allowed this multiple of a P-frame's bit budget (H.263 TMN-lineage
 /// ratio), with the GOP-wide average normalised back to the per-frame
 /// target.
+#[doc(hidden)]
 pub const I_BUDGET_WEIGHT: f64 = 4.0;
 
 /// Maximum number of re-encode trials the rate controller spends
 /// settling one frame's QP.
+#[doc(hidden)]
 pub const RC_MAX_TRIALS: u32 = 3;
 
 /// Frame-level rate-controller state (present only when the `bitrate`

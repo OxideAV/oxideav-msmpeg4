@@ -109,6 +109,7 @@ impl PictureDims {
 
 /// A decoded picture in planar YUV420 (pel domain).
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct Picture {
     pub width: u32,
     pub height: u32,
@@ -195,6 +196,7 @@ pub fn decode_picture(
 /// default for real-content decode; the G5 / Placeholder / Candidate
 /// variants remain available for hand-crafted synthetic streams.
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AcSelection {
     /// Per-frame dispatch from the picture-header selector bits.
     /// Resolves each block to one of {G0..G5} by mapping
@@ -313,6 +315,7 @@ pub fn decode_picture_opts(
 
 /// Outcome of [`decode_picture_partial`]: the picture as far as it got.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct PartialDecode {
     /// The parsed picture header.
     pub header: MsV3PictureHeader,
@@ -439,6 +442,7 @@ fn chroma_ac_table_for(selection: AcSelection, hdr: &MsV3PictureHeader) -> AcVlc
 /// coded, diagonal uncoded — the reference codes the block); of the
 /// candidate rules over `(left, top, top_left)`, only this one carries
 /// every I-frame of all three fixtures through to the last macroblock.
+#[doc(hidden)]
 pub fn predict_cbp_bit(left: bool, top: bool, top_left: bool) -> bool {
     if top == left { top } else { !top_left }
 }
@@ -455,6 +459,7 @@ pub fn predict_cbp_bit(left: bool, top: bool, top_left: bool) -> bool {
 /// AC prediction context and the MV predictor's top side; the CBP
 /// prediction (spec/17 §2.2) is **not** restarted and the bitstream is
 /// not realigned (spec/99 §2.5: no resync marker).
+#[doc(hidden)]
 pub fn slice_rows_for(iframe_ext: u8, mb_h: usize) -> Result<usize> {
     let divisor = (iframe_ext as usize).saturating_sub(22);
     if divisor == 0 {

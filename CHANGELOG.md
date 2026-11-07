@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- API hygiene: `Classification`, `picture::Picture`, `picture::AcSelection` and `picture::PartialDecode` are now `#[non_exhaustive]`. `encoder::I_BUDGET_WEIGHT`, `encoder::RC_MAX_TRIALS`, `picture::predict_cbp_bit` and `picture::slice_rows_for` are now `#[doc(hidden)]` (internal rate-control and decode helpers). `PictureDims` (a plain width × height value) and `MsV1V2Version` (exactly v1 / v2) stay exhaustive.
+
 ## [0.0.11](https://github.com/OxideAV/oxideav-msmpeg4/compare/v0.0.10...v0.0.11) - 2026-10-24
 
 ### Fixed
